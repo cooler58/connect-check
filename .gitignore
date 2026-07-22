@@ -7,7 +7,7 @@ reports/
 .DS_Store
 *.zip
 
-# локальные бинарники отладки
+# локальные бинарники отладки в корне (пакет — в bin/)
 /connect-check
 /connect-check.exe
 /probe-quic
@@ -25,18 +25,3 @@ reports/
 
 build/
 top_domains_embed.h
-
-# пакет (README оставляем)
-bin/mac/**
-bin/linux/**
-bin/win/**
-bin/resources.conf
-bin/VERSION
-bin/ConnectCheck-mac.app/**
-bin/connect-check-gui-linux
-bin/connect-check-gui-win.exe
-bin/connect-check-gui-mac
-!bin/README.md
-!bin/mac/.gitkeep
-!bin/linux/.gitkeep
-!bin/win/.gitkeep

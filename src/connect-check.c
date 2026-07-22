@@ -2382,6 +2382,8 @@ static ResSig g_sig[MAX_RES];
 static int g_nsig;
 static ResTcp g_game_tcp[MAX_RES];
 static int g_ngame_tcp;
+static ResTcp g_infra_tcp[MAX_RES];
+static int g_ninfra_tcp;
 static ResHttp g_game_https[MAX_RES];
 static int g_ngame_https;
 static ResHttpCrit g_ai[MAX_RES];
@@ -2505,6 +2507,28 @@ static void resources_load_defaults(void) {
         {"GOG", "www.gog.com", 443, 0},
         {"Faceit", "api.faceit.com", 443, 0},
     };
+    /* Selectel: ru-1 ≈ СПб (Дубровка), ru-7 ≈ Москва (Берзарина). SFTP :22 — публично у SPB. */
+    static const struct { const char *name, *host; int port, crit; } itcp[] = {
+        {"Selectel SPb SFTP :22", "ftp.ru-1.storage.selcloud.ru", 22, 0},
+        {"Selectel SPb S3 :80", "s3.ru-1.storage.selcloud.ru", 80, 0},
+        {"Selectel SPb S3 :443", "s3.ru-1.storage.selcloud.ru", 443, 0},
+        {"Selectel Мск S3 :80", "s3.ru-7.storage.selcloud.ru", 80, 0},
+        {"Selectel Мск S3 :443", "s3.ru-7.storage.selcloud.ru", 443, 0},
+        {"Selectel Мск API :443", "api.ru-7.storage.selcloud.ru", 443, 0},
+        /* AWS — глобальный + EU (Frankfurt / Stockholm) */
+        {"AWS S3 :443", "s3.amazonaws.com", 443, 0},
+        {"AWS S3 EU-Central :80", "s3.eu-central-1.amazonaws.com", 80, 0},
+        {"AWS S3 EU-Central :443", "s3.eu-central-1.amazonaws.com", 443, 0},
+        {"AWS S3 EU-North :443", "s3.eu-north-1.amazonaws.com", 443, 0},
+        {"AWS EC2 EU-Central :443", "ec2.eu-central-1.amazonaws.com", 443, 0},
+        {"AWS STS EU-Central :443", "sts.eu-central-1.amazonaws.com", 443, 0},
+        /* Azure */
+        {"Azure portal :443", "portal.azure.com", 443, 0},
+        {"Azure management :443", "management.azure.com", 443, 0},
+        {"Azure login :443", "login.microsoftonline.com", 443, 0},
+        {"Azure Blob East US :80", "eastus.blob.core.windows.net", 80, 0},
+        {"Azure Blob East US :443", "eastus.blob.core.windows.net", 443, 0},
+    };
     static const struct { const char *name, *url; } ghttps[] = {
         {"Battle.net", "https://battle.net/"},
         {"Blizzard", "https://www.blizzard.com/"},
@@ -2610,6 +2634,16 @@ static void resources_load_defaults(void) {
         g_game_tcp[i].crit = gtcp[i].crit;
     }
 
+    n = (int)(sizeof itcp / sizeof itcp[0]);
+    if (n > MAX_RES) n = MAX_RES;
+    g_ninfra_tcp = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_infra_tcp[i].name, sizeof g_infra_tcp[i].name, "%s", itcp[i].name);
+        snprintf(g_infra_tcp[i].host, sizeof g_infra_tcp[i].host, "%s", itcp[i].host);
+        g_infra_tcp[i].port = itcp[i].port;
+        g_infra_tcp[i].crit = itcp[i].crit;
+    }
+
     n = (int)(sizeof ghttps / sizeof ghttps[0]);
     if (n > MAX_RES) n = MAX_RES;
     g_ngame_https = n;
@@ -2654,10 +2688,11 @@ static int resources_load_file(const char *path) {
     FILE *f;
     char line[1024];
     char section[64] = "";
-    int got_sig = 0, got_gtcp = 0, got_ghttps = 0, got_ai = 0, got_vid = 0, got_bank = 0;
-    int nsig = 0, ngtcp = 0, nghttps = 0, nai = 0, nvid = 0, nbank = 0;
+    int got_sig = 0, got_gtcp = 0, got_itcp = 0, got_ghttps = 0, got_ai = 0, got_vid = 0, got_bank = 0;
+    int nsig = 0, ngtcp = 0, nitcp = 0, nghttps = 0, nai = 0, nvid = 0, nbank = 0;
     ResSig sig[MAX_RES];
     ResTcp gtcp[MAX_RES];
+    ResTcp itcp[MAX_RES];
     ResHttp ghttps[MAX_RES];
     ResHttpCrit ai[MAX_RES];
     ResVideo vids[MAX_RES];
@@ -2697,6 +2732,13 @@ static int resources_load_file(const char *path) {
             gtcp[ngtcp].crit = (nf > 3 && fields[3][0] == '1') ? 1 : 0;
             ngtcp++;
             got_gtcp = 1;
+        } else if (strcmp(section, "infra_tcp") == 0 && nitcp < MAX_RES && nf >= 3) {
+            snprintf(itcp[nitcp].name, sizeof itcp[nitcp].name, "%s", fields[0]);
+            snprintf(itcp[nitcp].host, sizeof itcp[nitcp].host, "%s", fields[1]);
+            itcp[nitcp].port = atoi(fields[2]);
+            itcp[nitcp].crit = (nf > 3 && fields[3][0] == '1') ? 1 : 0;
+            nitcp++;
+            got_itcp = 1;
         } else if (strcmp(section, "games_https") == 0 && nghttps < MAX_RES) {
             snprintf(ghttps[nghttps].name, sizeof ghttps[nghttps].name, "%s", fields[0]);
             snprintf(ghttps[nghttps].url, sizeof ghttps[nghttps].url, "%s", fields[1]);
@@ -2731,6 +2773,10 @@ static int resources_load_file(const char *path) {
     if (got_gtcp) {
         memcpy(g_game_tcp, gtcp, (size_t)ngtcp * sizeof gtcp[0]);
         g_ngame_tcp = ngtcp;
+    }
+    if (got_itcp) {
+        memcpy(g_infra_tcp, itcp, (size_t)nitcp * sizeof itcp[0]);
+        g_ninfra_tcp = nitcp;
     }
     if (got_ghttps) {
         memcpy(g_game_https, ghttps, (size_t)nghttps * sizeof ghttps[0]);
@@ -4136,6 +4182,20 @@ int main(int argc, char **argv) {
                      "Не отвечают (кроме ожидаемо ограниченных в РФ): %s.", names);
             add_finding("warning", detail, tx);
         }
+    }
+
+    /* Облака: Selectel / AWS / Azure (TCP) */
+    if (g_ninfra_tcp > 0 &&
+        stage_begin("Облако", "Selectel (СПб/Мск), AWS, Azure — TCP 22/80/443")) {
+        char fail[64][64];
+        int nfail = 0;
+        int n = g_ninfra_tcp;
+        for (i = 0; i < n; i++) {
+            stage_item(g_infra_tcp[i].name, i + 1, n);
+            check_tcp_ep("Облако", g_infra_tcp[i].name, g_infra_tcp[i].host, g_infra_tcp[i].port,
+                         4000, g_infra_tcp[i].crit, 0, &nfail, fail, 64);
+        }
+        stage_done();
     }
 
     /* Gaming platforms: Blizzard / Battle.net, Steam, Epic, Riot, … */

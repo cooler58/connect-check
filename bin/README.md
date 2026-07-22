@@ -2,7 +2,7 @@
 
 Сборка: `make package` (или `make -f Makefile.package`).
 
-В git не коммитятся бинарники `bin/{mac,linux,win}/**` — только этот README. Артефакты появляются после локальной/CI сборки.
+В репозитории лежат **готовые сборки** последней версии (`bin/{mac,linux,win}/`, GUI). После `git pull` можно сразу запускать без локальной компиляции.
 
 ## Содержимое после сборки
 
@@ -28,7 +28,9 @@
 
 Windows: `connect-check.cmd` или `connect-check.exe`.
 
-Списки этапов читаются из `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`).
+Списки этапов читаются из `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`, `[infra_tcp]`).
+
+Секция **`[infra_tcp]`** — TCP к облачной инфраструктуре (сейчас Selectel СПб/Москва: SSH/80/443).
 
 ## GUI
 

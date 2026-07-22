@@ -25,14 +25,18 @@
 
 Каждая опубликованная версия должна уезжать на GitHub (ветка + тег). Не пушить «сырые» WIP-коммиты как релизные теги.
 
+## Что коммитить в релизе
+
+- Исходники, `resources.conf`, `VERSION`, документация
+- **Готовые бинарники** в `bin/{mac,linux,win}/`, `bin/resources.conf`, `bin/VERSION`, GUI в корне `bin/` (`ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe`)
+
 ## Что не коммитить
 
 - `reports/`, HTML-отчёты
 - `build/`, `top_domains_embed.h` (генерируется)
-- бинарники в корне и `bin/{mac,linux,win}/**` (кроме `bin/README.md`)
+- отладочные бинарники в **корне** репозитория (`./connect-check`, `./probe-*`)
 - `.venv/`, `.env`, `.DS_Store`, `*.zip` пакетов
 
-Исходники и `resources.conf` / `VERSION` / документация — в git.
 
 ## Структура каталогов
 
