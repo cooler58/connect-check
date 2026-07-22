@@ -39,6 +39,16 @@
 #  include <fcntl.h>
 #  include <termios.h>
 #  include <signal.h>
+
+/*
+ * macOS: системный curl/LibreSSL ломает TLS к части госсайтов (gosuslugi и др.).
+ * SecureTransport ведёт себя как Safari/браузер.
+ */
+#  ifdef __APPLE__
+#    define CURL_SSL_ENV "CURL_SSL_BACKEND=secure-transport "
+#  else
+#    define CURL_SSL_ENV ""
+#  endif
 #endif
 
 #define MAX_CHECKS   1024
@@ -811,6 +821,7 @@ static void check_steam_cm(int *fail_n, char fail_names[][64], int fail_cap) {
         "\"https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0\" 2>nul";
 #else
     const char *cmd =
+        CURL_SSL_ENV
         "curl -sS --max-time 12 "
         "'https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0' 2>/dev/null";
 #endif
@@ -996,14 +1007,16 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
     int nredir = 0;
     memset(&r, 0, sizeof r);
     /* follow: идём по 301/302/… и смотрим финальный код + url_effective
-     * nofollow: как для captive — редирект сам по себе сигнал */
+     * nofollow: как для captive — редирект сам по себе сигнал.
+     * Не форсируем --http1.1: госсайты/CDN часто лучше на HTTP/2 + TLS1.3. */
     snprintf(cmd, sizeof cmd,
+             CURL_SSL_ENV
              "curl -sS -o /tmp/netdiag_body.$$ -w "
              "'%%{http_code}\\t%%{time_total}\\t%%{url_effective}\\t%%{num_redirects}\\t%%{redirect_url}' "
              "--max-time %d --connect-timeout %d "
              "-A '%s' "
-             "--http1.1 %s --max-redirs %d %s '%s' 2>/dev/null",
-             timeout_sec, timeout_sec, agent,
+             "%s --max-redirs %d %s '%s' 2>/dev/null",
+             timeout_sec, timeout_sec > 2 ? timeout_sec - 1 : timeout_sec, agent,
              follow ? "-L" : "",
              follow ? 8 : 0,
              insecure ? "-k" : "", url);
@@ -1089,9 +1102,10 @@ static HttpResult doh_probe(const char *url, int timeout_sec) {
              timeout_sec, timeout_sec, url);
 #else
     snprintf(cmd, sizeof cmd,
+             CURL_SSL_ENV
              "curl -sS -o /dev/null -w '%%{http_code}\\t%%{time_total}' "
              "--max-time %d --connect-timeout %d "
-             "-H 'Accept: application/dns-json' --http1.1 -k '%s' 2>/dev/null",
+             "-H 'Accept: application/dns-json' -k '%s' 2>/dev/null",
              timeout_sec, timeout_sec, url);
 #endif
     if (run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
@@ -2041,6 +2055,7 @@ static int http_fetch_text_ex(const char *url, char *buf, size_t buflen, int tim
         close(fd);
         if (cookie && cookie[0]) {
             snprintf(cmd, sizeof cmd,
+                     CURL_SSL_ENV
                      "curl -sS -L --max-time %d --connect-timeout %d "
                      "-A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' "
@@ -2050,6 +2065,7 @@ static int http_fetch_text_ex(const char *url, char *buf, size_t buflen, int tim
                      timeout_sec, timeout_sec, cookie, tmp, url);
         } else {
             snprintf(cmd, sizeof cmd,
+                     CURL_SSL_ENV
                      "curl -sS -L --max-time %d --connect-timeout %d "
                      "-A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' "
@@ -3218,14 +3234,29 @@ static void check_captive(const char *name, const char *url, int expect, int cri
 }
 
 static void check_ru(const char *cat, const char *name, const char *url,
-                     const char *note, int spoiler,
+                     const char *note, int spoiler, int multi_ua,
                      char fail_names[][64], int *nfail,
                      char slow_names[][80], int *nslow) {
     char ua_sum[256];
     int ua_mismatch = 0;
-    HttpResult r = http_probe_agents(url, 3, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+    HttpResult r;
     char detail[STR], hint[STR], host[128], ip[64];
     const char *st;
+
+    /*
+     * Значимые/банки: один UA и больший таймаут.
+     * Раньше 5 UA × 3 с на LibreSSL давали ложные FAIL на госуслугах и др.
+     */
+    if (multi_ua)
+        r = http_probe_agents(url, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+    else {
+        r = http_probe_ua(url, 12, 1, ua_default(), 1);
+        if (r.code > 0)
+            snprintf(ua_sum, sizeof ua_sum, "chrome=%d", r.code);
+        else
+            snprintf(ua_sum, sizeof ua_sum, "chrome=нет ответа");
+        ua_mismatch = 0;
+    }
 
     host_from_url(url, host, sizeof host);
     ip[0] = 0;
@@ -3242,7 +3273,7 @@ static void check_ru(const char *cat, const char *name, const char *url,
     if (r.code <= 0) {
         snprintf(detail, sizeof detail, "%s [%s]",
                  r.error[0] ? r.error : "таймаут/нет ответа", ua_sum[0] ? ua_sum : "—");
-        snprintf(hint, sizeof hint, "%s%sНедоступен со всеми User-Agent.",
+        snprintf(hint, sizeof hint, "%s%sНедоступен по HTTPS-пробе (браузер может работать при другом маршруте/QUIC).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
         add_check_ex(cat, name, "fail", detail, hint, ip, url, spoiler);
         if (*nfail < 40) snprintf(fail_names[(*nfail)++], 64, "%s", name);
@@ -3276,9 +3307,9 @@ static void check_ru(const char *cat, const char *name, const char *url,
                  "%s%sОтвет зависит от User-Agent (win/mac/android/tv/embed).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
     }
-    if (r.ms > 2000) {
+    if (r.ms > 3000) {
         st = "warn";
-        snprintf(hint, sizeof hint, "%s%sМедленный ответ (>2000 ms).",
+        snprintf(hint, sizeof hint, "%s%sМедленный ответ (>3000 ms).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
         if (*nslow < 40) snprintf(slow_names[(*nslow)++], 80, "%s %dms", name, r.ms);
     }
@@ -4176,7 +4207,7 @@ int main(int argc, char **argv) {
             stage_item(g_sig[i].name, i + 1, n);
             before_fail = nsig_fail;
             before_checks = nchecks;
-            check_ru("Значимые ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1,
+            check_ru("Значимые ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1, 0,
                      sig_fail, &nsig_fail, sig_slow, &nsig_slow);
             if (g_sig[i].expected_block && nsig_fail > before_fail) {
                 /* ожидаемый блок РФ: не FAIL/WARN сети */
@@ -4665,7 +4696,7 @@ int main(int argc, char **argv) {
         int n = g_nbanks;
         for (i = 0; i < n; i++) {
             stage_item(g_banks[i].name, i + 1, n);
-            check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0,
+            check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0, 0,
                      fail_names, &nfail, slow_names, &nslow);
         }
         stage_done();

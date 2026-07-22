@@ -2,6 +2,12 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.0.3] — 2026-07-22
+
+### Fixed
+- Ложные FAIL на **Госуслугах** и части госсайтов на macOS: системный curl/LibreSSL рвал TLS (`SSL_ERROR_SYSCALL`), браузер при этом работал. Пробы идут через `CURL_SSL_BACKEND=secure-transport`.
+- Значимые ресурсы / банки: один User-Agent и таймаут 12 с вместо 5 UA × 3 с; убран принудительный `--http1.1`.
+
 ## [1.0.2] — 2026-07-22
 
 ### Added
