@@ -1,13 +1,12 @@
-# Connect Check GUI — Nuklear + GLFW (чистый C)
+# Connect Check GUI — Nuklear + GLFW
 #
-#   make -f Makefile.gui              — текущая ОС → bin/{mac|linux|win}
-#   make -f Makefile.gui package-all  — mac + win (+ linux через Docker с macOS)
+# Раскладка bin/:
+#   GUI → корень bin/  (ConnectCheck-mac.app, connect-check-gui-linux, connect-check-gui-win.exe)
+#   CLI → bin/{mac,linux,win}/  (connect-check, probe-*)
+#
+#   make -f Makefile.gui              — GUI текущей ОС → корень bin/
+#   make -f Makefile.gui package-all  — mac + win + linux
 #   make -f Makefile.gui run          — собрать и запустить
-#
-# Зависимости:
-#   mac:   brew install glfw
-#   linux: apt install libglfw3-dev  (или Docker, см. package-linux)
-#   win:   third_party/win (GLFW MinGW) + x86_64-w64-mingw32-gcc
 
 UNAME_S := $(shell uname -s)
 ROOT    := $(CURDIR)
@@ -17,6 +16,7 @@ FONT    := $(TP)/fonts/DejaVuSans.ttf
 GLFW_WIN ?= $(TP)/win
 VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
 VER_CFLAG := -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+STAGING := build/gui
 
 .PHONY: all package run clean deps-hint \
         package-mac package-linux package-win package-all \
@@ -37,31 +37,17 @@ else
   package: package-win
 endif
 
-MAC_BIN := bin/mac/connect-check-gui
+# --- macOS: только ConnectCheck-mac.app в корне bin/ ---
 MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src \
                -I/opt/homebrew/include -I/usr/local/include $(VER_CFLAG)
 MAC_LDFLAGS := -L/opt/homebrew/lib -L/usr/local/lib -lglfw \
                -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
+MAC_STAGED  := $(STAGING)/mac/connect-check-gui
 
-package-mac: $(MAC_BIN)
-	@rm -rf bin/ConnectCheck-mac.app
-	@cp -R bin/mac/ConnectCheck.app bin/ConnectCheck-mac.app
-	@rm -f bin/connect-check-gui-mac
-	@ls -lh $(MAC_BIN) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui bin/mac/libglfw.3.dylib 2>/dev/null || true
-
-$(MAC_BIN): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+package-mac: $(MAC_STAGED)
 ifeq ($(UNAME_S),Darwin)
-	mkdir -p bin/mac
-	$(CC) $(MAC_CFLAGS) -o $@ $(SRC) $(MAC_LDFLAGS)
-	@cp -f /opt/homebrew/opt/glfw/lib/libglfw.3.dylib bin/mac/ 2>/dev/null || \
-	  cp -f /usr/local/opt/glfw/lib/libglfw.3.dylib bin/mac/ 2>/dev/null || true
-	@if [ -f bin/mac/libglfw.3.dylib ]; then \
-	  install_name_tool -change /opt/homebrew/opt/glfw/lib/libglfw.3.dylib @loader_path/libglfw.3.dylib $@ 2>/dev/null || true; \
-	  install_name_tool -change /usr/local/opt/glfw/lib/libglfw.3.dylib @loader_path/libglfw.3.dylib $@ 2>/dev/null || true; \
-	fi
-	@cp -f $(FONT) bin/mac/ 2>/dev/null || true
-	@rm -rf bin/mac/ConnectCheck.app
-	@mkdir -p bin/mac/ConnectCheck.app/Contents/MacOS
+	@rm -rf bin/ConnectCheck-mac.app
+	@mkdir -p bin/ConnectCheck-mac.app/Contents/MacOS
 	@printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -73,17 +59,35 @@ ifeq ($(UNAME_S),Darwin)
 	  '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
 	  '<key>LSMinimumSystemVersion</key><string>11.0</string>' \
 	  '<key>NSHighResolutionCapable</key><true/>' \
-	  '</dict></plist>' > bin/mac/ConnectCheck.app/Contents/Info.plist
-	@cp -f $@ bin/mac/ConnectCheck.app/Contents/MacOS/connect-check-gui
-	@cp -f bin/mac/libglfw.3.dylib bin/mac/ConnectCheck.app/Contents/MacOS/ 2>/dev/null || true
-	@cp -f bin/mac/DejaVuSans.ttf bin/mac/ConnectCheck.app/Contents/MacOS/ 2>/dev/null || true
-	@echo "→ $@  (+ ConnectCheck.app для запуска без Terminal)"
-	@ls -lh $@
+	  '</dict></plist>' > bin/ConnectCheck-mac.app/Contents/Info.plist
+	@cp -f $(MAC_STAGED) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@cp -f $(STAGING)/mac/libglfw.3.dylib bin/ConnectCheck-mac.app/Contents/MacOS/ 2>/dev/null || true
+	@cp -f $(FONT) bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf 2>/dev/null || true
+	@# убрать GUI-артефакты из bin/mac (там только CLI)
+	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
+	@rm -f bin/connect-check-gui-mac
+	@echo "→ bin/ConnectCheck-mac.app"
+	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 else
 	@echo "package-mac только на Darwin"; exit 1
 endif
 
-WIN_BIN := bin/win/connect-check-gui.exe
+$(MAC_STAGED): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+ifeq ($(UNAME_S),Darwin)
+	mkdir -p $(STAGING)/mac
+	$(CC) $(MAC_CFLAGS) -o $@ $(SRC) $(MAC_LDFLAGS)
+	@cp -f /opt/homebrew/opt/glfw/lib/libglfw.3.dylib $(STAGING)/mac/ 2>/dev/null || \
+	  cp -f /usr/local/opt/glfw/lib/libglfw.3.dylib $(STAGING)/mac/ 2>/dev/null || true
+	@if [ -f $(STAGING)/mac/libglfw.3.dylib ]; then \
+	  install_name_tool -change /opt/homebrew/opt/glfw/lib/libglfw.3.dylib @loader_path/libglfw.3.dylib $@ 2>/dev/null || true; \
+	  install_name_tool -change /usr/local/opt/glfw/lib/libglfw.3.dylib @loader_path/libglfw.3.dylib $@ 2>/dev/null || true; \
+	fi
+else
+	@echo "package-mac только на Darwin"; exit 1
+endif
+
+# --- Windows: GUI только в корне bin/ ---
+WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
 WIN_CC  := x86_64-w64-mingw32-gcc
 WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(GLFW_WIN)/include $(VER_CFLAG)
 WIN_LDFLAGS := -mwindows -L$(GLFW_WIN)/lib -lglfw3 -lopengl32 -lgdi32 -luser32 -lshell32 -lwinmm
@@ -101,36 +105,35 @@ fetch-glfw-win:
 	  echo "→ $(GLFW_WIN)"; \
 	fi
 
-package-win: fetch-glfw-win $(WIN_BIN)
-	@cp -f $(WIN_BIN) bin/connect-check-gui-win.exe
-	@ls -lh $(WIN_BIN) bin/connect-check-gui-win.exe
+package-win: fetch-glfw-win $(WIN_STAGED)
+	@cp -f $(WIN_STAGED) bin/connect-check-gui-win.exe
+	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
+	@rm -f bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
+	@ls -lh bin/connect-check-gui-win.exe
+	@file bin/connect-check-gui-win.exe | sed 's|^|  |'
 
-$(WIN_BIN): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
-	mkdir -p bin/win
+$(WIN_STAGED): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
+	mkdir -p $(STAGING)/win
 	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_LDFLAGS)
-	@cp -f $(FONT) bin/win/ 2>/dev/null || true
-	@echo "→ $@"
-	@ls -lh $@ bin/win/DejaVuSans.ttf 2>/dev/null
-	@file $@ | sed 's|^|  |'
 
-LINUX_BIN := bin/linux/connect-check-gui
+# --- Linux: GUI + libglfw + font в корне bin/ ---
+LINUX_STAGED := $(STAGING)/linux/connect-check-gui
 LINUX_CFLAGS  := -O2 -Wall -I$(TP) -I$(ROOT)/src $(VER_CFLAG) $(shell pkg-config --cflags glfw3 2>/dev/null)
 LINUX_LDFLAGS := $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw) -lGL -lm -ldl -lpthread -Wl,-rpath,'$$ORIGIN'
 
-package-linux-native: $(LINUX_BIN)
-	@cp -f $(LINUX_BIN) bin/connect-check-gui-linux
+package-linux-native: $(LINUX_STAGED)
+	@cp -f $(LINUX_STAGED) bin/connect-check-gui-linux
 	@chmod +x bin/connect-check-gui-linux
-	@ls -lh $(LINUX_BIN) bin/connect-check-gui-linux 2>/dev/null || true
+	@SO=$$(ldd $(LINUX_STAGED) 2>/dev/null | awk '/libglfw/{print $$3; exit}'); \
+	  if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" bin/; fi
+	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
+	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
+	@ls -lh bin/connect-check-gui-linux
 
-$(LINUX_BIN): $(SRC) $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(LINUX_STAGED): $(SRC) $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Linux)
-	mkdir -p bin/linux
+	mkdir -p $(STAGING)/linux
 	$(CC) $(LINUX_CFLAGS) -o $@ $(SRC) $(LINUX_LDFLAGS)
-	@SO=$$(ldd $@ 2>/dev/null | awk '/libglfw/{print $$3; exit}'); \
-	  if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" bin/linux/; fi
-	@cp -f $(FONT) bin/linux/ 2>/dev/null || true
-	@echo "→ $@"
-	@ls -lh $@
 else
 	@echo "native Linux GUI только на Linux — используйте package-linux (Docker)"; exit 1
 endif
@@ -141,6 +144,7 @@ ifeq ($(UNAME_S),Linux)
 else
 	@command -v docker >/dev/null || { echo "Нужен docker (colima start)"; exit 1; }
 	@echo "→ Linux GUI через Docker (linux/amd64)…"
+	mkdir -p $(STAGING)/linux
 	docker run --rm --platform linux/amd64 \
 	  -v "$(ROOT):/src" -w /src \
 	  debian:bookworm-slim \
@@ -148,45 +152,43 @@ else
 	    apt-get update -qq; \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
 	      gcc pkg-config libglfw3-dev libgl1-mesa-dev >/dev/null; \
-	    mkdir -p bin/linux; \
+	    mkdir -p build/gui/linux; \
 	    gcc -O2 -Wall -Ithird_party -Isrc -DCONNECT_CHECK_VERSION=\"$(VERSION)\" $$(pkg-config --cflags glfw3) \
-	      -o bin/linux/connect-check-gui gui/connect-check-gui.c \
+	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c \
 	      $$(pkg-config --libs glfw3) -lGL -lm -ldl -lpthread -Wl,-rpath,\$$ORIGIN; \
-	    SO=$$(ldd bin/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
-	    if [ -n "$$SO" ] && [ -f "$$SO" ] && [ "$$SO" != "bin/linux/$$(basename $$SO)" ] && [ "$$SO" != "/src/bin/linux/$$(basename $$SO)" ]; then \
-	      cp -f "$$SO" bin/linux/; \
-	    fi; \
-	    cp -f third_party/fonts/DejaVuSans.ttf bin/linux/; \
-	    ls -lh bin/linux/connect-check-gui bin/linux/libglfw* bin/linux/DejaVuSans.ttf'
-	@cp -f bin/linux/connect-check-gui bin/connect-check-gui-linux
+	    SO=$$(ldd build/gui/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
+	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" build/gui/linux/; fi; \
+	    cp -f third_party/fonts/DejaVuSans.ttf build/gui/linux/; \
+	    ls -lh build/gui/linux/connect-check-gui build/gui/linux/libglfw* build/gui/linux/DejaVuSans.ttf'
+	@cp -f $(STAGING)/linux/connect-check-gui bin/connect-check-gui-linux
 	@chmod +x bin/connect-check-gui-linux
+	@cp -f $(STAGING)/linux/libglfw.so* bin/ 2>/dev/null || true
+	@cp -f $(STAGING)/linux/DejaVuSans.ttf bin/DejaVuSans.ttf 2>/dev/null || true
+	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
 	@ls -lh bin/connect-check-gui-linux
 endif
 
 package-all: package-mac package-win package-linux
-	@cp -f bin/linux/connect-check-gui bin/connect-check-gui-linux 2>/dev/null || true
-	@cp -f bin/win/connect-check-gui.exe bin/connect-check-gui-win.exe 2>/dev/null || true
-	@chmod +x bin/connect-check-gui-linux bin/connect-check-gui-win.exe 2>/dev/null || true
 	@echo ""
-	@echo "GUI готов (в OS-папках и в корне bin/):"
+	@echo "GUI в корне bin/:"
 	@ls -ld bin/ConnectCheck-mac.app 2>/dev/null || true
-	@ls -lh bin/connect-check-gui-linux bin/connect-check-gui-win.exe \
-	        bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf \
-	        bin/linux/connect-check-gui bin/linux/libglfw* bin/linux/DejaVuSans.ttf \
-	        bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf 2>/dev/null || true
+	@ls -lh bin/connect-check-gui-linux bin/connect-check-gui-win.exe bin/DejaVuSans.ttf bin/libglfw.so* 2>/dev/null || true
 
 run: package
 ifeq ($(UNAME_S),Darwin)
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/mac) $(MAC_BIN)
+	CONNECT_CHECK_BIN_DIR=$(abspath bin/mac) open bin/ConnectCheck-mac.app
 else ifeq ($(UNAME_S),Linux)
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/linux) $(LINUX_BIN)
+	CONNECT_CHECK_BIN_DIR=$(abspath bin/linux) ./bin/connect-check-gui-linux
 else
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/win) $(WIN_BIN)
+	CONNECT_CHECK_BIN_DIR=$(abspath bin/win) ./bin/connect-check-gui-win.exe
 endif
 
 clean:
+	rm -rf bin/ConnectCheck-mac.app
+	rm -f bin/connect-check-gui-mac bin/connect-check-gui-linux bin/connect-check-gui-win.exe
+	rm -f bin/DejaVuSans.ttf bin/libglfw.so*
+	rm -rf bin/mac/ConnectCheck.app
 	rm -f bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
-	rm -rf bin/mac/ConnectCheck.app bin/ConnectCheck-mac.app
 	rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
 	rm -f bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
-	rm -f bin/connect-check-gui-mac bin/connect-check-gui-linux bin/connect-check-gui-win.exe
+	rm -rf $(STAGING)

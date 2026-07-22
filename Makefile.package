@@ -43,11 +43,12 @@ package: mac linux win
 dist: package
 	mkdir -p dist
 	rm -f dist/connect-check-*-$(VERSION).* 2>/dev/null || true
-	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz linux
-	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz mac ConnectCheck-mac.app VERSION resources.conf 2>/dev/null || \
-	  tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz mac VERSION resources.conf
-	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip win connect-check-gui-win.exe VERSION resources.conf 2>/dev/null || \
-	  (cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip win VERSION resources.conf)
+	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz \
+	  linux connect-check-gui-linux libglfw.so.3 DejaVuSans.ttf VERSION resources.conf
+	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz \
+	  mac ConnectCheck-mac.app VERSION resources.conf
+	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip \
+	  win connect-check-gui-win.exe DejaVuSans.ttf VERSION resources.conf
 	@ls -lh dist/connect-check-*-$(VERSION).*
 	@echo "dist/ готов — прикрепить к GitHub Release v$(VERSION)"
 
@@ -106,7 +107,7 @@ endif
 
 clean-package:
 	rm -f bin/mac/* bin/linux/* bin/win/*
-	rm -f bin/resources.conf bin/VERSION
+	rm -f bin/resources.conf bin/VERSION bin/DejaVuSans.ttf bin/libglfw.so*
 	rm -f bin/connect-check-gui-linux bin/connect-check-gui-win.exe
-	rm -rf bin/ConnectCheck-mac.app
+	rm -rf bin/ConnectCheck-mac.app bin/mac/ConnectCheck.app
 	@echo "bin/{mac,linux,win} и GUI в корне очищены (README сохранён)"

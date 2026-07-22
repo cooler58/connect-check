@@ -2,6 +2,12 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.0.5] — 2026-07-22
+
+### Changed
+- Раскладка `bin/`: **GUI только в корне** (`ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe`); CLI — только в `bin/{mac,linux,win}/`.
+- Полная пересборка всех ОС + Linux GUI; документация обновлена.
+
 ## [1.0.4] — 2026-07-22
 
 ### Fixed

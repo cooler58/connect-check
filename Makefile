@@ -31,9 +31,12 @@ release:
 	  echo "$$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "VERSION должен быть semver X.Y.Z, сейчас: $$ver"; exit 1; }; \
 	  echo "release connect-check $$ver"
 	$(MAKE) -f Makefile.package
-	-$(MAKE) -f Makefile.gui
+	$(MAKE) -f Makefile.gui package-all
 	$(MAKE) -f Makefile.package dist
-	@test -x bin/linux/connect-check || { echo "release: нет linux — abort"; exit 1; }
+	@test -x bin/linux/connect-check || { echo "release: нет linux CLI — abort"; exit 1; }
+	@test -d bin/ConnectCheck-mac.app || { echo "release: нет mac GUI — abort"; exit 1; }
+	@test -f bin/connect-check-gui-win.exe || { echo "release: нет win GUI — abort"; exit 1; }
+	@test -x bin/connect-check-gui-linux || { echo "release: нет linux GUI — abort"; exit 1; }
 
 version:
 	@echo "connect-check $$(tr -d '[:space:]' < VERSION)"

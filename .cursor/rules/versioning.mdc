@@ -7,7 +7,7 @@ alwaysApply: true
 
 - Проект называется **connect-check** (не netscan). Основной бинарь: `connect-check`.
 - Версия только из корневого `VERSION` (semver). При релизе синхронизировать `CHANGELOG.md`, тег `vX.Y.Z`, пуш ветки и тега.
-- Исходники в `src/`, GUI в `gui/`, готовые сборки в `bin/` **коммитить при релизе** (`make release`).
-- Не коммитить `reports/`, HTML-отчёты, `build/`, `.venv/`, отладочные бинарники в корне (`./connect-check`, `./probe-*`).
-- Сборка: `make package`, `make gui`, `make release`. Подробности: `docs/VERSIONING.md`.
+- Исходники в `src/`, GUI в `gui/`. В `bin/`: **GUI только в корне**, CLI только в `bin/{mac,linux,win}/` — коммитить при релизе (`make release`).
+- Не коммитить `reports/`, HTML-отчёты, `build/`, `dist/`, `.venv/`, отладочные бинарники в корне репо (`./connect-check`, `./probe-*`).
+- Сборка: `make package`, `make -f Makefile.gui package-all`, `make release`. Подробности: `docs/VERSIONING.md`, `bin/README.md`.
 - После релиза — коммит + `git push` на `origin` (`cooler58/connect-check`) + тег `vX.Y.Z`, не force-push в `main`.

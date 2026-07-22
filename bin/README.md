@@ -1,68 +1,49 @@
 # connect-check — пакет в `bin/`
 
-Сборка: `make package` (или `make -f Makefile.package`).
-
-В репозитории лежат **готовые сборки** последней версии:
-
-| Каталог | Содержимое |
-|---------|------------|
-| [`bin/linux/`](linux/) | **Linux x86_64** (static musl): `connect-check` + все `probe-*` + `resources.conf` |
-| [`bin/mac/`](mac/) | macOS arm64 CLI + GUI |
-| [`bin/win/`](win/) | Windows x86_64 CLI + GUI |
-
-Скачать пакетом: GitHub Release → `connect-check-linux-x86_64-*.tar.gz` (весь `bin/linux`).
-
-Сборка: `make package` / `make dist` (нужен `zig` для кросс-сборки Linux с macOS).
-
-## Содержимое после сборки
+## Раскладка
 
 | Путь | Что |
 |------|-----|
-| `resources.conf` | общие списки ресурсов (копия также в каждой OS-папке) |
-| `VERSION` | версия пакета (`-V` / `--version`) |
-| `ConnectCheck-mac.app` | GUI macOS (двойной клик; CLI ищет в `bin/mac/`) |
-| `connect-check-gui-linux` | GUI Linux |
-| `connect-check-gui-win.exe` | GUI Windows |
-| `mac/` `linux/` `win/` | CLI + probe-* + conf для соответствующей ОС |
+| **`bin/ConnectCheck-mac.app`** | GUI macOS |
+| **`bin/connect-check-gui-linux`** | GUI Linux (+ рядом `libglfw*.so`, `DejaVuSans.ttf` при необходимости) |
+| **`bin/connect-check-gui-win.exe`** | GUI Windows (+ `DejaVuSans.ttf` в корне `bin/`) |
+| `bin/mac/` | CLI macOS: `connect-check`, `probe-*`, `resources.conf` |
+| `bin/linux/` | CLI Linux x86_64 (static musl): то же |
+| `bin/win/` | CLI Windows: `connect-check.exe`, `probe-*.exe`, `connect-check.cmd`, `resources.conf` |
+| `bin/resources.conf`, `bin/VERSION` | общие файлы пакета |
+
+GUI — **только в корне `bin/`**. Остальные бинарники — **только в папках ОС**.
+
+Сборка: `make package` (CLI) + `make -f Makefile.gui package-all` (GUI). Архивы Release: `make dist`.
 
 ## `connect-check` — полная диагностика
 
 ```bash
-./connect-check
-./connect-check -V
-./connect-check -y
-./connect-check -y --skip-dns-bulk --skip-video
-./connect-check -y -o ./reports --no-open
-./connect-check --resources ./my.conf -y
+./bin/mac/connect-check -V
+./bin/linux/connect-check -y
+./bin/win/connect-check.exe -y
 ```
 
-Windows: `connect-check.cmd` или `connect-check.exe`.
-
-Списки этапов читаются из `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`, `[infra_tcp]`).
-
-Секция **`[infra_tcp]`** — TCP к облачной инфраструктуре (сейчас Selectel СПб/Москва: SSH/80/443).
+Списки: `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`, `[infra_tcp]`, `[infra_https]`).
 
 ## GUI
 
-| Артефакт | ОС |
-|----------|-----|
-| `ConnectCheck-mac.app` | macOS |
-| `connect-check-gui-linux` | Linux |
-| `connect-check-gui-win.exe` | Windows |
-
-Рядом должны лежать `connect-check`, `probe-*`, `resources.conf`. Каталог CLI можно задать через `CONNECT_CHECK_BIN_DIR`.
-
 ```bash
 open bin/ConnectCheck-mac.app
-CONNECT_CHECK_BIN_DIR=/path/to/bin/mac ./bin/mac/connect-check-gui
+CONNECT_CHECK_BIN_DIR=bin/mac open bin/ConnectCheck-mac.app
+
+CONNECT_CHECK_BIN_DIR=bin/linux ./bin/connect-check-gui-linux
+CONNECT_CHECK_BIN_DIR=bin/win ./bin/connect-check-gui-win.exe
 ```
+
+Рядом с GUI задайте `CONNECT_CHECK_BIN_DIR` на папку CLI вашей ОС (`bin/mac`, `bin/linux` или `bin/win`).
 
 ## Когда что запускать
 
 | Симптом | Инструмент |
 |---------|------------|
-| На телефоне/TV «нет интернета», браузер на ПК жив | `connect-check` или `probe-captive` |
+| На телефоне/TV «нет интернета» | `connect-check` или `probe-captive` |
 | Игры / Battle.net | `connect-check` + `probe-battlenet` / `probe-quic` |
-| Умный дом / Tuya | `connect-check` (IoT) + `probe-mqtt` |
+| Умный дом / Tuya | `connect-check` + `probe-mqtt` |
 | Видео / CDN | `connect-check` + `probe-video` |
-| Подозрение на DPI / Private DNS | `connect-check`, findings DoT/DoH |
+| DPI / Private DNS | `connect-check`, findings DoT/DoH |

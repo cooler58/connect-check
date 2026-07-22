@@ -29,23 +29,24 @@
 ## Что коммитить в релизе
 
 - Исходники, `resources.conf`, `VERSION`, документация
-- **Готовые бинарники** в `bin/{mac,linux,win}/`, `bin/resources.conf`, `bin/VERSION`, GUI в корне `bin/` (`ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe`)
+- **CLI** в `bin/{mac,linux,win}/` (`connect-check`, `probe-*`, `resources.conf`)
+- **GUI только в корне `bin/`:** `ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe` (+ `DejaVuSans.ttf` / `libglfw*.so` при необходимости)
 
 ## Что не коммитить
 
 - `reports/`, HTML-отчёты
-- `build/`, `top_domains_embed.h` (генерируется)
-- отладочные бинарники в **корне** репозитория (`./connect-check`, `./probe-*`)
-- `.venv/`, `.env`, `.DS_Store`, `*.zip` пакетов
-
+- `build/`, `dist/`, `top_domains_embed.h`
+- отладочные бинарники в **корне репозитория** (`./connect-check`, `./probe-*`)
+- GUI внутри `bin/mac|linux|win/` (туда не кладём)
+- `.venv/`, `.env`, `.DS_Store`, `*.zip`
 
 ## Структура каталогов
 
 | Путь | Роль |
 |------|------|
 | `src/` | CLI и probe исходники |
-| `gui/` | GUI |
-| `bin/` | выход сборки (локально) |
+| `gui/` | GUI исходник |
+| `bin/` | GUI в корне; CLI по `mac/` `linux/` `win/` |
 | `docs/` | процесс |
 | `scripts/` | генераторы для сборки |
 | `wordlists/` | данные для embed DNS-списка |
@@ -53,7 +54,7 @@
 
 ## Имена артефактов
 
-- CLI: `connect-check` / `connect-check.exe`
-- пробы: `probe-*`
-- GUI: `connect-check-gui`, `ConnectCheck.app` / `ConnectCheck-mac.app`
-- env: `CONNECT_CHECK_BIN_DIR`
+- CLI: `bin/<os>/connect-check` (+ `.exe` на Windows)
+- пробы: `bin/<os>/probe-*`
+- GUI: `bin/ConnectCheck-mac.app`, `bin/connect-check-gui-linux`, `bin/connect-check-gui-win.exe`
+- env: `CONNECT_CHECK_BIN_DIR` → каталог CLI (`bin/mac` и т.д.)
