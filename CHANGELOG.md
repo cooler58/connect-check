@@ -2,6 +2,11 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.0.4] — 2026-07-22
+
+### Fixed
+- Полная пересборка и выкладка **всех** бинарников (mac/linux/win + probes + GUI); в Release — архивы пакетов, не один файл.
+
 ## [1.0.3] — 2026-07-22
 
 ### Fixed

@@ -18,10 +18,11 @@
 
 1. Обновить `VERSION`.
 2. Запись в [`CHANGELOG.md`](../CHANGELOG.md) под новый заголовок.
-3. `make release` (или `make package` + при необходимости `make gui`).
-4. Коммит: `release: vX.Y.Z — краткое why`.
+3. `make release` (package + gui + `dist/` архивы; **linux обязателен** — нужен `zig` на macOS).
+4. Коммит: `release: vX.Y.Z — краткое why` (включая `bin/mac`, `bin/linux`, `bin/win`).
 5. Тег: `git tag -a vX.Y.Z -m "connect-check vX.Y.Z"`.
 6. Пуш: `git push origin main && git push origin vX.Y.Z`.
+7. GitHub Release: прикрепить `dist/connect-check-{linux,mac,win}-*-vX.Y.Z.*` (полный linux-пакет, не один файл).
 
 Каждая опубликованная версия должна уезжать на GitHub (ветка + тег). Не пушить «сырые» WIP-коммиты как релизные теги.
 

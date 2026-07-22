@@ -24,13 +24,32 @@ endif
 PROBES := probe-quic probe-battlenet probe-mqtt probe-video probe-captive probe-url
 WIN_PROBES := $(addsuffix .exe,$(PROBES))
 
-.PHONY: package clean-package linux mac win help
+.PHONY: package clean-package linux mac win help dist
 
 package: mac linux win
+	@test -x bin/linux/connect-check || { echo "ОШИБКА: нет bin/linux/connect-check — нужен zig (brew install zig)"; exit 1; }
+	@test -x bin/mac/connect-check || { echo "ОШИБКА: нет bin/mac/connect-check"; exit 1; }
+	@test -f bin/win/connect-check.exe || { echo "ОШИБКА: нет bin/win/connect-check.exe"; exit 1; }
 	cp -f resources.conf bin/resources.conf
+	cp -f resources.conf bin/mac/resources.conf
+	cp -f resources.conf bin/linux/resources.conf
+	cp -f resources.conf bin/win/resources.conf
 	cp -f VERSION bin/VERSION
 	@echo "Готово: bin/{mac,linux,win} + bin/resources.conf (connect-check $(VERSION))"
+	@echo "  linux: $$(file -b bin/linux/connect-check)"
 	@ls -la bin/mac bin/linux bin/win bin/resources.conf bin/VERSION 2>/dev/null || true
+
+# Архивы для GitHub Releases (не коммитятся — см. .gitignore *.zip / dist/)
+dist: package
+	mkdir -p dist
+	rm -f dist/connect-check-*-$(VERSION).* 2>/dev/null || true
+	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz linux
+	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz mac ConnectCheck-mac.app VERSION resources.conf 2>/dev/null || \
+	  tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz mac VERSION resources.conf
+	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip win connect-check-gui-win.exe VERSION resources.conf 2>/dev/null || \
+	  (cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip win VERSION resources.conf)
+	@ls -lh dist/connect-check-*-$(VERSION).*
+	@echo "dist/ готов — прикрепить к GitHub Release v$(VERSION)"
 
 help:
 	@echo "make -f Makefile.package          — mac + linux + win в bin/"

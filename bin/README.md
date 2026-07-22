@@ -2,7 +2,17 @@
 
 Сборка: `make package` (или `make -f Makefile.package`).
 
-В репозитории лежат **готовые сборки** последней версии (`bin/{mac,linux,win}/`, GUI). После `git pull` можно сразу запускать без локальной компиляции.
+В репозитории лежат **готовые сборки** последней версии:
+
+| Каталог | Содержимое |
+|---------|------------|
+| [`bin/linux/`](linux/) | **Linux x86_64** (static musl): `connect-check` + все `probe-*` + `resources.conf` |
+| [`bin/mac/`](mac/) | macOS arm64 CLI + GUI |
+| [`bin/win/`](win/) | Windows x86_64 CLI + GUI |
+
+Скачать пакетом: GitHub Release → `connect-check-linux-x86_64-*.tar.gz` (весь `bin/linux`).
+
+Сборка: `make package` / `make dist` (нужен `zig` для кросс-сборки Linux с macOS).
 
 ## Содержимое после сборки
 
