@@ -1,0 +1,13 @@
+---
+description: Версии, релизы и сборка connect-check
+alwaysApply: true
+---
+
+# connect-check — версии и git
+
+- Проект называется **connect-check** (не netscan). Основной бинарь: `connect-check`.
+- Версия только из корневого `VERSION` (semver). При релизе синхронизировать `CHANGELOG.md`, тег `vX.Y.Z`, пуш ветки и тега.
+- Исходники в `src/`, GUI в `gui/`, выход в `bin/` (бинарники не коммитить).
+- Не коммитить `reports/`, HTML-отчёты, `build/`, `.venv/`, корневые `connect-check`/`probe-*`/`*.exe`.
+- Сборка: `make package`, `make gui`, `make release`. Подробности: `docs/VERSIONING.md`.
+- После запрошенного релиза — коммит + `git push` на `origin` (`cooler58/connect-check`), не force-push в `main`.

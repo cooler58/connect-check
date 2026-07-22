@@ -1,0 +1,13 @@
+---
+description: Структура и именование connect-check
+globs: "{src,gui,scripts}/**/*.{c,h,py},Makefile*"
+alwaysApply: false
+---
+
+# Структура кода
+
+- `src/connect-check.c` — главная диагностика; `src/probe-*.c` — пробы; `src/version.h` — макрос версии.
+- GUI: `gui/connect-check-gui.c`, ищет CLI по имени `connect-check`, env `CONNECT_CHECK_BIN_DIR`.
+- Макрос версии: `CONNECT_CHECK_VERSION` (через `-D` из Makefile).
+- Embed доменов: `scripts/embed_domains.py` → `build/top_domains_embed.h` (в git не класть).
+- Не возвращать имена netscan / diagnose-net / NetScan в новых строках UI и документации.

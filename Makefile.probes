@@ -1,0 +1,63 @@
+# connect-check — периодические пробы
+CC       ?= cc
+VERSION  := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
+CFLAGS   ?= -O2 -Wall -Wextra
+CFLAGS   += -Isrc -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+MINGW    ?= x86_64-w64-mingw32-gcc
+WINFLAGS := -O2 -Wall -D_WIN32_WINNT=0x0601 -Isrc -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+WINLIBS  := -lws2_32
+SRC_DIR  := src
+
+.PHONY: all quic battlenet mqtt video captive url win clean
+
+PROBES := probe-quic probe-battlenet probe-mqtt probe-video probe-captive probe-url
+
+all: $(PROBES)
+
+quic: probe-quic
+battlenet: probe-battlenet
+mqtt: probe-mqtt
+video: probe-video
+captive: probe-captive
+url: probe-url
+
+probe-quic: $(SRC_DIR)/probe-quic.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe-battlenet: $(SRC_DIR)/probe-battlenet.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe-mqtt: $(SRC_DIR)/probe-mqtt.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe-video: $(SRC_DIR)/probe-video.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe-captive: $(SRC_DIR)/probe-captive.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+probe-url: $(SRC_DIR)/probe-url.c src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $<
+
+win: $(addsuffix .exe,$(PROBES))
+
+probe-quic.exe: $(SRC_DIR)/probe-quic.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS)
+
+probe-battlenet.exe: $(SRC_DIR)/probe-battlenet.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS)
+
+probe-mqtt.exe: $(SRC_DIR)/probe-mqtt.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS)
+
+probe-video.exe: $(SRC_DIR)/probe-video.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS) -lwininet
+
+probe-captive.exe: $(SRC_DIR)/probe-captive.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS)
+
+probe-url.exe: $(SRC_DIR)/probe-url.c src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $< $(WINLIBS)
+
+clean:
+	rm -f $(PROBES) $(addsuffix .exe,$(PROBES))

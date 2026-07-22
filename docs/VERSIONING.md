@@ -1,0 +1,54 @@
+# Версии, сборки и релизы
+
+## SemVer
+
+Файл [`VERSION`](../VERSION) в корне — единственный источник правды (формат `MAJOR.MINOR.PATCH`).
+
+| Изменение | Когда |
+|-----------|--------|
+| **PATCH** `x.y.Z` | фикс бага, правка списков в `resources.conf`, мелкие правки отчёта |
+| **MINOR** `x.Y.0` | новый этап/проба, новый флаг CLI, совместимое расширение |
+| **MAJOR** `X.0.0` | ломающее изменение CLI/формата отчёта/`resources.conf` |
+
+Макрос сборки: `-DCONNECT_CHECK_VERSION="…"`. Заголовок: `src/version.h`.
+
+Формат `resources.conf`: поле `connect-check-version` и `CONNECT_CHECK_RESOURCES_FORMAT` — при несовместимом формате поднимать MAJOR или формат+MINOR.
+
+## Процесс релиза
+
+1. Обновить `VERSION`.
+2. Запись в [`CHANGELOG.md`](../CHANGELOG.md) под новый заголовок.
+3. `make release` (или `make package` + при необходимости `make gui`).
+4. Коммит: `release: vX.Y.Z — краткое why`.
+5. Тег: `git tag -a vX.Y.Z -m "connect-check vX.Y.Z"`.
+6. Пуш: `git push origin main && git push origin vX.Y.Z`.
+
+Каждая опубликованная версия должна уезжать на GitHub (ветка + тег). Не пушить «сырые» WIP-коммиты как релизные теги.
+
+## Что не коммитить
+
+- `reports/`, HTML-отчёты
+- `build/`, `top_domains_embed.h` (генерируется)
+- бинарники в корне и `bin/{mac,linux,win}/**` (кроме `bin/README.md`)
+- `.venv/`, `.env`, `.DS_Store`, `*.zip` пакетов
+
+Исходники и `resources.conf` / `VERSION` / документация — в git.
+
+## Структура каталогов
+
+| Путь | Роль |
+|------|------|
+| `src/` | CLI и probe исходники |
+| `gui/` | GUI |
+| `bin/` | выход сборки (локально) |
+| `docs/` | процесс |
+| `scripts/` | генераторы для сборки |
+| `wordlists/` | данные для embed DNS-списка |
+| `third_party/` | вендоренные зависимости GUI |
+
+## Имена артефактов
+
+- CLI: `connect-check` / `connect-check.exe`
+- пробы: `probe-*`
+- GUI: `connect-check-gui`, `ConnectCheck.app` / `ConnectCheck-mac.app`
+- env: `CONNECT_CHECK_BIN_DIR`

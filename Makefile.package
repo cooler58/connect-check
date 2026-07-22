@@ -1,0 +1,93 @@
+# Пакет bin/: mac + linux + win
+#
+#   make -f Makefile.package
+#   make package   (из корневого Makefile)
+
+UNAME_S := $(shell uname -s)
+VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
+
+ifeq ($(UNAME_S),Linux)
+  LINUX_CC     ?= cc
+  LINUX_CFLAGS ?= -O2 -Wall -Wextra -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+  LINUX_LABEL  := native
+else
+  ZIG ?= $(shell command -v zig 2>/dev/null)
+  ifneq ($(ZIG),)
+    LINUX_CC     ?= $(ZIG) cc -target x86_64-linux-musl
+    LINUX_CFLAGS ?= -O2 -Wall -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+    LINUX_LABEL  := zig-musl-x86_64
+  else
+    LINUX_CC     ?=
+  endif
+endif
+
+PROBES := probe-quic probe-battlenet probe-mqtt probe-video probe-captive probe-url
+WIN_PROBES := $(addsuffix .exe,$(PROBES))
+
+.PHONY: package clean-package linux mac win help
+
+package: mac linux win
+	cp -f resources.conf bin/resources.conf
+	cp -f VERSION bin/VERSION
+	@echo "Готово: bin/{mac,linux,win} + bin/resources.conf (connect-check $(VERSION))"
+	@ls -la bin/mac bin/linux bin/win bin/resources.conf bin/VERSION 2>/dev/null || true
+
+help:
+	@echo "make -f Makefile.package          — mac + linux + win в bin/"
+	@echo "make -f Makefile.package linux    — только bin/linux"
+	@echo "make -f Makefile.package mac      — только bin/mac (на Darwin)"
+	@echo "make -f Makefile.package win      — только bin/win"
+	@echo "make -f Makefile.gui              — GUI (Nuklear/C, нужен GLFW)"
+	@echo "Нужен zig (brew install zig) для Linux-сборки с macOS."
+
+mac:
+ifeq ($(UNAME_S),Darwin)
+	$(MAKE) -f Makefile.diagnose all
+	$(MAKE) -f Makefile.probes all
+	mkdir -p bin/mac
+	cp -f connect-check $(PROBES) bin/mac/
+	cp -f resources.conf bin/mac/
+	chmod +x bin/mac/connect-check bin/mac/probe-*
+	@echo "bin/mac обновлён (Darwin)"
+else ifeq ($(UNAME_S),Linux)
+	@echo "Пропуск bin/mac (сборка не на macOS). Соберите на Mac или скопируйте готовое."
+else
+	@echo "Пропуск bin/mac (хост $(UNAME_S))"
+endif
+
+win:
+	$(MAKE) -f Makefile.diagnose win
+	$(MAKE) -f Makefile.probes win
+	mkdir -p bin/win
+	cp -f connect-check.exe $(WIN_PROBES) bin/win/
+	cp -f resources.conf bin/win/
+	-cp -f src/connect-check.cmd bin/win/
+	@echo "bin/win обновлён"
+
+linux:
+ifeq ($(LINUX_CC),)
+	@echo "Нет компилятора для Linux."
+	@echo "  • на Linux: обычный cc"
+	@echo "  • на macOS: brew install zig   (кросс x86_64-linux-musl)"
+	@exit 1
+endif
+	$(MAKE) -f Makefile.diagnose embed
+	mkdir -p bin/linux
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/connect-check src/connect-check.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-quic src/probe-quic.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-battlenet src/probe-battlenet.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-mqtt src/probe-mqtt.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-video src/probe-video.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-captive src/probe-captive.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-url src/probe-url.c
+	cp -f resources.conf bin/linux/
+	chmod +x bin/linux/*
+	@echo "bin/linux обновлён ($(LINUX_LABEL))"
+	@file bin/linux/connect-check bin/linux/probe-url | sed 's|^|  |'
+
+clean-package:
+	rm -f bin/mac/* bin/linux/* bin/win/*
+	rm -f bin/resources.conf bin/VERSION
+	rm -f bin/connect-check-gui-linux bin/connect-check-gui-win.exe
+	rm -rf bin/ConnectCheck-mac.app
+	@echo "bin/{mac,linux,win} и GUI в корне очищены (README сохранён)"

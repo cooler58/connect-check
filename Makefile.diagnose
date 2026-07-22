@@ -1,0 +1,35 @@
+# connect-check — основная диагностика
+CC       ?= cc
+VERSION  := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
+CFLAGS   ?= -O2 -Wall -Wextra
+CFLAGS   += -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+MINGW    ?= x86_64-w64-mingw32-gcc
+WINFLAGS := -O2 -Wall -D_WIN32_WINNT=0x0601 -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+WINLIBS  := -lwininet -lws2_32 -liphlpapi -lshell32
+EMBED_H  := build/top_domains_embed.h
+DOMAINS  := wordlists/top_domains.txt
+SRC      := src/connect-check.c
+BIN      := connect-check
+WINBIN   := connect-check.exe
+
+.PHONY: all win clean embed
+
+all: $(BIN)
+
+embed: $(EMBED_H)
+
+$(EMBED_H): $(DOMAINS) scripts/embed_domains.py
+	mkdir -p build
+	python3 scripts/embed_domains.py $(DOMAINS) $(EMBED_H)
+
+$(BIN): $(SRC) $(EMBED_H) src/version.h VERSION
+	$(CC) $(CFLAGS) -o $@ $(SRC)
+
+win: $(WINBIN)
+
+$(WINBIN): $(SRC) $(EMBED_H) src/version.h VERSION
+	$(MINGW) $(WINFLAGS) -o $@ $(SRC) $(WINLIBS)
+
+clean:
+	rm -f $(BIN) $(WINBIN)
+	rm -f $(EMBED_H)
