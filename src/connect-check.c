@@ -2384,6 +2384,8 @@ static ResTcp g_game_tcp[MAX_RES];
 static int g_ngame_tcp;
 static ResTcp g_infra_tcp[MAX_RES];
 static int g_ninfra_tcp;
+static ResHttp g_infra_https[MAX_RES];
+static int g_ninfra_https;
 static ResHttp g_game_https[MAX_RES];
 static int g_ngame_https;
 static ResHttpCrit g_ai[MAX_RES];
@@ -2515,19 +2517,22 @@ static void resources_load_defaults(void) {
         {"Selectel Мск S3 :80", "s3.ru-7.storage.selcloud.ru", 80, 0},
         {"Selectel Мск S3 :443", "s3.ru-7.storage.selcloud.ru", 443, 0},
         {"Selectel Мск API :443", "api.ru-7.storage.selcloud.ru", 443, 0},
-        /* AWS — глобальный + EU (Frankfurt / Stockholm) */
-        {"AWS S3 :443", "s3.amazonaws.com", 443, 0},
-        {"AWS S3 EU-Central :80", "s3.eu-central-1.amazonaws.com", 80, 0},
+        /* AWS TCP — региональные (глобальный s3.amazonaws.com из РФ часто рвёт TLS) */
         {"AWS S3 EU-Central :443", "s3.eu-central-1.amazonaws.com", 443, 0},
         {"AWS S3 EU-North :443", "s3.eu-north-1.amazonaws.com", 443, 0},
         {"AWS EC2 EU-Central :443", "ec2.eu-central-1.amazonaws.com", 443, 0},
-        {"AWS STS EU-Central :443", "sts.eu-central-1.amazonaws.com", 443, 0},
         /* Azure */
         {"Azure portal :443", "portal.azure.com", 443, 0},
         {"Azure management :443", "management.azure.com", 443, 0},
         {"Azure login :443", "login.microsoftonline.com", 443, 0},
-        {"Azure Blob East US :80", "eastus.blob.core.windows.net", 80, 0},
         {"Azure Blob East US :443", "eastus.blob.core.windows.net", 443, 0},
+    };
+    /* HTTPS-проверки облаков: 200/301/403 XML от S3 = сервис отвечает */
+    static const struct { const char *name, *url; } ihttps[] = {
+        {"AWS Health", "https://health.aws.amazon.com/health/status"},
+        {"AWS Status", "https://status.aws.amazon.com/"},
+        {"AWS S3 (landsat-pds)", "https://landsat-pds.s3.amazonaws.com/"},
+        {"AWS S3 CDN (amazonlinux)", "https://cdn.amazonlinux.com/"},
     };
     static const struct { const char *name, *url; } ghttps[] = {
         {"Battle.net", "https://battle.net/"},
@@ -2644,6 +2649,14 @@ static void resources_load_defaults(void) {
         g_infra_tcp[i].crit = itcp[i].crit;
     }
 
+    n = (int)(sizeof ihttps / sizeof ihttps[0]);
+    if (n > MAX_RES) n = MAX_RES;
+    g_ninfra_https = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_infra_https[i].name, sizeof g_infra_https[i].name, "%s", ihttps[i].name);
+        snprintf(g_infra_https[i].url, sizeof g_infra_https[i].url, "%s", ihttps[i].url);
+    }
+
     n = (int)(sizeof ghttps / sizeof ghttps[0]);
     if (n > MAX_RES) n = MAX_RES;
     g_ngame_https = n;
@@ -2688,11 +2701,12 @@ static int resources_load_file(const char *path) {
     FILE *f;
     char line[1024];
     char section[64] = "";
-    int got_sig = 0, got_gtcp = 0, got_itcp = 0, got_ghttps = 0, got_ai = 0, got_vid = 0, got_bank = 0;
-    int nsig = 0, ngtcp = 0, nitcp = 0, nghttps = 0, nai = 0, nvid = 0, nbank = 0;
+    int got_sig = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_ai = 0, got_vid = 0, got_bank = 0;
+    int nsig = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, nai = 0, nvid = 0, nbank = 0;
     ResSig sig[MAX_RES];
     ResTcp gtcp[MAX_RES];
     ResTcp itcp[MAX_RES];
+    ResHttp ihttps[MAX_RES];
     ResHttp ghttps[MAX_RES];
     ResHttpCrit ai[MAX_RES];
     ResVideo vids[MAX_RES];
@@ -2739,6 +2753,11 @@ static int resources_load_file(const char *path) {
             itcp[nitcp].crit = (nf > 3 && fields[3][0] == '1') ? 1 : 0;
             nitcp++;
             got_itcp = 1;
+        } else if (strcmp(section, "infra_https") == 0 && nihttps < MAX_RES) {
+            snprintf(ihttps[nihttps].name, sizeof ihttps[nihttps].name, "%s", fields[0]);
+            snprintf(ihttps[nihttps].url, sizeof ihttps[nihttps].url, "%s", fields[1]);
+            nihttps++;
+            got_ihttps = 1;
         } else if (strcmp(section, "games_https") == 0 && nghttps < MAX_RES) {
             snprintf(ghttps[nghttps].name, sizeof ghttps[nghttps].name, "%s", fields[0]);
             snprintf(ghttps[nghttps].url, sizeof ghttps[nghttps].url, "%s", fields[1]);
@@ -2777,6 +2796,10 @@ static int resources_load_file(const char *path) {
     if (got_itcp) {
         memcpy(g_infra_tcp, itcp, (size_t)nitcp * sizeof itcp[0]);
         g_ninfra_tcp = nitcp;
+    }
+    if (got_ihttps) {
+        memcpy(g_infra_https, ihttps, (size_t)nihttps * sizeof ihttps[0]);
+        g_ninfra_https = nihttps;
     }
     if (got_ghttps) {
         memcpy(g_game_https, ghttps, (size_t)nghttps * sizeof ghttps[0]);
@@ -4184,16 +4207,66 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Облака: Selectel / AWS / Azure (TCP) */
-    if (g_ninfra_tcp > 0 &&
-        stage_begin("Облако", "Selectel (СПб/Мск), AWS, Azure — TCP 22/80/443")) {
+    /* Облака: Selectel / AWS / Azure — TCP + рабочие HTTPS (AWS/S3) */
+    if ((g_ninfra_tcp > 0 || g_ninfra_https > 0) &&
+        stage_begin("Облако", "Selectel, AWS/S3, Azure — TCP и HTTPS")) {
         char fail[64][64];
         int nfail = 0;
         int n = g_ninfra_tcp;
+        int nh = g_ninfra_https;
         for (i = 0; i < n; i++) {
-            stage_item(g_infra_tcp[i].name, i + 1, n);
+            stage_item(g_infra_tcp[i].name, i + 1, n + nh);
             check_tcp_ep("Облако", g_infra_tcp[i].name, g_infra_tcp[i].host, g_infra_tcp[i].port,
                          4000, g_infra_tcp[i].crit, 0, &nfail, fail, 64);
+        }
+        for (i = 0; i < nh; i++) {
+            HttpResult r;
+            char host[128], ip[64], ua_sum[256];
+            int ua_mismatch;
+            stage_item(g_infra_https[i].name, n + i + 1, n + nh);
+            r = http_probe_agents(g_infra_https[i].url, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+            host_from_url(g_infra_https[i].url, host, sizeof host);
+            ip[0] = 0;
+            if (host[0]) dns_resolve(host, ip, sizeof ip);
+            if (r.code > 0) {
+                /* 403 AccessDenied от S3/CDN = endpoint жив (аноним без ключа — норма) */
+                if (r.code >= 300 && r.code < 400) {
+                    snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
+                             r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
+                    add_check_ex("Облако", g_infra_https[i].name, "ok", detail,
+                                 "Облако отвечает редиректом.", ip, g_infra_https[i].url, 0);
+                } else {
+                    st = (r.ms > 4000 || ua_mismatch) ? "warn" : "ok";
+                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+                    add_check_ex("Облако", g_infra_https[i].name, st, detail,
+                                 (r.code == 403)
+                                     ? "403 от S3/CDN без ключа — сервис доступен (ожидаемо)."
+                                     : (r.ms > 4000 ? "Медленный ответ облака" : ""),
+                                 ip, g_infra_https[i].url, 0);
+                }
+            } else if (host_unresolved(host, ip)) {
+                snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
+                add_check_ex("Облако", g_infra_https[i].name, "warn", detail,
+                             "Имя не резолвится — сбой DNS, не обязательно блок AWS.",
+                             NULL, g_infra_https[i].url, 0);
+            } else {
+                snprintf(detail, sizeof detail, "%s [%s]",
+                         r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
+                add_check_ex("Облако", g_infra_https[i].name, "fail", detail,
+                             "HTTPS к AWS/S3 недоступен (DPI/фильтр/маршрут).",
+                             ip, g_infra_https[i].url, 0);
+                if (nfail < 64) snprintf(fail[nfail++], 64, "%s", g_infra_https[i].name);
+            }
+        }
+        if (nfail > 0) {
+            char names[LONGSTR] = "", tx[LONGSTR];
+            for (i = 0; i < nfail; i++) {
+                if (i) strcat(names, ", ");
+                strcat(names, fail[i]);
+            }
+            snprintf(detail, sizeof detail, "Облако: сбои HTTPS (%d)", nfail);
+            snprintf(tx, sizeof tx, "Не отвечают: %s.", names);
+            add_finding(nfail >= 2 ? "warning" : "info", detail, tx);
         }
         stage_done();
     }

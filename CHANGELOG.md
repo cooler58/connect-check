@@ -2,6 +2,14 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.0.2] — 2026-07-22
+
+### Added
+- Секция `[infra_https]`: рабочие HTTPS-проверки **AWS** и **AWS S3** (Health/Status + S3 403 AccessDenied = живой endpoint).
+
+### Changed
+- Убраны flaky TCP к `s3.amazonaws.com` / STS (из РФ часто TLS timeout); оставлены EU S3/EC2 TCP + HTTPS S3.
+
 ## [1.0.1] — 2026-07-22
 
 ### Added
