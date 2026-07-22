@@ -42,6 +42,8 @@ CONNECT_CHECK_BIN_DIR=bin/linux ./bin/connect-check-gui-linux
 
 Рядом с CLI лежит **`resources.conf`**. Без файла — встроенные списки.
 
+Этапы включают значимые ресурсы, игры, **AI (TCP :443)**, видео, банки, облако, IoT. Витрины с antibot/DPI проверяются через CDN/API/облака клиента — см. [`CHANGELOG.md`](CHANGELOG.md) и [`bin/README.md`](bin/README.md).
+
 ## Сборка
 
 ```bash

@@ -26,6 +26,10 @@ GUI — **только в корне `bin/`**. Остальные бинарни
 
 Списки: `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`, `[infra_tcp]`, `[infra_https]`).
 
+Формат `[ai]` (с 1.0.6): `name|host|port|crit` — только TCP connect (HTTPS у AI часто «умный» таймаут). Старый вид `name|https://…|crit` ещё принимается.
+
+Игры / IoT: витрины store/marketing часто antibot — в conf заложены CDN/API/облака клиента (Steam CDN, Epic account/CDN, Ubisoft Services, Nabu Casa, Hue discovery, Tapo WAP и т.п.).
+
 ## GUI
 
 ```bash

@@ -157,7 +157,16 @@ else
 	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c \
 	      $$(pkg-config --libs glfw3) -lGL -lm -ldl -lpthread -Wl,-rpath,\$$ORIGIN; \
 	    SO=$$(ldd build/gui/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
-	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" build/gui/linux/; fi; \
+	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then \
+	      base=$$(basename "$$SO"); \
+	      dest="build/gui/linux/$$base"; \
+	      if [ ! -e "$$dest" ] || [ "$$SO" -ef "$$dest" ]; then \
+	        :; \
+	      else \
+	        cp -f "$$SO" "$$dest"; \
+	      fi; \
+	      if [ ! -e "$$dest" ]; then cp -f "$$SO" "$$dest" || true; fi; \
+	    fi; \
 	    cp -f third_party/fonts/DejaVuSans.ttf build/gui/linux/; \
 	    ls -lh build/gui/linux/connect-check-gui build/gui/linux/libglfw* build/gui/linux/DejaVuSans.ttf'
 	@cp -f $(STAGING)/linux/connect-check-gui bin/connect-check-gui-linux

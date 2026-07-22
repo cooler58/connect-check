@@ -121,6 +121,7 @@ static char g_prog_item[48];
 static int g_prog_cur;
 static int g_prog_total;
 static void stage_progress(const char *msg, int cur, int total);
+static void host_from_url(const char *url, char *host, size_t hostlen);
 
 /* ---------- utils ---------- */
 
@@ -809,12 +810,38 @@ static void check_tcp_ep(const char *cat, const char *name, const char *host,
 /*
  * Steam CM: старые cm2-1.steampowered.com — NXDOMAIN.
  * Берём IP:port из GetCMList WebAPI и пробуем TCP (как клиент Steam).
+ * Если api.steampowered.com режется (часто в РФ) — fallback на известные
+ * *.steamserver.net :27017 (то, куда реально ходит клиент).
  */
+static int steam_cm_try_host(const char *host, int port, char *ip, size_t iplen,
+                             long long *ms_out) {
+    long long t0;
+    ip[0] = 0;
+    if (!dns_resolve(host, ip, iplen) || !ip[0])
+        return 0;
+    t0 = now_ms();
+    if (!tcp_open(ip, port, 3500))
+        return 0;
+    if (ms_out)
+        *ms_out = now_ms() - t0;
+    return 1;
+}
+
 static void check_steam_cm(int *fail_n, char fail_names[][64], int fail_cap) {
     char out[16384], detail[STR], ip[64];
     const char *p;
-    int tried = 0, ok = 0, port = 0;
-    long long t0;
+    int tried = 0, ok = 0, port = 0, list_ok = 0;
+    long long ms = 0;
+    /* EU/ближние CM — если GetCMList недоступен (API/DPI). */
+    static const char *const cm_fallback[] = {
+        "ext1-fra1.steamserver.net",
+        "ext2-fra1.steamserver.net",
+        "ext1-ams1.steamserver.net",
+        "ext1-waw1.steamserver.net",
+        "ext1-vie1.steamserver.net",
+        "ext1-lhr1.steamserver.net",
+    };
+    size_t fi;
 #ifdef _WIN32
     const char *cmd =
         "curl.exe -sS --max-time 12 "
@@ -827,59 +854,83 @@ static void check_steam_cm(int *fail_n, char fail_names[][64], int fail_cap) {
 #endif
 
     out[0] = 0;
-    if (run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
-        add_check_ex("Игры", "Steam CM (GetCMList)", "fail",
-                     "не удалось получить список CM",
-                     "Нужен HTTPS к api.steampowered.com (ISteamDirectory/GetCMList).",
-                     NULL,
-                     "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
-                     0);
-        if (fail_n && *fail_n < fail_cap)
-            snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam CM");
+    if (run_capture(cmd, out, sizeof out) == 0 && out[0])
+        list_ok = 1;
+
+    if (list_ok) {
+        p = out;
+        ip[0] = 0;
+        while (tried < 10 && !ok) {
+            int a, b, c, d, po, n = 0;
+            long long t0;
+            while (*p && (*p < '0' || *p > '9')) p++;
+            if (!*p) break;
+            if (sscanf(p, "%d.%d.%d.%d:%d%n", &a, &b, &c, &d, &po, &n) == 5 &&
+                a >= 0 && a < 256 && b >= 0 && b < 256 &&
+                c >= 0 && c < 256 && d >= 0 && d < 256 &&
+                po > 0 && po < 65536 && n > 0) {
+                snprintf(ip, sizeof ip, "%d.%d.%d.%d", a, b, c, d);
+                port = po;
+                p += n;
+                tried++;
+                t0 = now_ms();
+                if (tcp_open(ip, port, 3500)) {
+                    ok = 1;
+                    snprintf(detail, sizeof detail,
+                             "CM %s:%d открыт, %lld ms (из GetCMList, попытка %d)",
+                             ip, port, (long long)(now_ms() - t0), tried);
+                    add_check_ex("Игры", "Steam CM TCP", "ok", detail, "",
+                                 ip,
+                                 "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
+                                 0);
+                    break;
+                }
+            } else {
+                p++;
+            }
+        }
+        if (!ok) {
+            snprintf(detail, sizeof detail,
+                     "GetCMList ok, TCP к CM не открылся (%d попыток)", tried);
+            add_check_ex("Игры", "Steam CM TCP", "fail", detail,
+                         "Список CM получен, но порты 27017+ фильтруются/недоступны.",
+                         tried ? ip : NULL,
+                         "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
+                         0);
+            if (fail_n && *fail_n < fail_cap)
+                snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam CM");
+        }
         return;
     }
 
-    p = out;
-    ip[0] = 0;
-    while (tried < 10 && !ok) {
-        int a, b, c, d, po, n = 0;
-        while (*p && (*p < '0' || *p > '9')) p++;
-        if (!*p) break;
-        if (sscanf(p, "%d.%d.%d.%d:%d%n", &a, &b, &c, &d, &po, &n) == 5 &&
-            a >= 0 && a < 256 && b >= 0 && b < 256 &&
-            c >= 0 && c < 256 && d >= 0 && d < 256 &&
-            po > 0 && po < 65536 && n > 0) {
-            snprintf(ip, sizeof ip, "%d.%d.%d.%d", a, b, c, d);
-            port = po;
-            p += n;
-            tried++;
-            t0 = now_ms();
-            if (tcp_open(ip, port, 3500)) {
-                ok = 1;
-                snprintf(detail, sizeof detail, "CM %s:%d открыт, %lld ms (из GetCMList, попытка %d)",
-                         ip, port, (long long)(now_ms() - t0), tried);
-                add_check_ex("Игры", "Steam CM TCP", "ok", detail, "",
-                             ip,
-                             "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
-                             0);
-                break;
-            }
-        } else {
-            p++;
+    /* GetCMList недоступен — пробуем известные CM (как клиент без свежего списка). */
+    add_check_ex("Игры", "Steam CM (GetCMList)", "warn",
+                 "GetCMList недоступен (api.steampowered.com)",
+                 "Витрина/API часто режутся; проверяем TCP к известным CM steamserver.net.",
+                 NULL,
+                 "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
+                 0);
+
+    for (fi = 0; fi < sizeof cm_fallback / sizeof cm_fallback[0]; fi++) {
+        if (steam_cm_try_host(cm_fallback[fi], 27017, ip, sizeof ip, &ms)) {
+            snprintf(detail, sizeof detail,
+                     "CM %s:27017 открыт, %lld ms (fallback, GetCMList недоступен)",
+                     cm_fallback[fi], ms);
+            add_check_ex("Игры", "Steam CM TCP", "ok", detail,
+                         "Клиентский порт CM доступен; WebAPI GetCMList может быть заблокирован отдельно.",
+                         ip, cm_fallback[fi], 0);
+            return;
         }
     }
 
-    if (!ok) {
-        snprintf(detail, sizeof detail,
-                 "GetCMList ok, TCP к CM не открылся (%d попыток)", tried);
-        add_check_ex("Игры", "Steam CM TCP", "fail", detail,
-                     "Список CM получен, но порты 27017+ фильтруются/недоступны.",
-                     tried ? ip : NULL,
-                     "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
-                     0);
-        if (fail_n && *fail_n < fail_cap)
-            snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam CM");
-    }
+    add_check_ex("Игры", "Steam CM TCP", "fail",
+                 "GetCMList недоступен и fallback CM :27017 не открылись",
+                 "Нужны HTTPS к api.steampowered.com и/или TCP 27017 к *.steamserver.net.",
+                 NULL,
+                 "https://api.steampowered.com/ISteamDirectory/GetCMList/v1/?cellid=0",
+                 0);
+    if (fail_n && *fail_n < fail_cap)
+        snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam CM");
 }
 
 /* ---------- HTTP ---------- */
@@ -2378,12 +2429,6 @@ typedef struct {
 
 typedef struct {
     char name[RES_NAME];
-    char url[RES_URL];
-    int crit;
-} ResHttpCrit;
-
-typedef struct {
-    char name[RES_NAME];
     char home[RES_URL];
     char video[RES_URL];
 } ResVideo;
@@ -2404,7 +2449,7 @@ static ResHttp g_infra_https[MAX_RES];
 static int g_ninfra_https;
 static ResHttp g_game_https[MAX_RES];
 static int g_ngame_https;
-static ResHttpCrit g_ai[MAX_RES];
+static ResTcp g_ai[MAX_RES];
 static int g_nai;
 static ResVideo g_video[MAX_RES];
 static int g_nvideo;
@@ -2434,9 +2479,9 @@ static void resources_load_defaults(void) {
     static const struct { const char *name, *url, *note; int eb; } sig[] = {
         /* РФ: топ из «белого списка» Минцифры */
         {"Госуслуги", "https://www.gosuslugi.ru/", "белый список Минцифры", 0},
-        {"Президент РФ", "https://www.kremlin.ru/", "белый список Минцифры", 0},
-        {"Правительство РФ", "https://government.ru/", "белый список Минцифры", 0},
-        {"Госдума", "https://duma.gov.ru/", "белый список Минцифры", 0},
+        {"Президент РФ", "http://www.kremlin.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
+        {"Правительство РФ", "http://government.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
+        {"Госдума", "http://duma.gov.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
         {"ЦБ РФ", "https://www.cbr.ru/", "белый список Минцифры", 0},
         {"Почта России", "https://www.pochta.ru/", "белый список Минцифры", 0},
         {"Честный знак", "https://crpt.ru/", "белый список Минцифры (ЦРПТ)", 0},
@@ -2462,11 +2507,11 @@ static void resources_load_defaults(void) {
         {"Лента.ру", "https://lenta.ru/", "белый список Минцифры", 0},
         {"Рувики", "https://ru.ruwiki.ru/", "белый список Минцифры", 0},
         {"Ozon", "https://www.ozon.ru/", "белый список Минцифры", 0},
-        {"Wildberries", "https://www.wildberries.ru/", "белый список Минцифры", 0},
+        {"Wildberries", "https://napi.wildberries.ru/", "белый список; главная www — antibot/JS, проба через napi API", 0},
         {"Мегамаркет", "https://megamarket.ru/", "белый список Минцифры", 0},
         {"Avito", "https://www.avito.ru/", "белый список Минцифры", 0},
         {"Домклик", "https://domclick.ru/", "белый список Минцифры", 0},
-        {"2ГИС", "https://2gis.ru/", "белый список Минцифры", 0},
+        {"2ГИС", "https://mapgl.2gis.com/api/js", "белый список; главная 2gis.ru — antibot/TLS, проба через MapGL API", 0},
         {"HH.ru", "https://hh.ru/", "белый список Минцифры", 0},
         {"РЖД", "https://www.rzd.ru/", "белый список Минцифры", 0},
         {"Туту.ру", "https://www.tutu.ru/", "белый список Минцифры", 0},
@@ -2476,7 +2521,8 @@ static void resources_load_defaults(void) {
         {"Google", "https://www.google.com/", "", 0},
         {"Gmail", "https://mail.google.com/", "", 0},
         {"Microsoft", "https://www.microsoft.com/", "", 0},
-        {"Microsoft Teams", "https://teams.microsoft.com/", "", 0},
+        {"Microsoft Teams", "https://go.trouter.teams.microsoft.com/",
+         "веб teams.microsoft.com часто таймаут/antibot; проба Trouter (realtime Teams)", 0},
         {"YouTube", "https://www.youtube.com/",
          "Ожидаемо: ограничен/блокируется в РФ — не проблема сети.", 1},
         {"Instagram", "https://www.instagram.com/",
@@ -2514,7 +2560,10 @@ static void resources_load_defaults(void) {
         {"Steam community :443", "steamcommunity.com", 443, 1},
         {"Steam CDN :443", "cdn.cloudflare.steamstatic.com", 443, 0},
         {"Steam media CDN", "media.steampowered.com", 443, 0},
+        {"Steam CM EU (fra1)", "ext1-fra1.steamserver.net", 27017, 0},
         {"Epic Games :443", "www.epicgames.com", 443, 0},
+        {"Epic account API", "account-public-service-prod03.ol.epicgames.com", 443, 0},
+        {"Epic CDN :443", "cdn1.epicgames.com", 443, 0},
         {"Epic launcher API", "launcher-public-service-prod06.ol.epicgames.com", 443, 0},
         {"Riot clientconfig", "clientconfig.rpg.riotgames.com", 443, 0},
         {"Riot auth", "auth.riotgames.com", 443, 0},
@@ -2522,6 +2571,8 @@ static void resources_load_defaults(void) {
         {"PlayStation", "www.playstation.com", 443, 0},
         {"EA / Origin", "www.ea.com", 443, 0},
         {"Ubisoft Connect", "www.ubisoft.com", 443, 0},
+        {"Ubisoft Services", "public-ubiservices.ubi.com", 443, 0},
+        {"Ubisoft CDN", "static2.cdn.ubi.com", 443, 0},
         {"GOG", "www.gog.com", 443, 0},
         {"Faceit", "api.faceit.com", 443, 0},
     };
@@ -2555,17 +2606,20 @@ static void resources_load_defaults(void) {
         {"Blizzard", "https://www.blizzard.com/"},
         {"Battle.net login", "https://account.battle.net/login/"},
         {"Battle.net support", "https://eu.battle.net/support/"},
-        {"Steam Store", "https://store.steampowered.com/"},
-        {"Steam Community", "https://steamcommunity.com/"},
-        {"Steam API", "https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/"},
-        {"Steam Help", "https://help.steampowered.com/"},
-        {"Epic Games Store", "https://store.epicgames.com/"},
-        {"Epic launcher", "https://launcher.store.epicgames.com/"},
+        /* Витрины store/community/api часто antibot/DPI; CDN и account API — рабочие сигналы. */
+        {"Steam CDN (Dota)", "https://cdn.cloudflare.steamstatic.com/steam/apps/570/header.jpg"},
+        {"Steam CDN (CS2)",
+         "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/730/header.jpg"},
+        {"Epic account API",
+         "https://account-public-service-prod03.ol.epicgames.com/account/api/public/account"},
+        {"Epic CDN", "https://cdn1.epicgames.com/"},
+        {"Epic Unreal CDN", "https://cdn2.unrealengine.com/"},
         {"Riot Games", "https://www.riotgames.com/"},
         {"Xbox", "https://www.xbox.com/"},
         {"PlayStation Network", "https://www.playstation.com/"},
         {"EA App", "https://www.ea.com/ea-app"},
-        {"Ubisoft Connect", "https://www.ubisoft.com/"},
+        {"Ubisoft Services", "https://public-ubiservices.ubi.com/"},
+        {"Ubisoft CDN", "https://static2.cdn.ubi.com/"},
         {"GOG Galaxy", "https://www.gog.com/"},
         {"Nintendo", "https://www.nintendo.com/"},
         {"Roblox", "https://www.roblox.com/"},
@@ -2573,35 +2627,36 @@ static void resources_load_defaults(void) {
         {"VK Play", "https://vkplay.ru/"},
         {"Lesta / Mir Tankov", "https://tanki.su/"},
     };
-    static const struct { const char *name, *url; int crit; } ai[] = {
-        {"Cursor", "https://www.cursor.com/", 1},
-        {"Cursor API", "https://api2.cursor.sh/", 1},
-        {"OpenAI", "https://openai.com/", 1},
-        {"ChatGPT", "https://chatgpt.com/", 1},
-        {"OpenAI API", "https://api.openai.com/", 1},
-        {"Claude / Anthropic", "https://claude.ai/", 1},
-        {"Anthropic API", "https://api.anthropic.com/", 1},
-        {"Anthropic console", "https://console.anthropic.com/", 0},
-        {"Grok / xAI", "https://grok.x.ai/", 1},
-        {"xAI", "https://x.ai/", 0},
-        {"xAI API", "https://api.x.ai/", 0},
-        {"Gemini", "https://gemini.google.com/", 1},
-        {"Google AI Studio", "https://aistudio.google.com/", 0},
-        {"Google AI / Generative", "https://generativelanguage.googleapis.com/", 0},
-        {"Microsoft Copilot", "https://copilot.microsoft.com/", 0},
-        {"GitHub Copilot", "https://github.com/features/copilot", 0},
-        {"Perplexity", "https://www.perplexity.ai/", 0},
-        {"DeepSeek", "https://www.deepseek.com/", 0},
-        {"DeepSeek Chat", "https://chat.deepseek.com/", 0},
-        {"Mistral", "https://mistral.ai/", 0},
-        {"Mistral Chat", "https://chat.mistral.ai/", 0},
-        {"Hugging Face", "https://huggingface.co/", 0},
-        {"Groq", "https://groq.com/", 0},
-        {"Together AI", "https://www.together.ai/", 0},
-        {"Poe", "https://poe.com/", 0},
-        {"Notion AI", "https://www.notion.so/", 0},
-        {"YandexGPT / Alice AI", "https://alice.yandex.ru/", 0},
-        {"GigaChat", "https://giga.chat/", 0},
+    /* AI: только TCP :443 — HTTPS часто «умный» таймаут/DPI при живом connect. */
+    static const struct { const char *name, *host; int port, crit; } ai[] = {
+        {"Cursor", "www.cursor.com", 443, 1},
+        {"Cursor API", "api2.cursor.sh", 443, 1},
+        {"OpenAI", "openai.com", 443, 1},
+        {"ChatGPT", "chatgpt.com", 443, 1},
+        {"OpenAI API", "api.openai.com", 443, 1},
+        {"Claude / Anthropic", "claude.ai", 443, 1},
+        {"Anthropic API", "api.anthropic.com", 443, 1},
+        {"Anthropic console", "console.anthropic.com", 443, 0},
+        {"Grok / xAI", "grok.x.ai", 443, 1},
+        {"xAI", "x.ai", 443, 0},
+        {"xAI API", "api.x.ai", 443, 0},
+        {"Gemini", "gemini.google.com", 443, 1},
+        {"Google AI Studio", "aistudio.google.com", 443, 0},
+        {"Google AI / Generative", "generativelanguage.googleapis.com", 443, 0},
+        {"Microsoft Copilot", "copilot.microsoft.com", 443, 0},
+        {"GitHub Copilot", "github.com", 443, 0},
+        {"Perplexity", "www.perplexity.ai", 443, 0},
+        {"DeepSeek", "www.deepseek.com", 443, 0},
+        {"DeepSeek Chat", "chat.deepseek.com", 443, 0},
+        {"Mistral", "mistral.ai", 443, 0},
+        {"Mistral Chat", "chat.mistral.ai", 443, 0},
+        {"Hugging Face", "huggingface.co", 443, 0},
+        {"Groq", "groq.com", 443, 0},
+        {"Together AI", "www.together.ai", 443, 0},
+        {"Poe", "poe.com", 443, 0},
+        {"Notion AI", "www.notion.so", 443, 0},
+        {"YandexGPT / Alice AI", "alice.yandex.ru", 443, 0},
+        {"GigaChat", "giga.chat", 443, 0},
     };
     static const struct { const char *name, *home, *video; } vids[] = {
         {"Яндекс Видео", "https://ya.ru/video/", "https://ya.ru/video/search?text=news"},
@@ -2625,8 +2680,8 @@ static void resources_load_defaults(void) {
         {"Банки РФ", "ПСБ", "https://www.psbank.ru/"},
         {"Банки РФ", "Росбанк", "https://www.rosbank.ru/"},
         {"Сервисы РФ", "Mail.ru", "https://mail.ru/"},
-        {"Сервисы РФ", "2ГИС", "https://2gis.ru/"},
-        {"Сервисы РФ", "Wildberries", "https://www.wildberries.ru/"},
+        {"Сервисы РФ", "2ГИС", "https://mapgl.2gis.com/api/js"},
+        {"Сервисы РФ", "Wildberries", "https://napi.wildberries.ru/"},
         {"Сервисы РФ", "Ozon", "https://www.ozon.ru/"},
         {"Сервисы РФ", "Avito", "https://www.avito.ru/"},
         {"Сервисы РФ", "HH.ru", "https://hh.ru/"},
@@ -2686,7 +2741,8 @@ static void resources_load_defaults(void) {
     g_nai = n;
     for (i = 0; i < n; i++) {
         snprintf(g_ai[i].name, sizeof g_ai[i].name, "%s", ai[i].name);
-        snprintf(g_ai[i].url, sizeof g_ai[i].url, "%s", ai[i].url);
+        snprintf(g_ai[i].host, sizeof g_ai[i].host, "%s", ai[i].host);
+        g_ai[i].port = ai[i].port;
         g_ai[i].crit = ai[i].crit;
     }
 
@@ -2724,7 +2780,7 @@ static int resources_load_file(const char *path) {
     ResTcp itcp[MAX_RES];
     ResHttp ihttps[MAX_RES];
     ResHttp ghttps[MAX_RES];
-    ResHttpCrit ai[MAX_RES];
+    ResTcp ai[MAX_RES];
     ResVideo vids[MAX_RES];
     ResBank banks[MAX_RES];
 
@@ -2780,11 +2836,23 @@ static int resources_load_file(const char *path) {
             nghttps++;
             got_ghttps = 1;
         } else if (strcmp(section, "ai") == 0 && nai < MAX_RES) {
+            /* name|host|port|crit — или устаревшее name|https://…|crit */
             snprintf(ai[nai].name, sizeof ai[nai].name, "%s", fields[0]);
-            snprintf(ai[nai].url, sizeof ai[nai].url, "%s", fields[1]);
-            ai[nai].crit = (nf > 2 && fields[2][0] == '1') ? 1 : 0;
-            nai++;
-            got_ai = 1;
+            if (nf >= 3 && fields[1][0] &&
+                !(starts_with(fields[1], "http://") || starts_with(fields[1], "https://"))) {
+                snprintf(ai[nai].host, sizeof ai[nai].host, "%s", fields[1]);
+                ai[nai].port = atoi(fields[2]);
+                if (ai[nai].port <= 0) ai[nai].port = 443;
+                ai[nai].crit = (nf > 3 && fields[3][0] == '1') ? 1 : 0;
+            } else {
+                host_from_url(fields[1], ai[nai].host, sizeof ai[nai].host);
+                ai[nai].port = 443;
+                ai[nai].crit = (nf > 2 && fields[2][0] == '1') ? 1 : 0;
+            }
+            if (ai[nai].host[0]) {
+                nai++;
+                got_ai = 1;
+            }
         } else if (strcmp(section, "video") == 0 && nvid < MAX_RES && nf >= 3) {
             snprintf(vids[nvid].name, sizeof vids[nvid].name, "%s", fields[0]);
             snprintf(vids[nvid].home, sizeof vids[nvid].home, "%s", fields[1]);
@@ -3847,8 +3915,10 @@ int main(int argc, char **argv) {
             {"VK Marusya", "marusia.mail.ru", 443, 0},
             {"Nabu Casa account", "account.nabucasa.com", 443, 0},
             {"Nabu Casa API", "api.nabucasa.com", 443, 0},
-            {"Philips Hue", "api.meethue.com", 443, 0},
+            {"Philips Hue API", "api.meethue.com", 443, 0},
+            {"Philips Hue discovery", "discovery.meethue.com", 443, 0},
             {"TP-Link Tapo", "n-wap-gw.tplinkcloud.com", 443, 0},
+            {"TP-Link Tapo EU WAP", "eu-wap.tplinkcloud.com", 443, 0},
             {"TP-Link Kasa", "use1-api.tplinkra.com", 443, 0},
             {"eWeLink / Sonoff", "eu-apia.coolkit.cc", 443, 0},
             /* Aqara MQTT :8883 снаружи часто закрыт; :443 отвечает */
@@ -3877,9 +3947,11 @@ int main(int argc, char **argv) {
                 {"Алиса HTTPS", "https://alice.yandex.ru/"},
                 {"Xiaomi Home HTTPS", "https://home.mi.com/"},
                 {"Sber Salute HTTPS", "https://salute.sber.ru/"},
-                {"Home Assistant", "https://www.home-assistant.io/"},
-                {"Philips Hue", "https://www.philips-hue.com/"},
-                {"Tapo", "https://www.tapo.com/"},
+                /* Витрины home-assistant.io / philips-hue.com / tapo.com — antibot/DPI;
+                 * облака клиента: Nabu Casa, Hue discovery, Tapo WAP. */
+                {"Home Assistant Cloud", "https://account.nabucasa.com/"},
+                {"Philips Hue discovery", "https://discovery.meethue.com/"},
+                {"Tapo cloud", "https://eu-wap.tplinkcloud.com/"},
             };
             int nh = (int)(sizeof https / sizeof https[0]);
             char host[128], ip[64], ua_sum[256];
@@ -4255,24 +4327,38 @@ int main(int argc, char **argv) {
             char host[128], ip[64], ua_sum[256];
             int ua_mismatch;
             stage_item(g_infra_https[i].name, n + i + 1, n + nh);
-            r = http_probe_agents(g_infra_https[i].url, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+            /* один UA: для S3/CDN важна доступность, не матрица агентов */
+            r = http_probe_ua(g_infra_https[i].url, 10, 1, ua_default(), 1);
+            if (r.code > 0)
+                snprintf(ua_sum, sizeof ua_sum, "chrome=%d", r.code);
+            else
+                snprintf(ua_sum, sizeof ua_sum, "chrome=нет ответа");
+            ua_mismatch = 0;
             host_from_url(g_infra_https[i].url, host, sizeof host);
             ip[0] = 0;
             if (host[0]) dns_resolve(host, ip, sizeof ip);
             if (r.code > 0) {
-                /* 403 AccessDenied от S3/CDN = endpoint жив (аноним без ключа — норма) */
                 if (r.code >= 300 && r.code < 400) {
                     snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
                              r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
                     add_check_ex("Облако", g_infra_https[i].name, "ok", detail,
                                  "Облако отвечает редиректом.", ip, g_infra_https[i].url, 0);
+                } else if (r.code == 401 || r.code == 403) {
+                    /* S3/CDN без ключа: AccessDenied = хост и TLS живы */
+                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+                    add_check_ex("Облако", g_infra_https[i].name, "ok", detail,
+                                 "HTTP 403/401 без ключа — CDN/S3 доступен (ожидаемо, не сбой).",
+                                 ip, g_infra_https[i].url, 0);
+                } else if (r.code >= 500) {
+                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+                    add_check_ex("Облако", g_infra_https[i].name, "fail", detail,
+                                 "Сервер облака отвечает 5xx.", ip, g_infra_https[i].url, 0);
+                    if (nfail < 64) snprintf(fail[nfail++], 64, "%s", g_infra_https[i].name);
                 } else {
-                    st = (r.ms > 4000 || ua_mismatch) ? "warn" : "ok";
+                    st = (r.ms > 4000) ? "warn" : "ok";
                     snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
                     add_check_ex("Облако", g_infra_https[i].name, st, detail,
-                                 (r.code == 403)
-                                     ? "403 от S3/CDN без ключа — сервис доступен (ожидаемо)."
-                                     : (r.ms > 4000 ? "Медленный ответ облака" : ""),
+                                 r.ms > 4000 ? "Медленный ответ облака" : "",
                                  ip, g_infra_https[i].url, 0);
                 }
             } else if (host_unresolved(host, ip)) {
@@ -4378,53 +4464,16 @@ int main(int argc, char **argv) {
         add_check("Игры", "Этап", "info", "пропущен пользователем", "");
     }
 
-    /* AI / LLM platforms */
-    if (stage_begin("AI / LLM", "Cursor, OpenAI, Claude, Grok, Gemini и другие AI-платформы")) {
+    /* AI / LLM: TCP :443 (HTTPS часто «умный» таймаут при живом connect) */
+    if (stage_begin("AI / LLM",
+                    "Cursor, OpenAI, Claude, Grok, Gemini — TCP connect :443 (без HTTPS-пробы)")) {
         char ai_fail[48][64];
         int nai_fail = 0;
         int n = g_nai;
         for (i = 0; i < n; i++) {
-            char host[128], ip[64], ua_sum[256];
-            int ua_mismatch = 0;
-            HttpResult r;
             stage_item(g_ai[i].name, i + 1, n);
-            r = http_probe_agents(g_ai[i].url, 5, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-            host_from_url(g_ai[i].url, host, sizeof host);
-            ip[0] = 0;
-            if (host[0]) dns_resolve(host, ip, sizeof ip);
-            if (r.code > 0) {
-                if (r.code >= 300 && r.code < 400) {
-                    snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
-                             r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
-                    add_check_ex("AI / LLM", g_ai[i].name, "ok", detail,
-                                 "HTTP-редирект: сервис отвечает. Не сбой доступности.",
-                                 ip, g_ai[i].url, 0);
-                } else {
-                st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
-                if (r.redirect[0])
-                    snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
-                             r.code, r.redirect, r.ms, ua_sum);
-                else
-                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                add_check_ex("AI / LLM", g_ai[i].name, st, detail,
-                             ua_mismatch ? "Ответ зависит от User-Agent."
-                             : (r.ms > 3000 ? "Медленный ответ AI-сервиса" : ""),
-                             ip, g_ai[i].url, 0);
-                }
-            } else if (host_unresolved(host, ip)) {
-                snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-                add_check_ex("AI / LLM", g_ai[i].name, "warn", detail,
-                             "Имя не резолвится — это сбой DNS, а не недоступность AI-платформы.",
-                             NULL, g_ai[i].url, 0);
-            } else {
-                snprintf(detail, sizeof detail, "%s [%s]",
-                         r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
-                add_check_ex("AI / LLM", g_ai[i].name, "fail", detail,
-                             "AI-платформа недоступна (блок/DPI/маршрут).",
-                             ip, g_ai[i].url, 0);
-                if (g_ai[i].crit && nai_fail < 48)
-                    snprintf(ai_fail[nai_fail++], 64, "%s", g_ai[i].name);
-            }
+            check_tcp_ep("AI / LLM", g_ai[i].name, g_ai[i].host, g_ai[i].port,
+                         4000, g_ai[i].crit, 0, &nai_fail, ai_fail, 48);
         }
         if (nai_fail > 0) {
             char names[LONGSTR] = "", tx[LONGSTR];
@@ -4434,8 +4483,8 @@ int main(int argc, char **argv) {
             }
             snprintf(detail, sizeof detail, "Недоступны AI-платформы (%d)", nai_fail);
             snprintf(tx, sizeof tx,
-                     "Не отвечают: %s. IDE/чат-боты могут падать при «живом» браузере — "
-                     "проверьте фильтр HTTPS/SNI и DNS.", names);
+                     "TCP :443 не открывается: %s. Порт закрыт/фильтруется — "
+                     "IDE/чат-боты не достучатся до API.", names);
             add_finding(nai_fail >= 2 ? "critical" : "warning", detail, tx);
         }
         stage_done();

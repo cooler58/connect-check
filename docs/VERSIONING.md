@@ -14,6 +14,8 @@
 
 Формат `resources.conf`: поле `connect-check-version` и `CONNECT_CHECK_RESOURCES_FORMAT` — при несовместимом формате поднимать MAJOR или формат+MINOR.
 
+Секция `[ai]` (с 1.0.6): предпочтительно `name|host|port|crit` (TCP). Устаревший `name|url|crit` парсер всё ещё понимает.
+
 ## Процесс релиза
 
 1. Обновить `VERSION`.

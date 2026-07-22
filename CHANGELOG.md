@@ -2,6 +2,17 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.0.6] — 2026-07-22
+
+### Fixed
+- Ложные FAIL на витринах с antibot/DPI: **Steam / Epic / Ubisoft**, **Wildberries**, **2ГИС**, **Teams**, **Home Assistant / Hue / Tapo** — пробы через CDN, API, discovery/WAP или облако клиента.
+- Госсайты (Кремль / Правительство / Дума): проверка по **HTTP** (:443 часто мёртв).
+- **Steam CM**: если `GetCMList` недоступен — fallback TCP на `*.steamserver.net:27017`.
+- Облако: HTTP **401/403** от S3/CDN без ключа = OK.
+
+### Changed
+- Этап **AI / LLM**: только **TCP :443** (без HTTPS-проб). Формат `[ai]`: `name|host|port|crit` (старые URL в conf ещё читаются).
+
 ## [1.0.5] — 2026-07-22
 
 ### Changed
