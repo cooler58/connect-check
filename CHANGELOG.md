@@ -2,6 +2,13 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.1.1] — 2026-07-28
+
+### Changed
+- Распараллелены оставшиеся массовые пробы: **DPI** (порты/DoH/SNI/QUIC), **NTP**, gstatic×8, download-пробы скорости.
+- Умный дом / IoT уже был на пуле в 1.1.0 (TCP + HTTPS).
+- При сбое HTTP(S)-пробы ресурса — fallback **TCP :443 / :80** (если порт открыт → warn, не fail).
+
 ## [1.1.0] — 2026-07-28
 
 ### Added

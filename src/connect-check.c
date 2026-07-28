@@ -3535,6 +3535,20 @@ static void host_from_url(const char *url, char *host, size_t hostlen) {
     }
 }
 
+/* После неудачной HTTP(S)-пробы: TCP :443/:80 — живой порт ≠ полный блок хоста. */
+static void tcp_http_fallback(const char *host, char *extra, size_t extralen, int *any_open) {
+    int o443 = 0, o80 = 0;
+    if (any_open) *any_open = 0;
+    if (extra && extralen) extra[0] = 0;
+    if (!host || !host[0]) return;
+    o443 = tcp_open(host, 443, 2500);
+    o80 = tcp_open(host, 80, 2500);
+    if (any_open) *any_open = (o443 || o80) ? 1 : 0;
+    if (extra && extralen)
+        snprintf(extra, extralen, "TCP :443 %s / :80 %s",
+                 o443 ? "открыт" : "закрыт", o80 ? "открыт" : "закрыт");
+}
+
 static void check_captive_fill(Check *out, const char *name, const char *url,
                                int expect, int *want_finding, char *ftitle, size_t ftlen,
                                char *ftext, size_t ftextlen) {
@@ -3646,8 +3660,22 @@ static void check_ru_fill(Check *out, const char *cat, const char *name, const c
     }
 
     if (r.code <= 0) {
-        snprintf(detail, sizeof detail, "%s [%s]",
-                 r.error[0] ? r.error : "таймаут/нет ответа", ua_sum[0] ? ua_sum : "—");
+        char fb[96];
+        int tcp_ok = 0;
+        tcp_http_fallback(host, fb, sizeof fb, &tcp_ok);
+        snprintf(detail, sizeof detail, "%s [%s]%s%s",
+                 r.error[0] ? r.error : "таймаут/нет ответа",
+                 ua_sum[0] ? ua_sum : "—",
+                 fb[0] ? " · " : "", fb);
+        if (tcp_ok) {
+            snprintf(hint, sizeof hint,
+                     "%s%sHTTP(S)-проба не ответила, но TCP :80/:443 открыт — "
+                     "скорее DPI/TLS/маршрут HTTP, не полный блок хоста.",
+                     note && note[0] ? note : "", note && note[0] ? " " : "");
+            check_set(out, cat, name, "warn", detail, hint, ip, url, spoiler);
+            /* не считаем fail ресурса для finding */
+            return;
+        }
         snprintf(hint, sizeof hint, "%s%sНедоступен по HTTPS-пробе (браузер может работать при другом маршруте/QUIC).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
         check_set(out, cat, name, "fail", detail, hint, ip, url, spoiler);
@@ -3803,10 +3831,20 @@ static void https_res_job(int idx, void *v) {
         check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "warn", detail,
                   "Имя не резолвится — сбой DNS.", NULL, ctx->items[idx].url, 0);
     } else {
-        snprintf(detail, sizeof detail, "%s [%s]",
-                 r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
-        check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "fail", detail,
-                  "HTTPS недоступен (DPI/фильтр/маршрут).", ip, ctx->items[idx].url, 0);
+        char fb[96];
+        int tcp_ok = 0;
+        tcp_http_fallback(host, fb, sizeof fb, &tcp_ok);
+        snprintf(detail, sizeof detail, "%s [%s]%s%s",
+                 r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—",
+                 fb[0] ? " · " : "", fb);
+        if (tcp_ok) {
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "warn", detail,
+                      "HTTPS-проба не ответила, но TCP :80/:443 открыт — DPI/TLS, не полный блок.",
+                      ip, ctx->items[idx].url, 0);
+        } else {
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "fail", detail,
+                      "HTTPS недоступен (DPI/фильтр/маршрут).", ip, ctx->items[idx].url, 0);
+        }
     }
 }
 
@@ -3837,10 +3875,20 @@ static void video_job(int idx, void *v) {
                   "Имя не резолвится — это сбой DNS, а не недоступность видео.",
                   NULL, g_video[idx].home, 0);
     } else {
-        snprintf(detail, sizeof detail, "сайт HTTP %d; видео HTTP %d [%s]",
-                 r.code, rv.code, ua_sum[0] ? ua_sum : "—");
-        check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "fail", detail,
-                  "Не открылся сайт или видео-путь.", ip, g_video[idx].home, 0);
+        char fb[96];
+        int tcp_ok = 0;
+        tcp_http_fallback(host, fb, sizeof fb, &tcp_ok);
+        snprintf(detail, sizeof detail, "сайт HTTP %d; видео HTTP %d [%s]%s%s",
+                 r.code, rv.code, ua_sum[0] ? ua_sum : "—",
+                 fb[0] ? " · " : "", fb);
+        if (tcp_ok) {
+            check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "warn", detail,
+                      "HTTP(S) к сайту/видео не прошёл, но TCP :80/:443 открыт.",
+                      ip, g_video[idx].home, 0);
+        } else {
+            check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "fail", detail,
+                      "Не открылся сайт или видео-путь.", ip, g_video[idx].home, 0);
+        }
     }
 }
 
@@ -3862,6 +3910,244 @@ static void captive_par_job(int idx, void *v) {
     check_captive_fill(&ctx->outs[idx], ctx->names[idx], ctx->urls[idx], ctx->expects[idx],
                        ctx->crits[idx] ? &ctx->wantf[idx] : NULL,
                        ft, 256, fx, LONGSTR);
+}
+
+typedef struct {
+    Check *outs;
+    int *count_fail;   /* 1 = добавить в dpi_fail */
+    int *dot_tls_ok;   /* 1 = DoT TLS+SNI OK */
+    const char **names;
+    const char **hosts;
+    int *ports;
+    int *expect_open;
+} DpiPortCtx;
+
+static void dpi_port_job(int idx, void *v) {
+    DpiPortCtx *ctx = (DpiPortCtx *)v;
+    char ip[64], url[256], detail[STR];
+    const char *name = ctx->names[idx];
+    const char *host = ctx->hosts[idx];
+    ctx->count_fail[idx] = 0;
+    ctx->dot_tls_ok[idx] = 0;
+    snprintf(url, sizeof url, "https://%s/", host);
+    if (!dns_resolve(host, ip, sizeof ip)) {
+        snprintf(detail, sizeof detail, "DNS fail %s", host);
+        check_set(&ctx->outs[idx], "DPI", name, "warn", detail, "", NULL, url, 0);
+        return;
+    }
+    if (strncmp(name, "DoT ", 4) == 0) {
+        int ms = 0, rc = dot_probe(host, 3000, &ms);
+        const char *sni = dot_sni_for(host);
+        if (rc == 2) {
+            snprintf(detail, sizeof detail, "DoT TLS+SNI OK (%s) %d ms", sni, ms);
+            check_set(&ctx->outs[idx], "DPI", name, "ok", detail, "", ip, url, 0);
+            ctx->dot_tls_ok[idx] = 1;
+        } else if (rc == 1) {
+            snprintf(detail, sizeof detail, "TCP :853 есть, TLS нет (%s) %d ms", sni, ms);
+            check_set(&ctx->outs[idx], "DPI", name, "warn", detail,
+                      "Порт открыт, но DoT-handshake не проходит.", ip, url, 0);
+        } else {
+            check_set(&ctx->outs[idx], "DPI", name, "warn",
+                      "TCP :853 закрыт (может быть нормой)",
+                      "Не критично само по себе; смотрите DoH и Private DNS.",
+                      ip, url, 0);
+        }
+        return;
+    }
+    if (tcp_open(host, ctx->ports[idx], 3000)) {
+        check_set(&ctx->outs[idx], "DPI", name, "ok", "TCP открыт", "", ip, url, 0);
+    } else if (ctx->expect_open[idx]) {
+        check_set(&ctx->outs[idx], "DPI", name, "fail", "TCP закрыт/фильтр",
+                  "Порт часто режется DPI. IoT и push могут страдать при живом HTTPS.",
+                  ip, url, 0);
+        ctx->count_fail[idx] = 1;
+    } else {
+        check_set(&ctx->outs[idx], "DPI", name, "warn",
+                  "TCP закрыт (может быть нормой)",
+                  "Не критично само по себе; смотрите в связке с IoT/VPN.",
+                  ip, url, 0);
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *is_fail;
+    const char **names;
+    const char **urls;
+} DohCtx;
+
+static void doh_job(int idx, void *v) {
+    DohCtx *ctx = (DohCtx *)v;
+    HttpResult r = doh_probe(ctx->urls[idx], 5);
+    char detail[STR];
+    ctx->is_fail[idx] = 0;
+    if (r.code == 200) {
+        snprintf(detail, sizeof detail, "HTTP %d, %d ms (dns-json)", r.code, r.ms);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "ok", detail, "", NULL, NULL, 0);
+    } else if (r.code > 0) {
+        snprintf(detail, sizeof detail, "HTTP %d, %d ms", r.code, r.ms);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "warn", detail,
+                  idx == 0 ? "Ожидали 200 с Accept: application/dns-json — возможна подмена/фильтр DoH." : "",
+                  NULL, NULL, 0);
+    } else {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "fail",
+                  r.error[0] ? r.error : "таймаут",
+                  idx == 0
+                      ? "DoH часто режет DPI. Private DNS/DoH может ломать связность на клиентах."
+                      : "Фильтр DoH Google — частый признак DPI.",
+                  NULL, NULL, 0);
+        ctx->is_fail[idx] = 1;
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *sni_fail;
+    const char **names;
+    const char **urls;
+    int *expected_ru;
+} SniCtx;
+
+static void sni_job(int idx, void *v) {
+    SniCtx *ctx = (SniCtx *)v;
+    HttpResult r;
+    char host[128], ip[64], detail[STR];
+    ctx->sni_fail[idx] = 0;
+    r = http_probe(ctx->urls[idx], 6, 1);
+    host_from_url(ctx->urls[idx], host, sizeof host);
+    ip[0] = 0;
+    if (host[0]) dns_resolve(host, ip, sizeof ip);
+    if (r.code > 0 && r.code < 500) {
+        snprintf(detail, sizeof detail, "HTTP %d, %d ms", r.code, r.ms);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "ok", detail, "", ip, ctx->urls[idx], 0);
+    } else if (ctx->expected_ru[idx]) {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "info",
+                  r.error[0] ? r.error : "таймаут/блок",
+                  "Ожидаемо в РФ — не считается проблемой сети / DPI.",
+                  ip, ctx->urls[idx], 0);
+    } else if (host_unresolved(host, ip)) {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "warn",
+                  "DNS не резолвит имя", "Сбой DNS, не SNI/DPI.",
+                  NULL, ctx->urls[idx], 0);
+    } else {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "fail",
+                  r.error[0] ? r.error : "таймаут/блок",
+                  "SNI/DPI-фильтр: сайт режется по имени, не по «интернету вообще».",
+                  ip, ctx->urls[idx], 0);
+        ctx->sni_fail[idx] = 1;
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *qok;
+    const char **names;
+    const char **hosts;
+    int *expected_ru;
+} QuicCtx;
+
+static void quic_job(int idx, void *v) {
+    QuicCtx *ctx = (QuicCtx *)v;
+    int ms = 0;
+    char ip[64], url[256], detail[STR];
+    ctx->qok[idx] = 0;
+    ip[0] = 0;
+    dns_resolve(ctx->hosts[idx], ip, sizeof ip);
+    snprintf(url, sizeof url, "https://%s/", ctx->hosts[idx]);
+    if (quic_probe(ctx->hosts[idx], 2500, &ms)) {
+        ctx->qok[idx] = 1;
+        snprintf(detail, sizeof detail, "QUIC VN (UDP/443) за %d ms", ms);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "ok", detail, "", ip, url, 0);
+    } else if (ctx->expected_ru[idx]) {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "info", "нет UDP-ответа на :443",
+                  "Ожидаемо в РФ для этого хоста — не считается проблемой.",
+                  ip, url, 0);
+    } else {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "warn", "нет UDP-ответа на :443",
+                  "QUIC/HTTP3 может резаться DPI при живом TCP/443. "
+                  "Браузеры откатятся на TCP; часть CDN/видео — нет.",
+                  ip, url, 0);
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *ok;
+    const char **hosts;
+} NtpCtx;
+
+static void ntp_job(int idx, void *v) {
+    NtpCtx *ctx = (NtpCtx *)v;
+    char name[80];
+    snprintf(name, sizeof name, "NTP %s", ctx->hosts[idx]);
+    if (ntp_probe(ctx->hosts[idx], 2500)) {
+        ctx->ok[idx] = 1;
+        check_set(&ctx->outs[idx], "NTP / время", name, "ok", "UDP/123 ответ получен", "",
+                  NULL, NULL, 0);
+    } else {
+        ctx->ok[idx] = 0;
+        check_set(&ctx->outs[idx], "NTP / время", name, "warn", "нет ответа UDP/123",
+                  "Без NTP часы на IoT сбиваются → TLS handshake fail → туннель не поднимается.",
+                  NULL, NULL, 0);
+    }
+}
+
+typedef struct {
+    int *ok; /* 1 = 204 без редиректа */
+    int *ms;
+} GstCtx;
+
+static void gstatic_job(int idx, void *v) {
+    GstCtx *ctx = (GstCtx *)v;
+    HttpResult r = http_probe_nofollow("http://connectivitycheck.gstatic.com/generate_204", 3, 0);
+    if (r.code == 204 && !r.redirect[0]) {
+        ctx->ok[idx] = 1;
+        ctx->ms[idx] = r.ms;
+    } else {
+        ctx->ok[idx] = 0;
+        ctx->ms[idx] = r.ms;
+    }
+}
+
+typedef struct {
+    Check *outs;
+    double *mbps;
+    const char **names;
+    const char **urls;
+    const char **geo;
+    int *critical;
+} SpeedCtx;
+
+static void speed_job(int idx, void *v) {
+    SpeedCtx *ctx = (SpeedCtx *)v;
+    char host[128], rip[64], detail[STR];
+    long bytes = 0;
+    int ms = 0;
+    ctx->mbps[idx] = -1;
+    host_from_url(ctx->urls[idx], host, sizeof host);
+    rip[0] = 0;
+    if (host[0]) dns_resolve(host, rip, sizeof rip);
+    if (http_download_bytes(ctx->urls[idx], 35, &bytes, &ms) && ms > 0 && bytes > 200000) {
+        double mbps = (bytes * 8.0) / (ms * 1000.0);
+        ctx->mbps[idx] = mbps;
+        snprintf(detail, sizeof detail, "%.2f Мбит/с (%ld байт за %d ms) · %s",
+                 mbps, bytes, ms, ctx->geo[idx]);
+        check_set(&ctx->outs[idx], "Скорость", ctx->names[idx],
+                  mbps < 8 ? "warn" : "ok", detail,
+                  mbps < 8 ? "Ниже ~8 Мбит/с до этой точки — узкое место на маршруте или Wi‑Fi." : "",
+                  rip[0] ? rip : NULL, ctx->urls[idx], 0);
+    } else if (ctx->critical[idx]) {
+        snprintf(detail, sizeof detail, "%s",
+                 ms > 0 ? "скачано слишком мало / обрыв" : "таймаут / нет ответа");
+        check_set(&ctx->outs[idx], "Скорость", ctx->names[idx], "fail", detail,
+                  "Не удалось скачать пробник — фильтр, маршрут или перегруз.",
+                  rip[0] ? rip : NULL, ctx->urls[idx], 0);
+    } else {
+        check_set(&ctx->outs[idx], "Скорость", ctx->names[idx], "info",
+                  "недоступен с этой сети (норма, если не из РФ)",
+                  "Запасная проба РФ — Selectel.",
+                  rip[0] ? rip : NULL, ctx->urls[idx], 0);
+    }
 }
 
 static void usage(const char *argv0) {
@@ -4248,14 +4534,20 @@ int main(int argc, char **argv) {
             free(outs); free(wantf); free(ftitles); free(ftexts);
             free(names); free(urls); free(expects); free(crits);
         }
-        for (i = 0; i < 8; i++) {
-            HttpResult r;
-            stage_progress("gstatic ×8", nc + i + 1, nc + 8);
-            r = http_probe_nofollow("http://connectivitycheck.gstatic.com/generate_204", 3, 0);
-            if (r.code == 204 && !r.redirect[0]) {
-                flaky_ok++;
-                flaky_sum += r.ms;
-            } else flaky_fail++;
+        {
+            int gok[8], gms[8];
+            GstCtx gctx;
+            memset(gok, 0, sizeof gok);
+            memset(gms, 0, sizeof gms);
+            gctx.ok = gok;
+            gctx.ms = gms;
+            run_parallel(8, opt_jobs, gstatic_job, &gctx, "gstatic ×8");
+            for (i = 0; i < 8; i++) {
+                if (gok[i]) {
+                    flaky_ok++;
+                    flaky_sum += gms[i];
+                } else flaky_fail++;
+            }
         }
     }
     {
@@ -4384,21 +4676,34 @@ int main(int argc, char **argv) {
         };
         int ntp_ok = 0;
         int ntp_n = (int)(sizeof ntp_hosts / sizeof ntp_hosts[0]);
+        Check *nout = (Check *)calloc((size_t)ntp_n, sizeof(Check));
+        int *nok = (int *)calloc((size_t)ntp_n, sizeof(int));
         printf("\n▶ NTP\n");
-        for (i = 0; i < ntp_n; i++) {
-            char name[80];
-            int ok;
-            snprintf(name, sizeof name, "NTP %s", ntp_hosts[i]);
-            stage_progress(name, i + 1, ntp_n);
-            ok = ntp_probe(ntp_hosts[i], 2500);
-            if (ok) {
-                ntp_ok++;
-                add_check("NTP / время", name, "ok", "UDP/123 ответ получен", "");
-            } else {
-                add_check("NTP / время", name, "warn", "нет ответа UDP/123",
-                          "Без NTP часы на IoT сбиваются → TLS handshake fail → туннель не поднимается.");
+        if (nout && nok) {
+            NtpCtx nctx;
+            nctx.outs = nout; nctx.ok = nok; nctx.hosts = ntp_hosts;
+            run_parallel(ntp_n, opt_jobs, ntp_job, &nctx, "NTP");
+            for (i = 0; i < ntp_n; i++) {
+                add_check_from(&nout[i]);
+                if (nok[i]) ntp_ok++;
+            }
+        } else {
+            for (i = 0; i < ntp_n; i++) {
+                char name[80];
+                int ok;
+                snprintf(name, sizeof name, "NTP %s", ntp_hosts[i]);
+                stage_progress(name, i + 1, ntp_n);
+                ok = ntp_probe(ntp_hosts[i], 2500);
+                if (ok) {
+                    ntp_ok++;
+                    add_check("NTP / время", name, "ok", "UDP/123 ответ получен", "");
+                } else {
+                    add_check("NTP / время", name, "warn", "нет ответа UDP/123",
+                              "Без NTP часы на IoT сбиваются → TLS handshake fail → туннель не поднимается.");
+                }
             }
         }
+        free(nout); free(nok);
         stage_done();
         if (ntp_ok == 0)
             add_finding("critical", "NTP полностью недоступен",
@@ -4587,90 +4892,107 @@ int main(int argc, char **argv) {
         int dpi_total = n + 2 + 4 + 6; /* ports + DoH×2 + SNI×4 + QUIC×6 */
         int step = 0;
         int dot_open = 0;
-        for (i = 0; i < n; i++) {
-            char ip[64], url[256];
-            int open;
-            stage_progress(dpi[i].name, ++step, dpi_total);
-            snprintf(url, sizeof url, "https://%s/", dpi[i].host);
-            if (!dns_resolve(dpi[i].host, ip, sizeof ip)) {
-                snprintf(detail, sizeof detail, "DNS fail %s", dpi[i].host);
-                add_check_ex("DPI", dpi[i].name, "warn", detail, "", NULL, url, 0);
-                continue;
-            }
-            if (strncmp(dpi[i].name, "DoT ", 4) == 0) {
-                int ms = 0, rc = dot_probe(dpi[i].host, 3000, &ms);
-                const char *sni = dot_sni_for(dpi[i].host);
-                if (rc == 2) {
-                    snprintf(detail, sizeof detail, "DoT TLS+SNI OK (%s) %d ms", sni, ms);
-                    add_check_ex("DPI", dpi[i].name, "ok", detail, "", ip, url, 0);
-                    dot_open++;
-                } else if (rc == 1) {
-                    snprintf(detail, sizeof detail, "TCP :853 есть, TLS нет (%s) %d ms", sni, ms);
-                    add_check_ex("DPI", dpi[i].name, "warn", detail,
-                                 "Порт открыт, но DoT-handshake не проходит.",
-                                 ip, url, 0);
-                } else {
-                    add_check_ex("DPI", dpi[i].name, "warn",
-                                 "TCP :853 закрыт (может быть нормой)",
-                                 "Не критично само по себе; смотрите DoH и Private DNS.",
-                                 ip, url, 0);
+        {
+            Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
+            int *cf = (int *)calloc((size_t)n, sizeof(int));
+            int *dt = (int *)calloc((size_t)n, sizeof(int));
+            const char **names = (const char **)calloc((size_t)n, sizeof(char *));
+            const char **hosts = (const char **)calloc((size_t)n, sizeof(char *));
+            int *ports = (int *)calloc((size_t)n, sizeof(int));
+            int *exp = (int *)calloc((size_t)n, sizeof(int));
+            if (outs && cf && dt && names && hosts && ports && exp) {
+                DpiPortCtx pctx;
+                for (i = 0; i < n; i++) {
+                    names[i] = dpi[i].name; hosts[i] = dpi[i].host;
+                    ports[i] = dpi[i].port; exp[i] = dpi[i].expect_open;
                 }
-                continue;
-            }
-            open = tcp_open(dpi[i].host, dpi[i].port, 3000);
-            if (open) {
-                add_check_ex("DPI", dpi[i].name, "ok", "TCP открыт", "", ip, url, 0);
-            } else if (dpi[i].expect_open) {
-                add_check_ex("DPI", dpi[i].name, "fail",
-                             "TCP закрыт/фильтр",
-                             "Порт часто режется DPI. IoT и push могут страдать при живом HTTPS.",
-                             ip, url, 0);
-                if (ndpi < 40) snprintf(dpi_fail[ndpi++], 64, "%s", dpi[i].name);
+                pctx.outs = outs; pctx.count_fail = cf; pctx.dot_tls_ok = dt;
+                pctx.names = names; pctx.hosts = hosts; pctx.ports = ports; pctx.expect_open = exp;
+                run_parallel(n, opt_jobs, dpi_port_job, &pctx, "DPI ports");
+                step += n;
+                for (i = 0; i < n; i++) {
+                    add_check_from(&outs[i]);
+                    if (dt[i]) dot_open++;
+                    if (cf[i] && ndpi < 40) snprintf(dpi_fail[ndpi++], 64, "%s", dpi[i].name);
+                }
             } else {
-                add_check_ex("DPI", dpi[i].name, "warn",
-                             "TCP закрыт (может быть нормой)",
-                             "Не критично само по себе; смотрите в связке с IoT/VPN.",
-                             ip, url, 0);
+                for (i = 0; i < n; i++) {
+                    char ip[64], url[256];
+                    int open;
+                    stage_progress(dpi[i].name, ++step, dpi_total);
+                    snprintf(url, sizeof url, "https://%s/", dpi[i].host);
+                    if (!dns_resolve(dpi[i].host, ip, sizeof ip)) {
+                        snprintf(detail, sizeof detail, "DNS fail %s", dpi[i].host);
+                        add_check_ex("DPI", dpi[i].name, "warn", detail, "", NULL, url, 0);
+                        continue;
+                    }
+                    if (strncmp(dpi[i].name, "DoT ", 4) == 0) {
+                        int ms = 0, rc = dot_probe(dpi[i].host, 3000, &ms);
+                        const char *sni = dot_sni_for(dpi[i].host);
+                        if (rc == 2) {
+                            snprintf(detail, sizeof detail, "DoT TLS+SNI OK (%s) %d ms", sni, ms);
+                            add_check_ex("DPI", dpi[i].name, "ok", detail, "", ip, url, 0);
+                            dot_open++;
+                        } else if (rc == 1) {
+                            snprintf(detail, sizeof detail, "TCP :853 есть, TLS нет (%s) %d ms", sni, ms);
+                            add_check_ex("DPI", dpi[i].name, "warn", detail,
+                                         "Порт открыт, но DoT-handshake не проходит.",
+                                         ip, url, 0);
+                        } else {
+                            add_check_ex("DPI", dpi[i].name, "warn",
+                                         "TCP :853 закрыт (может быть нормой)",
+                                         "Не критично само по себе; смотрите DoH и Private DNS.",
+                                         ip, url, 0);
+                        }
+                        continue;
+                    }
+                    open = tcp_open(dpi[i].host, dpi[i].port, 3000);
+                    if (open) {
+                        add_check_ex("DPI", dpi[i].name, "ok", "TCP открыт", "", ip, url, 0);
+                    } else if (dpi[i].expect_open) {
+                        add_check_ex("DPI", dpi[i].name, "fail",
+                                     "TCP закрыт/фильтр",
+                                     "Порт часто режется DPI. IoT и push могут страдать при живом HTTPS.",
+                                     ip, url, 0);
+                        if (ndpi < 40) snprintf(dpi_fail[ndpi++], 64, "%s", dpi[i].name);
+                    } else {
+                        add_check_ex("DPI", dpi[i].name, "warn",
+                                     "TCP закрыт (может быть нормой)",
+                                     "Не критично само по себе; смотрите в связке с IoT/VPN.",
+                                     ip, url, 0);
+                    }
+                }
             }
+            free(outs); free(cf); free(dt); free(names); free(hosts); free(ports); free(exp);
         }
 
         {
-            HttpResult r;
+            static const char *doh_names[] = {"DoH Cloudflare", "DoH Google JSON"};
+            static const char *doh_urls[] = {
+                "https://cloudflare-dns.com/dns-query?name=example.com&type=A",
+                "https://dns.google/resolve?name=example.com&type=A",
+            };
+            Check *outs = (Check *)calloc(2, sizeof(Check));
+            int is_fail[2] = {0, 0};
             int doh_ok = 0, doh_fail = 0;
-            stage_progress("DoH Cloudflare", ++step, dpi_total);
-            r = doh_probe(
-                "https://cloudflare-dns.com/dns-query?name=example.com&type=A", 5);
-            if (r.code == 200) {
-                snprintf(detail, sizeof detail, "HTTP %d, %d ms (dns-json)", r.code, r.ms);
-                add_check("DPI", "DoH Cloudflare", "ok", detail, "");
-                doh_ok++;
-            } else if (r.code > 0) {
-                snprintf(detail, sizeof detail, "HTTP %d, %d ms", r.code, r.ms);
-                add_check("DPI", "DoH Cloudflare", "warn", detail,
-                          "Ожидали 200 с Accept: application/dns-json — возможна подмена/фильтр DoH.");
-            } else {
-                add_check("DPI", "DoH Cloudflare", "fail",
-                          r.error[0] ? r.error : "таймаут",
-                          "DoH часто режет DPI. Private DNS/DoH может ломать связность на клиентах.");
-                if (ndpi < 40) snprintf(dpi_fail[ndpi++], 64, "%s", "DoH Cloudflare");
-                doh_fail++;
+            DohCtx dctx;
+            if (outs) {
+                dctx.outs = outs; dctx.is_fail = is_fail;
+                dctx.names = doh_names; dctx.urls = doh_urls;
+                run_parallel(2, opt_jobs, doh_job, &dctx, "DoH");
+                step += 2;
+                for (i = 0; i < 2; i++) {
+                    add_check_from(&outs[i]);
+                    if (strcmp(outs[i].status, "ok") == 0) doh_ok++;
+                    if (is_fail[i]) {
+                        doh_fail++;
+                        if (ndpi < 40)
+                            snprintf(dpi_fail[ndpi++], 64, "%s",
+                                     i == 0 ? "DoH Cloudflare" : "DoH Google");
+                    }
+                }
             }
-            stage_progress("DoH Google", ++step, dpi_total);
-            r = doh_probe("https://dns.google/resolve?name=example.com&type=A", 5);
-            if (r.code == 200) {
-                snprintf(detail, sizeof detail, "HTTP %d, %d ms (dns-json)", r.code, r.ms);
-                add_check("DPI", "DoH Google JSON", "ok", detail, "");
-                doh_ok++;
-            } else if (r.code > 0) {
-                snprintf(detail, sizeof detail, "HTTP %d, %d ms", r.code, r.ms);
-                add_check("DPI", "DoH Google JSON", "warn", detail, "");
-            } else {
-                add_check("DPI", "DoH Google JSON", "fail",
-                          r.error[0] ? r.error : "таймаут",
-                          "Фильтр DoH Google — частый признак DPI.");
-                if (ndpi < 40) snprintf(dpi_fail[ndpi++], 64, "%s", "DoH Google");
-                doh_fail++;
-            }
+            free(outs);
             if (doh_fail > 0 && dot_open > 0) {
                 add_finding("info", "DoH режется, DoT (TCP/853 + TLS) доступен",
                             "Включайте шифрованный DNS как DoT / Private DNS (хост dns.google или 1dot1dot1dot1.cloudflare-dns.com), "
@@ -4698,35 +5020,26 @@ int main(int argc, char **argv) {
             };
             int nsni = (int)(sizeof sni / sizeof sni[0]);
             int sni_fail = 0;
-            for (i = 0; i < nsni; i++) {
-                HttpResult r;
-                char host[128], ip[64];
-                stage_progress(sni[i].name, ++step, dpi_total);
-                r = http_probe(sni[i].url, 6, 1);
-                host_from_url(sni[i].url, host, sizeof host);
-                ip[0] = 0;
-                if (host[0]) dns_resolve(host, ip, sizeof ip);
-                if (r.code > 0 && r.code < 500) {
-                    snprintf(detail, sizeof detail, "HTTP %d, %d ms", r.code, r.ms);
-                    add_check_ex("DPI", sni[i].name, "ok", detail, "", ip, sni[i].url, 0);
-                } else if (sni[i].expected_ru) {
-                    add_check_ex("DPI", sni[i].name, "info",
-                                 r.error[0] ? r.error : "таймаут/блок",
-                                 "Ожидаемо в РФ — не считается проблемой сети / DPI.",
-                                 ip, sni[i].url, 0);
-                } else if (host_unresolved(host, ip)) {
-                    add_check_ex("DPI", sni[i].name, "warn",
-                                 "DNS не резолвит имя",
-                                 "Сбой DNS, не SNI/DPI.",
-                                 NULL, sni[i].url, 0);
-                } else {
-                    add_check_ex("DPI", sni[i].name, "fail",
-                                 r.error[0] ? r.error : "таймаут/блок",
-                                 "SNI/DPI-фильтр: сайт режется по имени, не по «интернету вообще».",
-                                 ip, sni[i].url, 0);
-                    sni_fail++;
+            Check *outs = (Check *)calloc((size_t)nsni, sizeof(Check));
+            int *sf = (int *)calloc((size_t)nsni, sizeof(int));
+            const char **names = (const char **)calloc((size_t)nsni, sizeof(char *));
+            const char **urls = (const char **)calloc((size_t)nsni, sizeof(char *));
+            int *eru = (int *)calloc((size_t)nsni, sizeof(int));
+            if (outs && sf && names && urls && eru) {
+                SniCtx sctx;
+                for (i = 0; i < nsni; i++) {
+                    names[i] = sni[i].name; urls[i] = sni[i].url; eru[i] = sni[i].expected_ru;
+                }
+                sctx.outs = outs; sctx.sni_fail = sf; sctx.names = names;
+                sctx.urls = urls; sctx.expected_ru = eru;
+                run_parallel(nsni, opt_jobs, sni_job, &sctx, "SNI");
+                step += nsni;
+                for (i = 0; i < nsni; i++) {
+                    add_check_from(&outs[i]);
+                    if (sf[i]) sni_fail++;
                 }
             }
+            free(outs); free(sf); free(names); free(urls); free(eru);
             if (sni_fail >= 1)
                 add_finding("warning", "Похоже на SNI/DPI фильтрацию",
                             "Неожиданно недоступны «обычные» зарубежные HTTPS (не YouTube/Telegram/Discord). "
@@ -4736,7 +5049,6 @@ int main(int argc, char **argv) {
         /* QUIC / HTTP3 path */
         {
             struct { const char *name, *host; int expected_ru; } qh[] = {
-                /* Контроль: Яндекс. youtube/discord в РФ часто без QUIC — не проблема. */
                 {"QUIC ya.ru:443/udp", "ya.ru", 0},
                 {"QUIC yandex.ru:443/udp", "www.yandex.ru", 0},
                 {"QUIC google.com:443/udp", "www.google.com", 0},
@@ -4746,28 +5058,28 @@ int main(int argc, char **argv) {
             };
             int qok = 0;
             int nq = (int)(sizeof qh / sizeof qh[0]);
-            for (i = 0; i < nq; i++) {
-                int ms = 0;
-                char ip[64], url[256];
-                stage_progress(qh[i].name, ++step, dpi_total);
-                ip[0] = 0;
-                dns_resolve(qh[i].host, ip, sizeof ip);
-                snprintf(url, sizeof url, "https://%s/", qh[i].host);
-                if (quic_probe(qh[i].host, 2500, &ms)) {
-                    qok++;
-                    snprintf(detail, sizeof detail, "QUIC VN (UDP/443) за %d ms", ms);
-                    add_check_ex("DPI", qh[i].name, "ok", detail, "", ip, url, 0);
-                } else if (qh[i].expected_ru) {
-                    add_check_ex("DPI", qh[i].name, "info", "нет UDP-ответа на :443",
-                                 "Ожидаемо в РФ для этого хоста — не считается проблемой.",
-                                 ip, url, 0);
-                } else {
-                    add_check_ex("DPI", qh[i].name, "warn", "нет UDP-ответа на :443",
-                                 "QUIC/HTTP3 может резаться DPI при живом TCP/443. "
-                                 "Браузеры откатятся на TCP; часть CDN/видео — нет.",
-                                 ip, url, 0);
+            Check *outs = (Check *)calloc((size_t)nq, sizeof(Check));
+            int *qo = (int *)calloc((size_t)nq, sizeof(int));
+            const char **names = (const char **)calloc((size_t)nq, sizeof(char *));
+            const char **hosts = (const char **)calloc((size_t)nq, sizeof(char *));
+            int *eru = (int *)calloc((size_t)nq, sizeof(int));
+            if (outs && qo && names && hosts && eru) {
+                QuicCtx qctx;
+                for (i = 0; i < nq; i++) {
+                    names[i] = qh[i].name; hosts[i] = qh[i].host; eru[i] = qh[i].expected_ru;
+                }
+                qctx.outs = outs; qctx.qok = qo; qctx.names = names;
+                qctx.hosts = hosts; qctx.expected_ru = eru;
+                run_parallel(nq, opt_jobs, quic_job, &qctx, "QUIC");
+                step += nq;
+                for (i = 0; i < nq; i++) {
+                    add_check_from(&outs[i]);
+                    if (qo[i]) qok++;
                 }
             }
+            free(outs); free(qo); free(names); free(hosts); free(eru);
+            (void)step;
+            (void)dpi_total;
             if (qok == 0)
                 add_finding("warning", "QUIC недоступен",
                             "Ни один контрольный хост (кроме ожидаемо ограниченных в РФ) "
@@ -5054,42 +5366,33 @@ int main(int argc, char **argv) {
              "https://proof.ovh.net/files/10Mb.dat", "Европа · OVH FR", &mbps_eu, 1},
         };
         int np = (int)(sizeof probes / sizeof probes[0]);
-        int pi;
+        Check *souts = (Check *)calloc((size_t)np, sizeof(Check));
+        double *smbps = (double *)calloc((size_t)np, sizeof(double));
+        const char **snames = (const char **)calloc((size_t)np, sizeof(char *));
+        const char **surls = (const char **)calloc((size_t)np, sizeof(char *));
+        const char **sgeo = (const char **)calloc((size_t)np, sizeof(char *));
+        int *scrit = (int *)calloc((size_t)np, sizeof(int));
 
         stage_progress("пробы download", 1, np + 2);
-        for (pi = 0; pi < np; pi++) {
-            char host[128], rip[64];
-            stage_item(probes[pi].name, pi + 1, np);
-            host_from_url(probes[pi].url, host, sizeof host);
-            rip[0] = 0;
-            if (host[0]) dns_resolve(host, rip, sizeof rip);
-            bytes = 0;
-            ms = 0;
-            if (http_download_bytes(probes[pi].url, 35, &bytes, &ms) && ms > 0 && bytes > 200000) {
-                double mbps = (bytes * 8.0) / (ms * 1000.0);
-                if (probes[pi].out_mbps) *probes[pi].out_mbps = mbps;
-                st = mbps < 8 ? "warn" : "ok";
-                snprintf(detail, sizeof detail,
-                         "%.2f Мбит/с (%ld байт за %d ms) · %s",
-                         mbps, bytes, ms, probes[pi].geo);
-                add_check_ex("Скорость", probes[pi].name, st, detail,
-                             mbps < 8
-                                 ? "Ниже ~8 Мбит/с до этой точки — узкое место на маршруте или Wi‑Fi."
-                                 : "",
-                             rip[0] ? rip : NULL, probes[pi].url, 0);
-            } else if (probes[pi].critical) {
-                snprintf(detail, sizeof detail, "%s",
-                         ms > 0 ? "скачано слишком мало / обрыв" : "таймаут / нет ответа");
-                add_check_ex("Скорость", probes[pi].name, "fail", detail,
-                             "Не удалось скачать пробник — фильтр, маршрут или перегруз.",
-                             rip[0] ? rip : NULL, probes[pi].url, 0);
-            } else {
-                add_check_ex("Скорость", probes[pi].name, "info",
-                             "недоступен с этой сети (норма, если не из РФ)",
-                             "Запасная проба РФ — Selectel.",
-                             rip[0] ? rip : NULL, probes[pi].url, 0);
+        if (souts && smbps && snames && surls && sgeo && scrit) {
+            SpeedCtx sctx;
+            int pi;
+            for (pi = 0; pi < np; pi++) {
+                snames[pi] = probes[pi].name;
+                surls[pi] = probes[pi].url;
+                sgeo[pi] = probes[pi].geo;
+                scrit[pi] = probes[pi].critical;
+            }
+            sctx.outs = souts; sctx.mbps = smbps; sctx.names = snames;
+            sctx.urls = surls; sctx.geo = sgeo; sctx.critical = scrit;
+            run_parallel(np, opt_jobs, speed_job, &sctx, "скорость");
+            for (pi = 0; pi < np; pi++) {
+                add_check_from(&souts[pi]);
+                if (probes[pi].out_mbps && smbps[pi] >= 0)
+                    *probes[pi].out_mbps = smbps[pi];
             }
         }
+        free(souts); free(smbps); free(snames); free(surls); free(sgeo); free(scrit);
 
         if (mbps_ru >= 0 && mbps_eu >= 0) {
             if (mbps_ru >= 15 && mbps_eu >= 0 && mbps_eu < mbps_ru * 0.25 && mbps_eu < 10)
