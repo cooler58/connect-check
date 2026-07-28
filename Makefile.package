@@ -93,7 +93,7 @@ ifeq ($(LINUX_CC),)
 endif
 	$(MAKE) -f Makefile.diagnose embed
 	mkdir -p bin/linux
-	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/connect-check src/connect-check.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -pthread -o bin/linux/connect-check src/connect-check.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-quic src/probe-quic.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-battlenet src/probe-battlenet.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-mqtt src/probe-mqtt.c

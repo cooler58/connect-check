@@ -23,32 +23,30 @@
 #  include <iphlpapi.h>
 #  include <wininet.h>
 #  include <shellapi.h>
+#  include <process.h>
 #  include <io.h>
 #  pragma comment(lib, "ws2_32.lib")
 #  pragma comment(lib, "iphlpapi.lib")
 #  pragma comment(lib, "wininet.lib")
 #  pragma comment(lib, "shell32.lib")
 #else
-#  include <unistd.h>
-#  include <sys/types.h>
-#  include <sys/socket.h>
-#  include <sys/time.h>
-#  include <netinet/in.h>
-#  include <arpa/inet.h>
-#  include <netdb.h>
-#  include <fcntl.h>
-#  include <termios.h>
-#  include <signal.h>
-
-/*
- * macOS: системный curl/LibreSSL ломает TLS к части госсайтов (gosuslugi и др.).
- * SecureTransport ведёт себя как Safari/браузер.
- */
-#  ifdef __APPLE__
-#    define CURL_SSL_ENV "CURL_SSL_BACKEND=secure-transport "
-#  else
-#    define CURL_SSL_ENV ""
-#  endif
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <signal.h>
+#include <pthread.h>
+/* macOS: системный curl/LibreSSL ломает TLS к части госсайтов (gosuslugi и др.). */
+#ifdef __APPLE__
+#define CURL_SSL_ENV "CURL_SSL_BACKEND=secure-transport "
+#else
+#define CURL_SSL_ENV ""
+#endif
 #endif
 
 #define MAX_CHECKS   1024
@@ -57,6 +55,9 @@
 #define MAX_DOMAINS  10000
 #define STR          512
 #define LONGSTR      1024
+#define PING_STR     768
+#define TRACE_STR    4096
+#define DEFAULT_JOBS 32
 
 typedef struct {
     char category[96];
@@ -66,6 +67,8 @@ typedef struct {
     char hint[STR];
     char resolved_ip[64];
     char diag_url[256];
+    char ping_text[PING_STR];
+    char trace_text[TRACE_STR];
     int spoiler; /* 1 = fold long category / diag under <details> */
 } Check;
 
@@ -105,6 +108,7 @@ static int opt_skip_dns_bulk;
 static int opt_force_dns_bulk; /* --dns-bulk: запустить даже при -y / без Enter */
 static int opt_skip_speed;
 static int opt_skip_video;
+static int opt_jobs = DEFAULT_JOBS; /* параллельные пробы внутри этапа */
 static int opt_dns_limit = 1000; /* полный прогон: --dns-limit 10000 */
 static int g_sys_dns_broken; /* getaddrinfo не резолвит известные имена — remote-этапы бессмысленны */
 static char domains_path[STR];
@@ -121,6 +125,7 @@ static char g_prog_item[48];
 static int g_prog_cur;
 static int g_prog_total;
 static void stage_progress(const char *msg, int cur, int total);
+static void stage_done(void);
 static void host_from_url(const char *url, char *host, size_t hostlen);
 
 /* ---------- utils ---------- */
@@ -194,6 +199,154 @@ static void add_finding(const char *level, const char *title, const char *text) 
     snprintf(f->level, sizeof f->level, "%s", level);
     snprintf(f->title, sizeof f->title, "%s", title);
     snprintf(f->text, sizeof f->text, "%s", text);
+}
+
+/* ---------- parallel jobs ---------- */
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_out_cs;
+static volatile LONG g_out_cs_init;
+static void out_lock_init(void) {
+    if (InterlockedCompareExchange(&g_out_cs_init, 1, 0) == 0)
+        InitializeCriticalSection(&g_out_cs);
+}
+static void out_lock(void) { out_lock_init(); EnterCriticalSection(&g_out_cs); }
+static void out_unlock(void) { LeaveCriticalSection(&g_out_cs); }
+static int atomic_fetch_add(volatile int *p) {
+    return (int)InterlockedIncrement((volatile LONG *)p) - 1;
+}
+#else
+static pthread_mutex_t g_out_mu = PTHREAD_MUTEX_INITIALIZER;
+static void out_lock(void) { pthread_mutex_lock(&g_out_mu); }
+static void out_unlock(void) { pthread_mutex_unlock(&g_out_mu); }
+static int atomic_fetch_add(volatile int *p) {
+    return __sync_fetch_and_add(p, 1);
+}
+#endif
+
+typedef void (*JobFn)(int idx, void *ctx);
+
+typedef struct {
+    volatile int next;
+    volatile int done;
+    int n;
+    JobFn fn;
+    void *ctx;
+    const char *prog_label;
+} ParallelState;
+
+static void stage_progress(const char *msg, int cur, int total);
+static void stage_done(void);
+
+#ifdef _WIN32
+static unsigned __stdcall parallel_worker(void *arg) {
+#else
+static void *parallel_worker(void *arg) {
+#endif
+    ParallelState *st = (ParallelState *)arg;
+    for (;;) {
+        int i = atomic_fetch_add(&st->next);
+        int done;
+        if (i >= st->n) break;
+        st->fn(i, st->ctx);
+        done = atomic_fetch_add(&st->done) + 1;
+        if (st->prog_label) {
+            out_lock();
+            stage_progress(st->prog_label, done, st->n);
+            out_unlock();
+        }
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static int jobs_clamp(int n, int jobs) {
+    if (jobs < 1) jobs = 1;
+    if (jobs > 256) jobs = 256;
+    if (n < 1) return 1;
+    if (jobs > n) jobs = n;
+    return jobs;
+}
+
+static void run_parallel(int n, int jobs, JobFn fn, void *ctx, const char *prog_label) {
+    ParallelState st;
+    int w, nw;
+    if (n <= 0 || !fn) return;
+    if (n == 1 || jobs <= 1) {
+        int i;
+        for (i = 0; i < n; i++) {
+            fn(i, ctx);
+            if (prog_label) stage_progress(prog_label, i + 1, n);
+        }
+        return;
+    }
+    nw = jobs_clamp(n, jobs);
+    memset(&st, 0, sizeof st);
+    st.n = n;
+    st.fn = fn;
+    st.ctx = ctx;
+    st.prog_label = prog_label;
+#ifdef _WIN32
+    {
+        HANDLE *ths = (HANDLE *)calloc((size_t)nw, sizeof(HANDLE));
+        if (!ths) {
+            for (w = 0; w < n; w++) fn(w, ctx);
+            return;
+        }
+        for (w = 0; w < nw; w++)
+            ths[w] = (HANDLE)_beginthreadex(NULL, 0, parallel_worker, &st, 0, NULL);
+        for (w = 0; w < nw; w++) {
+            if (ths[w]) {
+                WaitForSingleObject(ths[w], INFINITE);
+                CloseHandle(ths[w]);
+            }
+        }
+        free(ths);
+    }
+#else
+    {
+        pthread_t *ths = (pthread_t *)calloc((size_t)nw, sizeof(pthread_t));
+        if (!ths) {
+            for (w = 0; w < n; w++) fn(w, ctx);
+            return;
+        }
+        for (w = 0; w < nw; w++) {
+            if (pthread_create(&ths[w], NULL, parallel_worker, &st) != 0)
+                ths[w] = 0;
+        }
+        for (w = 0; w < nw; w++) {
+            if (ths[w]) pthread_join(ths[w], NULL);
+        }
+        free(ths);
+    }
+#endif
+}
+
+static void check_set(Check *c, const char *cat, const char *name, const char *st,
+                      const char *detail, const char *hint,
+                      const char *ip, const char *url, int spoiler) {
+    memset(c, 0, sizeof *c);
+    snprintf(c->category, sizeof c->category, "%s", cat ? cat : "");
+    snprintf(c->name, sizeof c->name, "%s", name ? name : "");
+    snprintf(c->status, sizeof c->status, "%s", st ? st : "info");
+    snprintf(c->detail, sizeof c->detail, "%s", detail ? detail : "");
+    snprintf(c->hint, sizeof c->hint, "%s", hint ? hint : "");
+    if (ip && ip[0]) snprintf(c->resolved_ip, sizeof c->resolved_ip, "%s", ip);
+    if (url && url[0]) snprintf(c->diag_url, sizeof c->diag_url, "%s", url);
+    c->spoiler = spoiler;
+}
+
+static void add_check_from(const Check *src) {
+    Check *c;
+    if (!src || nchecks >= MAX_CHECKS) return;
+    c = &checks[nchecks++];
+    *c = *src;
+    if (strcmp(c->status, "ok") == 0) ok_n++;
+    else if (strcmp(c->status, "warn") == 0) warn_n++;
+    else if (strcmp(c->status, "fail") == 0) fail_n++;
 }
 
 static int run_capture(const char *cmd, char *buf, size_t buflen) {
@@ -773,21 +926,20 @@ static int ntp_probe(const char *host, int timeout_ms) {
     return ok;
 }
 
-static void check_tcp_ep(const char *cat, const char *name, const char *host,
-                         int port, int timeout_ms, int critical, int spoiler,
-                         int *fail_n, char fail_names[][64], int fail_cap) {
+static void check_tcp_ep_fill(Check *out, const char *cat, const char *name,
+                              const char *host, int port, int timeout_ms,
+                              int critical, int spoiler, int *crit_fail) {
     char detail[STR], hint[STR], ip[64], url[256];
     long long t0;
     int open;
-
+    if (crit_fail) *crit_fail = 0;
     snprintf(url, sizeof url, "https://%s/", host);
     if (!dns_resolve(host, ip, sizeof ip)) {
         snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-        add_check_ex(cat, name, "warn", detail,
-                     "Имя не резолвится — это сбой DNS, а не доказательство недоступности сервиса. "
-                     "Проверьте системный DNS / фильтр / Private DNS.",
-                     NULL, url, spoiler);
-        /* не считаем критическим fail ресурса */
+        check_set(out, cat, name, "warn", detail,
+                  "Имя не резолвится — это сбой DNS, а не доказательство недоступности сервиса. "
+                  "Проверьте системный DNS / фильтр / Private DNS.",
+                  NULL, url, spoiler);
         return;
     }
     t0 = now_ms();
@@ -795,15 +947,25 @@ static void check_tcp_ep(const char *cat, const char *name, const char *host,
     if (open) {
         snprintf(detail, sizeof detail, "%s:%d открыт, %lld ms",
                  host, port, (long long)(now_ms() - t0));
-        add_check_ex(cat, name, "ok", detail, "", ip, url, spoiler);
+        check_set(out, cat, name, "ok", detail, "", ip, url, spoiler);
         return;
     }
     snprintf(detail, sizeof detail, "%s:%d закрыт/фильтр", host, port);
     snprintf(hint, sizeof hint,
              "Типичный симптом DPI/firewall: TCP connect не проходит. "
              "Для IoT нужны allowlist хостов и портов (часто 443/8883).");
-    add_check_ex(cat, name, "fail", detail, hint, ip, url, spoiler);
-    if (critical && fail_n && *fail_n < fail_cap)
+    check_set(out, cat, name, "fail", detail, hint, ip, url, spoiler);
+    if (critical && crit_fail) *crit_fail = 1;
+}
+
+static void check_tcp_ep(const char *cat, const char *name, const char *host,
+                         int port, int timeout_ms, int critical, int spoiler,
+                         int *fail_n, char fail_names[][64], int fail_cap) {
+    Check c;
+    int crit_fail = 0;
+    check_tcp_ep_fill(&c, cat, name, host, port, timeout_ms, critical, spoiler, &crit_fail);
+    add_check_from(&c);
+    if (crit_fail && fail_n && *fail_n < fail_cap)
         snprintf(fail_names[(*fail_n)++], 64, "%s", name);
 }
 
@@ -1451,6 +1613,107 @@ static int ping_summary(const char *target, int count, int *loss, double *avg) {
     }
 #endif
     return 0;
+}
+
+static int host_cmd_safe(const char *h) {
+    size_t i;
+    if (!h || !h[0]) return 0;
+    for (i = 0; h[i]; i++) {
+        unsigned char c = (unsigned char)h[i];
+        if (!(isalnum(c) || c == '.' || c == '-' || c == ':' || c == '%'))
+            return 0;
+    }
+    return 1;
+}
+
+static void host_from_check(const Check *c, char *host, size_t hostlen) {
+    host[0] = 0;
+    if (!c) return;
+    if (c->diag_url[0]) {
+        host_from_url(c->diag_url, host, hostlen);
+        if (host[0]) return;
+    }
+    if (c->resolved_ip[0] && host_cmd_safe(c->resolved_ip))
+        snprintf(host, hostlen, "%s", c->resolved_ip);
+}
+
+static void net_ping_text(const char *target, char *buf, size_t buflen) {
+    char cmd[320], out[8192];
+    buf[0] = 0;
+    if (!host_cmd_safe(target) || buflen < 8) return;
+#ifdef _WIN32
+    snprintf(cmd, sizeof cmd, "ping -n 4 -w 1000 %s", target);
+#else
+    snprintf(cmd, sizeof cmd, "ping -c 4 -W 1000 %s 2>&1", target);
+#endif
+    if (run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
+        snprintf(buf, buflen, "ping %s: нет вывода", target);
+        return;
+    }
+    snprintf(buf, buflen, "ping %s\n%s", target, out);
+    buf[buflen - 1] = 0;
+}
+
+static void net_traceroute_text(const char *target, char *buf, size_t buflen) {
+    char cmd[384], out[16384];
+    buf[0] = 0;
+    if (!host_cmd_safe(target) || buflen < 8) return;
+#ifdef _WIN32
+    snprintf(cmd, sizeof cmd, "tracert -d -w 1000 -h 15 %s", target);
+#elif defined(__APPLE__)
+    snprintf(cmd, sizeof cmd, "traceroute -n -w 1 -q 1 -m 15 %s 2>&1", target);
+#else
+    snprintf(cmd, sizeof cmd,
+             "(command -v traceroute >/dev/null && traceroute -n -w 1 -q 1 -m 15 %s) || "
+             "(command -v tracepath >/dev/null && tracepath -n -m 15 %s) || "
+             "echo 'traceroute/tracepath не найден'",
+             target, target);
+#endif
+    if (run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
+        snprintf(buf, buflen, "traceroute %s: нет вывода", target);
+        return;
+    }
+    snprintf(buf, buflen, "%s", out);
+    buf[buflen - 1] = 0;
+}
+
+typedef struct {
+    int *idxs;
+} NetDiagCtx;
+
+static void netdiag_job(int idx, void *v) {
+    NetDiagCtx *ctx = (NetDiagCtx *)v;
+    Check *c;
+    char host[128];
+    int ci = ctx->idxs[idx];
+    if (ci < 0 || ci >= nchecks) return;
+    c = &checks[ci];
+    host_from_check(c, host, sizeof host);
+    if (!host[0] && c->resolved_ip[0] && host_cmd_safe(c->resolved_ip))
+        snprintf(host, sizeof host, "%s", c->resolved_ip);
+    if (!host[0]) return;
+    net_ping_text(host, c->ping_text, sizeof c->ping_text);
+    net_traceroute_text(host, c->trace_text, sizeof c->trace_text);
+}
+
+static void enrich_fail_netdiag(void) {
+    int idxs[MAX_CHECKS];
+    int n = 0, i;
+    NetDiagCtx ctx;
+    for (i = 0; i < nchecks && n < MAX_CHECKS; i++) {
+        char host[128];
+        if (strcmp(checks[i].status, "fail") != 0) continue;
+        host_from_check(&checks[i], host, sizeof host);
+        if (!host[0] && !(checks[i].resolved_ip[0] && host_cmd_safe(checks[i].resolved_ip)))
+            continue;
+        idxs[n++] = i;
+    }
+    if (n == 0) return;
+    printf("\n▶ Сеть (ping/traceroute) для недоступных (%d)\n", n);
+    fflush(stdout);
+    ctx.idxs = idxs;
+    run_parallel(n, opt_jobs, netdiag_job, &ctx, "net-diag");
+    stage_done();
 }
 
 /* ---------- DNS latency ---------- */
@@ -2520,6 +2783,8 @@ static void resources_load_defaults(void) {
         /* контроль: зарубежные (часть — ожидаемый блок в РФ) */
         {"Google", "https://www.google.com/", "", 0},
         {"Gmail", "https://mail.google.com/", "", 0},
+        {"Google Play", "https://play.google.com/", "", 0},
+        {"App Store", "https://apps.apple.com/", "", 0},
         {"Microsoft", "https://www.microsoft.com/", "", 0},
         {"Microsoft Teams", "https://go.trouter.teams.microsoft.com/",
          "веб teams.microsoft.com часто таймаут/antibot; проба Trouter (realtime Teams)", 0},
@@ -3022,6 +3287,10 @@ static void write_html(void) {
         "button.copy{background:#243040;border:1px solid var(--line);color:var(--text);border-radius:6px;"
         "padding:2px 8px;font-size:.75rem;cursor:pointer}\n"
         "button.copy:hover{border-color:var(--info)}\n"
+        "pre.netdiag{margin:6px 0 4px;padding:8px 10px;background:#0c1015;border-radius:8px;"
+        "border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;max-height:280px;"
+        "overflow:auto;font-size:.78rem;line-height:1.35;color:var(--text)}\n"
+        ".netdiag-block{margin-top:8px}.netdiag-block .lbl{font-weight:600;color:var(--muted)}\n"
         ".howto{margin-top:22px;padding:16px;border-radius:12px;background:var(--panel);border:1px solid var(--line);color:var(--muted)}\n"
         ".howto h2{color:var(--text);font-size:1.1rem;margin:0 0 8px}code{background:#0c1015;padding:1px 6px;border-radius:4px}\n"
         "</style>\n"
@@ -3029,6 +3298,8 @@ static void write_html(void) {
         "async function copyText(t,btn){try{await navigator.clipboard.writeText(t);"
         "if(btn){const o=btn.textContent;btn.textContent='Скопировано';setTimeout(()=>btn.textContent=o,1200)}}"
         "catch(e){prompt('Скопируйте:',t)}}\n"
+        "function copyPre(btn){const b=btn.closest('.netdiag-block');"
+        "const pre=b&&b.querySelector('pre');if(pre)copyText(pre.textContent,btn)}\n"
         "function revealTarget(){const id=location.hash.slice(1);if(!id)return;"
         "const el=document.getElementById(id);if(!el)return;"
         "let p=el.parentElement;while(p){if(p.tagName==='DETAILS')p.open=true;p=p.parentElement}"
@@ -3140,10 +3411,12 @@ static void write_html(void) {
                 html_esc(f, c->hint);
                 fputs("</div>", f);
             }
-            if (c->resolved_ip[0] || c->diag_url[0]) {
+            if (c->resolved_ip[0] || c->diag_url[0] || c->ping_text[0] || c->trace_text[0]) {
                 int captive_row = (strcmp(c->category, "Captive / OS") == 0);
-                fprintf(f, "<details class=\"diag\"%s><summary>SNI / IP / URL</summary><div class=\"copyrow\">",
-                        captive_row ? " open" : "");
+                int has_net = (c->ping_text[0] || c->trace_text[0]);
+                fprintf(f, "<details class=\"diag\"%s><summary>%s</summary><div class=\"copyrow\">",
+                        captive_row ? " open" : "",
+                        has_net ? "SNI / IP / URL / сеть" : "SNI / IP / URL");
                 if (c->diag_url[0]) {
                     char hostbuf[128];
                     const char *p = c->diag_url;
@@ -3180,7 +3453,32 @@ static void write_html(void) {
                     html_esc(f, c->diag_url);
                     fputs("',this)\">копировать</button></span>", f);
                 }
-                fputs("</div></details>", f);
+                fputs("</div>", f);
+                if (c->ping_text[0]) {
+                    fputs("<div class=\"netdiag-block\"><div class=\"lbl\">Ping "
+                          "<button type=\"button\" class=\"copy\" onclick=\"copyPre(this)\">копировать</button>"
+                          "</div><pre class=\"netdiag\">", f);
+                    html_esc(f, c->ping_text);
+                    fputs("</pre></div>", f);
+                }
+                if (c->trace_text[0]) {
+                    fputs("<div class=\"netdiag-block\"><div class=\"lbl\">Traceroute "
+                          "<button type=\"button\" class=\"copy\" onclick=\"copyPre(this)\">копировать</button>"
+                          "</div><pre class=\"netdiag\">", f);
+                    html_esc(f, c->trace_text);
+                    fputs("</pre></div>", f);
+                }
+                if (has_net) {
+                    fputs("<div class=\"copyrow\" style=\"margin-top:8px\">"
+                          "<button type=\"button\" class=\"copy\" onclick=\""
+                          "const b=this.closest('details');"
+                          "let t='';"
+                          "b.querySelectorAll('code').forEach(c=>{t+=c.textContent+'\\n'});"
+                          "b.querySelectorAll('pre.netdiag').forEach(p=>{t+=p.textContent+'\\n\\n'});"
+                          "copyText(t.trim(),this)"
+                          "\">копировать всё</button></div>", f);
+                }
+                fputs("</details>", f);
             }
             fputs("</td><td class=\"hintcol\">", f);
             html_esc(f, c->hint);
@@ -3195,6 +3493,8 @@ static void write_html(void) {
         "<div class=\"howto\"><h2>Как читать отчёт</h2><ul>"
         "<li><strong>Выводы сверху</strong> — сначала смотрите блоки finding (critical / warning / info), "
         "потом таблицы по разделам.</li>"
+        "<li><strong>SNI / IP / URL / сеть</strong> — в спойлере у проверки: хост, IP, URL; "
+        "для сбоев (fail) дополнительно ping и traceroute с кнопками копирования.</li>"
         "<li><strong>Captive / OS</strong> — URL, по которым телефон/ПК решают «есть ли интернет». "
         "Для Android важен HTTP <code>204</code> без редиректа на gstatic/OEM.</li>"
         "<li><strong>Private DNS / DoT / DoH</strong> — DoT это DNS поверх TLS на TCP/<code>853</code>; "
@@ -3235,35 +3535,35 @@ static void host_from_url(const char *url, char *host, size_t hostlen) {
     }
 }
 
-static void check_captive(const char *name, const char *url, int expect, int critical) {
-    /* Captive: НЕ follow — 301/302 = портал/подмена */
+static void check_captive_fill(Check *out, const char *name, const char *url,
+                               int expect, int *want_finding, char *ftitle, size_t ftlen,
+                               char *ftext, size_t ftextlen) {
     HttpResult r = http_probe_nofollow(url, 5, 0);
     char detail[STR], hint[STR], host[128], ip[64];
     const char *st;
 
+    if (want_finding) *want_finding = 0;
     host_from_url(url, host, sizeof host);
     ip[0] = 0;
     if (host[0]) dns_resolve(host, ip, sizeof ip);
 
-    /* Без резолва HTTP-ошибка — не «captive/нет интернета», а DNS */
     if (host_unresolved(host, ip) && r.code != expect && !r.redirect[0]) {
         snprintf(detail, sizeof detail, "SNI %s · DNS не резолвит имя", host);
-        add_check_ex("Captive / OS", name, "warn", detail,
-                     "Имя не резолвится — это не доказательство captive portal / «нет интернета».",
-                     NULL, url, 0);
+        check_set(out, "Captive / OS", name, "warn", detail,
+                  "Имя не резолвится — это не доказательство captive portal / «нет интернета».",
+                  NULL, url, 0);
         return;
     }
 
     if (r.redirect[0]) {
         snprintf(detail, sizeof detail, "SNI %s · редирект → %s (HTTP %d)",
                  host[0] ? host : "?", r.redirect, r.code);
-        add_check_ex("Captive / OS", name, "fail", detail,
-                     "Captive portal или подмена HTTP.", ip, url, 0);
-        if (critical) {
-            char t[256], tx[LONGSTR];
-            snprintf(t, sizeof t, "Подмена %s", name);
-            snprintf(tx, sizeof tx, "Запрос к %s уходит на редирект. Проверьте Hotspot/Web-proxy на MikroTik.", url);
-            add_finding("critical", t, tx);
+        check_set(out, "Captive / OS", name, "fail", detail,
+                  "Captive portal или подмена HTTP.", ip, url, 0);
+        if (want_finding) {
+            *want_finding = 1;
+            snprintf(ftitle, ftlen, "Подмена %s", name);
+            snprintf(ftext, ftextlen, "Запрос к %s уходит на редирект. Проверьте Hotspot/Web-proxy на MikroTik.", url);
         }
         return;
     }
@@ -3274,16 +3574,15 @@ static void check_captive(const char *name, const char *url, int expect, int cri
         hint[0] = 0;
         if (r.ms > 1500)
             snprintf(hint, sizeof hint, "Медленный ответ — ОС может решить, что интернета нет");
-        add_check_ex("Captive / OS", name, st, detail, hint, ip, url, 0);
+        check_set(out, "Captive / OS", name, st, detail, hint, ip, url, 0);
         return;
     }
-    /* ipv6.msftconnecttest.com — только AAAA: на IPv4-only это не сбой сети */
     if (host[0] && !dns_has_ipv4(host) && r.code != expect) {
         snprintf(detail, sizeof detail, "SNI %s · %s (хост без A-записи)",
                  host, r.error[0] ? r.error : "нет ответа");
-        add_check_ex("Captive / OS", name, "info", detail,
-                     "Проверка только по IPv6. На сети без IPv6 ожидаемо недоступна — не проблема.",
-                     ip, url, 0);
+        check_set(out, "Captive / OS", name, "info", detail,
+                  "Проверка только по IPv6. На сети без IPv6 ожидаемо недоступна — не проблема.",
+                  ip, url, 0);
         return;
     }
     if (r.error[0])
@@ -3291,30 +3590,38 @@ static void check_captive(const char *name, const char *url, int expect, int cri
     else
         snprintf(detail, sizeof detail, "SNI %s · HTTP %d, %d ms",
                  host[0] ? host : "?", r.code, r.ms);
-    add_check_ex("Captive / OS", name, "fail", detail,
-                 "URL проверки связности ОС/устройства.", ip, url, 0);
-    if (critical) {
-        char t[256], tx[LONGSTR];
-        snprintf(t, sizeof t, "Не проходит %s", name);
-        snprintf(tx, sizeof tx, "%s — %s", url, detail);
-        add_finding("critical", t, tx);
+    check_set(out, "Captive / OS", name, "fail", detail,
+              "URL проверки связности ОС/устройства.", ip, url, 0);
+    if (want_finding) {
+        *want_finding = 1;
+        snprintf(ftitle, ftlen, "Не проходит %s", name);
+        snprintf(ftext, ftextlen, "%s — %s", url, detail);
     }
 }
 
-static void check_ru(const char *cat, const char *name, const char *url,
-                     const char *note, int spoiler, int multi_ua,
-                     char fail_names[][64], int *nfail,
-                     char slow_names[][80], int *nslow) {
+static void check_captive(const char *name, const char *url, int expect, int critical) {
+    Check c;
+    int want = 0;
+    char ftitle[256], ftext[LONGSTR];
+    check_captive_fill(&c, name, url, expect, critical ? &want : NULL,
+                       ftitle, sizeof ftitle, ftext, sizeof ftext);
+    add_check_from(&c);
+    if (critical && want)
+        add_finding("critical", ftitle, ftext);
+}
+
+static void check_ru_fill(Check *out, const char *cat, const char *name, const char *url,
+                          const char *note, int spoiler, int multi_ua,
+                          int *failed, int *slow_ms) {
     char ua_sum[256];
     int ua_mismatch = 0;
     HttpResult r;
     char detail[STR], hint[STR], host[128], ip[64];
     const char *st;
 
-    /*
-     * Значимые/банки: один UA и больший таймаут.
-     * Раньше 5 UA × 3 с на LibreSSL давали ложные FAIL на госуслугах и др.
-     */
+    if (failed) *failed = 0;
+    if (slow_ms) *slow_ms = 0;
+
     if (multi_ua)
         r = http_probe_agents(url, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
     else {
@@ -3332,9 +3639,9 @@ static void check_ru(const char *cat, const char *name, const char *url,
 
     if (r.code <= 0 && host_unresolved(host, ip)) {
         snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-        add_check_ex(cat, name, "warn", detail,
-                     "Имя не резолвится — это сбой DNS, а не недоступность ресурса.",
-                     NULL, url, spoiler);
+        check_set(out, cat, name, "warn", detail,
+                  "Имя не резолвится — это сбой DNS, а не недоступность ресурса.",
+                  NULL, url, spoiler);
         return;
     }
 
@@ -3343,8 +3650,8 @@ static void check_ru(const char *cat, const char *name, const char *url,
                  r.error[0] ? r.error : "таймаут/нет ответа", ua_sum[0] ? ua_sum : "—");
         snprintf(hint, sizeof hint, "%s%sНедоступен по HTTPS-пробе (браузер может работать при другом маршруте/QUIC).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
-        add_check_ex(cat, name, "fail", detail, hint, ip, url, spoiler);
-        if (*nfail < 40) snprintf(fail_names[(*nfail)++], 64, "%s", name);
+        check_set(out, cat, name, "fail", detail, hint, ip, url, spoiler);
+        if (failed) *failed = 1;
         return;
     }
     if (r.redirect[0])
@@ -3353,17 +3660,15 @@ static void check_ru(const char *cat, const char *name, const char *url,
     else
         snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
 
-    /* 3xx — сервер ответил редиректом, это не «ресурс недоступен» */
     if (r.code >= 300 && r.code < 400) {
-        add_check_ex(cat, name, "ok", detail,
-                     "HTTP-редирект (301/302/…): хост отвечает. Не считаем сбоем доступности.",
-                     ip, url, spoiler);
+        check_set(out, cat, name, "ok", detail,
+                  "HTTP-редирект (301/302/…): хост отвечает. Не считаем сбоем доступности.",
+                  ip, url, spoiler);
         return;
     }
     if (r.code >= 500) {
-        add_check_ex(cat, name, "fail", detail,
-                     "Сервер отвечает 5xx.", ip, url, spoiler);
-        if (*nfail < 40) snprintf(fail_names[(*nfail)++], 64, "%s", name);
+        check_set(out, cat, name, "fail", detail, "Сервер отвечает 5xx.", ip, url, spoiler);
+        if (failed) *failed = 1;
         return;
     }
     st = "ok";
@@ -3379,9 +3684,184 @@ static void check_ru(const char *cat, const char *name, const char *url,
         st = "warn";
         snprintf(hint, sizeof hint, "%s%sМедленный ответ (>3000 ms).",
                  note && note[0] ? note : "", note && note[0] ? " " : "");
-        if (*nslow < 40) snprintf(slow_names[(*nslow)++], 80, "%s %dms", name, r.ms);
+        if (slow_ms) *slow_ms = r.ms;
     }
-    add_check_ex(cat, name, st, detail, hint, ip, url, spoiler);
+    check_set(out, cat, name, st, detail, hint, ip, url, spoiler);
+}
+
+static void check_ru(const char *cat, const char *name, const char *url,
+                     const char *note, int spoiler, int multi_ua,
+                     char fail_names[][64], int *nfail,
+                     char slow_names[][80], int *nslow) {
+    Check c;
+    int failed = 0, slow_ms = 0;
+    check_ru_fill(&c, cat, name, url, note, spoiler, multi_ua, &failed, &slow_ms);
+    add_check_from(&c);
+    if (failed && nfail && *nfail < 40) snprintf(fail_names[(*nfail)++], 64, "%s", name);
+    if (slow_ms && nslow && *nslow < 40)
+        snprintf(slow_names[(*nslow)++], 80, "%s %dms", name, slow_ms);
+}
+
+/* ---------- parallel stage helpers ---------- */
+
+typedef struct {
+    Check *outs;
+    int *failed;
+    int *slow_ms;
+} SigJobCtx;
+
+static void sig_job(int idx, void *v) {
+    SigJobCtx *ctx = (SigJobCtx *)v;
+    check_ru_fill(&ctx->outs[idx], "Значимые ресурсы", g_sig[idx].name, g_sig[idx].url,
+                  g_sig[idx].note, 1, 0, &ctx->failed[idx], &ctx->slow_ms[idx]);
+}
+
+typedef struct {
+    Check *outs;
+    int *failed;
+    int *slow_ms;
+} BankJobCtx;
+
+static void bank_job(int idx, void *v) {
+    BankJobCtx *ctx = (BankJobCtx *)v;
+    check_ru_fill(&ctx->outs[idx], g_banks[idx].cat, g_banks[idx].name, g_banks[idx].url,
+                  "", 0, 0, &ctx->failed[idx], &ctx->slow_ms[idx]);
+}
+
+typedef struct {
+    Check *outs;
+    int *critf;
+    ResTcp *items;
+    const char *cat;
+    int spoiler;
+    int timeout_ms;
+} TcpResJobCtx;
+
+static void tcp_res_job(int idx, void *v) {
+    TcpResJobCtx *ctx = (TcpResJobCtx *)v;
+    check_tcp_ep_fill(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, ctx->items[idx].host,
+                      ctx->items[idx].port, ctx->timeout_ms, ctx->items[idx].crit,
+                      ctx->spoiler, &ctx->critf[idx]);
+}
+
+typedef struct {
+    Check *outs;
+    ResHttp *items;
+    const char *cat;
+    int multi_ua;
+    int timeout_sec;
+    int ok_403; /* 401/403 = ok (S3/CDN) */
+} HttpsResJobCtx;
+
+static void https_res_job(int idx, void *v) {
+    HttpsResJobCtx *ctx = (HttpsResJobCtx *)v;
+    HttpResult r;
+    char host[128], ip[64], ua_sum[256], detail[STR];
+    int ua_mismatch = 0;
+    const char *st;
+
+    if (ctx->multi_ua)
+        r = http_probe_agents(ctx->items[idx].url, ctx->timeout_sec, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+    else {
+        r = http_probe_ua(ctx->items[idx].url, ctx->timeout_sec, 1, ua_default(), 1);
+        if (r.code > 0) snprintf(ua_sum, sizeof ua_sum, "chrome=%d", r.code);
+        else snprintf(ua_sum, sizeof ua_sum, "chrome=нет ответа");
+    }
+    host_from_url(ctx->items[idx].url, host, sizeof host);
+    ip[0] = 0;
+    if (host[0]) dns_resolve(host, ip, sizeof ip);
+
+    if (r.code > 0) {
+        if (r.code >= 300 && r.code < 400) {
+            snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
+                     r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "ok", detail,
+                      "HTTP-редирект: хост отвечает.", ip, ctx->items[idx].url, 0);
+        } else if (ctx->ok_403 && (r.code == 401 || r.code == 403)) {
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "ok", detail,
+                      "HTTP 403/401 без ключа — CDN/S3 доступен (ожидаемо, не сбой).",
+                      ip, ctx->items[idx].url, 0);
+        } else if (r.code >= 500) {
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "fail", detail,
+                      "Сервер отвечает 5xx.", ip, ctx->items[idx].url, 0);
+        } else {
+            st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
+            if (r.redirect[0])
+                snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
+                         r.code, r.redirect, r.ms, ua_sum);
+            else
+                snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, st, detail,
+                      ua_mismatch ? "Ответ зависит от User-Agent."
+                      : (r.ms > 3000 ? "Медленный ответ" : ""),
+                      ip, ctx->items[idx].url, 0);
+        }
+    } else if (host_unresolved(host, ip)) {
+        snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
+        check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "warn", detail,
+                  "Имя не резолвится — сбой DNS.", NULL, ctx->items[idx].url, 0);
+    } else {
+        snprintf(detail, sizeof detail, "%s [%s]",
+                 r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
+        check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "fail", detail,
+                  "HTTPS недоступен (DPI/фильтр/маршрут).", ip, ctx->items[idx].url, 0);
+    }
+}
+
+typedef struct {
+    Check *outs;
+} VideoJobCtx;
+
+static void video_job(int idx, void *v) {
+    VideoJobCtx *ctx = (VideoJobCtx *)v;
+    char ua_sum[256], host[128], ip[64], detail[STR];
+    int ua_mismatch = 0;
+    HttpResult r, rv;
+    r = http_probe_agents(g_video[idx].home, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+    host_from_url(g_video[idx].home, host, sizeof host);
+    ip[0] = 0;
+    if (host[0]) dns_resolve(host, ip, sizeof ip);
+    rv = http_probe_agents(g_video[idx].video, 10, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
+    if (r.code > 0 && rv.code > 0 && r.code < 500 && rv.code < 500) {
+        snprintf(detail, sizeof detail,
+                 "сайт HTTP %d (%d ms); лента/видео HTTP %d (%d ms) [%s]",
+                 r.code, r.ms, rv.code, rv.ms, ua_sum);
+        check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "ok", detail,
+                  "Детально (первое видео с главной): ./probe-video -n 1",
+                  ip, g_video[idx].home, 0);
+    } else if (host_unresolved(host, ip)) {
+        snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
+        check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "warn", detail,
+                  "Имя не резолвится — это сбой DNS, а не недоступность видео.",
+                  NULL, g_video[idx].home, 0);
+    } else {
+        snprintf(detail, sizeof detail, "сайт HTTP %d; видео HTTP %d [%s]",
+                 r.code, rv.code, ua_sum[0] ? ua_sum : "—");
+        check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "fail", detail,
+                  "Не открылся сайт или видео-путь.", ip, g_video[idx].home, 0);
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *wantf;
+    char *ftitles; /* nc * 256 */
+    char *ftexts;  /* nc * LONGSTR */
+    const char **names;
+    const char **urls;
+    int *expects;
+    int *crits;
+} CapParCtx;
+
+static void captive_par_job(int idx, void *v) {
+    CapParCtx *ctx = (CapParCtx *)v;
+    char *ft = ctx->ftitles + (size_t)idx * 256;
+    char *fx = ctx->ftexts + (size_t)idx * LONGSTR;
+    check_captive_fill(&ctx->outs[idx], ctx->names[idx], ctx->urls[idx], ctx->expects[idx],
+                       ctx->crits[idx] ? &ctx->wantf[idx] : NULL,
+                       ft, 256, fx, LONGSTR);
 }
 
 static void usage(const char *argv0) {
@@ -3398,8 +3878,9 @@ static void usage(const char *argv0) {
         "  --dns-limit N          доменов на резолвер (по умолчанию 1000, макс. 10000)\n"
         "  --domains FILE         свой список доменов (иначе файл или встроенный)\n"
         "  --resources FILE       списки ресурсов по группам (иначе resources.conf рядом)\n"
+        "  --jobs N               параллельные пробы внутри этапа (по умолчанию %d, env CONNECT_CHECK_JOBS)\n"
         "Клавиши на этапах: Enter — далее/запустить, Space — пропустить (без эха).\n",
-        argv0, CONNECT_CHECK_VERSION);
+        argv0, CONNECT_CHECK_VERSION, DEFAULT_JOBS);
 }
 
 int main(int argc, char **argv) {
@@ -3420,6 +3901,14 @@ int main(int argc, char **argv) {
     int flaky_ok = 0, flaky_fail = 0, flaky_sum = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    {
+        const char *ej = getenv("CONNECT_CHECK_JOBS");
+        if (ej && ej[0]) {
+            int j = atoi(ej);
+            if (j >= 1 && j <= 256) opt_jobs = j;
+        }
+    }
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -3443,7 +3932,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--skip-dns-bulk") == 0) opt_skip_dns_bulk = 1;
         else if (strcmp(argv[i], "--skip-speed") == 0) opt_skip_speed = 1;
         else if (strcmp(argv[i], "--skip-video") == 0) opt_skip_video = 1;
-        else if ((strcmp(argv[i], "--dns-limit") == 0) && i + 1 < argc) {
+        else if ((strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
+            opt_jobs = atoi(argv[++i]);
+            if (opt_jobs < 1) opt_jobs = 1;
+            if (opt_jobs > 256) opt_jobs = 256;
+        } else if ((strcmp(argv[i], "--dns-limit") == 0) && i + 1 < argc) {
             opt_dns_limit = atoi(argv[++i]);
             if (opt_dns_limit < 1) opt_dns_limit = 1;
             if (opt_dns_limit > MAX_DOMAINS) opt_dns_limit = MAX_DOMAINS;
@@ -3515,6 +4008,7 @@ int main(int argc, char **argv) {
     printf("Диагностика интернета (connect-check %s) — сбор данных...\n", CONNECT_CHECK_VERSION);
     printf("Клавиши: Enter — далее, Space — пропустить (DNS: Enter — запустить, иначе пропуск).\n");
     if (opt_yes) printf("Режим -y: без вопросов; DNS-прогон пропускается (нужен --dns-bulk).\n");
+    printf("Параллельность: %d jobs (--jobs / CONNECT_CHECK_JOBS)\n", opt_jobs);
 
     printf("\n▶ Сеть и Wi‑Fi\n");
     stage_progress("локальная сеть", 1, 6);
@@ -3718,9 +4212,41 @@ int main(int argc, char **argv) {
             {"[Device] Amazon Kindle", "http://spectrum.s3.amazonaws.com/kindle-wifi/wifistub.html", 200, 0},
         };
         int nc = (int)(sizeof caps / sizeof caps[0]);
-        for (i = 0; i < nc; i++) {
-            stage_progress(caps[i].name, i + 1, nc + 8);
-            check_captive(caps[i].name, caps[i].url, caps[i].expect, caps[i].critical);
+        {
+            Check *outs = (Check *)calloc((size_t)nc, sizeof(Check));
+            int *wantf = (int *)calloc((size_t)nc, sizeof(int));
+            char *ftitles = (char *)calloc((size_t)nc, 256);
+            char *ftexts = (char *)calloc((size_t)nc, LONGSTR);
+            const char **names = (const char **)calloc((size_t)nc, sizeof(char *));
+            const char **urls = (const char **)calloc((size_t)nc, sizeof(char *));
+            int *expects = (int *)calloc((size_t)nc, sizeof(int));
+            int *crits = (int *)calloc((size_t)nc, sizeof(int));
+            if (outs && wantf && ftitles && ftexts && names && urls && expects && crits) {
+                CapParCtx cctx;
+                int j;
+                for (j = 0; j < nc; j++) {
+                    names[j] = caps[j].name;
+                    urls[j] = caps[j].url;
+                    expects[j] = caps[j].expect;
+                    crits[j] = caps[j].critical;
+                }
+                cctx.outs = outs; cctx.wantf = wantf; cctx.ftitles = ftitles; cctx.ftexts = ftexts;
+                cctx.names = names; cctx.urls = urls; cctx.expects = expects; cctx.crits = crits;
+                run_parallel(nc, opt_jobs, captive_par_job, &cctx, "captive");
+                for (j = 0; j < nc; j++) {
+                    add_check_from(&outs[j]);
+                    if (crits[j] && wantf[j])
+                        add_finding("critical", ftitles + (size_t)j * 256,
+                                    ftexts + (size_t)j * LONGSTR);
+                }
+            } else {
+                for (i = 0; i < nc; i++) {
+                    stage_progress(caps[i].name, i + 1, nc + 8);
+                    check_captive(caps[i].name, caps[i].url, caps[i].expect, caps[i].critical);
+                }
+            }
+            free(outs); free(wantf); free(ftitles); free(ftexts);
+            free(names); free(urls); free(expects); free(crits);
         }
         for (i = 0; i < 8; i++) {
             HttpResult r;
@@ -3933,10 +4459,34 @@ int main(int argc, char **argv) {
             {"Mosquitto test :1883", "test.mosquitto.org", 1883, 0},
         };
         int n = (int)(sizeof eps / sizeof eps[0]);
-        for (i = 0; i < n; i++) {
-            stage_item(eps[i].name, i + 1, n);
-            check_tcp_ep("Умный дом / IoT", eps[i].name, eps[i].host, eps[i].port,
-                         4000, eps[i].crit, 1, &niot, iot_fail, 48);
+        {
+            ResTcp *tmp = (ResTcp *)calloc((size_t)n, sizeof(ResTcp));
+            Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
+            int *critf = (int *)calloc((size_t)n, sizeof(int));
+            if (tmp && outs && critf) {
+                TcpResJobCtx tctx;
+                for (i = 0; i < n; i++) {
+                    snprintf(tmp[i].name, sizeof tmp[i].name, "%s", eps[i].name);
+                    snprintf(tmp[i].host, sizeof tmp[i].host, "%s", eps[i].host);
+                    tmp[i].port = eps[i].port;
+                    tmp[i].crit = eps[i].crit;
+                }
+                tctx.outs = outs; tctx.critf = critf; tctx.items = tmp;
+                tctx.cat = "Умный дом / IoT"; tctx.spoiler = 1; tctx.timeout_ms = 4000;
+                run_parallel(n, opt_jobs, tcp_res_job, &tctx, "IoT TCP");
+                for (i = 0; i < n; i++) {
+                    add_check_from(&outs[i]);
+                    if (critf[i] && niot < 48)
+                        snprintf(iot_fail[niot++], 64, "%s", eps[i].name);
+                }
+            } else {
+                for (i = 0; i < n; i++) {
+                    stage_item(eps[i].name, i + 1, n);
+                    check_tcp_ep("Умный дом / IoT", eps[i].name, eps[i].host, eps[i].port,
+                                 4000, eps[i].crit, 1, &niot, iot_fail, 48);
+                }
+            }
+            free(tmp); free(outs); free(critf);
         }
 
         {
@@ -3954,48 +4504,25 @@ int main(int argc, char **argv) {
                 {"Tapo cloud", "https://eu-wap.tplinkcloud.com/"},
             };
             int nh = (int)(sizeof https / sizeof https[0]);
-            char host[128], ip[64], ua_sum[256];
-            int ua_mismatch;
-            for (i = 0; i < nh; i++) {
-                HttpResult r;
-                stage_item(https[i].name, i + 1, nh);
-                r = http_probe_agents(https[i].url, 3, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-                host_from_url(https[i].url, host, sizeof host);
-                ip[0] = 0;
-                if (host[0]) dns_resolve(host, ip, sizeof ip);
-                if (r.code > 0) {
-                    if (r.code >= 300 && r.code < 400) {
-                        snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
-                                 r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
-                        add_check_ex("Умный дом / IoT", https[i].name, "ok", detail,
-                                     "HTTP-редирект: облако отвечает. Не сбой доступности.",
-                                     ip, https[i].url, 1);
-                    } else {
-                    st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
-                    if (r.redirect[0])
-                        snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
-                                 r.code, r.redirect, r.ms, ua_sum);
-                    else
-                        snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                    add_check_ex("Умный дом / IoT", https[i].name, st, detail,
-                                 ua_mismatch ? "Ответ зависит от User-Agent."
-                                 : (r.ms > 3000 ? "Медленный ответ облака IoT" : ""),
-                                 ip, https[i].url, 1);
-                    }
-                } else if (host_unresolved(host, ip)) {
-                    snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-                    add_check_ex("Умный дом / IoT", https[i].name, "warn", detail,
-                                 "Имя не резолвится — это сбой DNS, а не недоступность облака.",
-                                 NULL, https[i].url, 1);
-                } else {
-                    snprintf(detail, sizeof detail, "%s [%s]",
-                             r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
-                    add_check_ex("Умный дом / IoT", https[i].name, "fail", detail,
-                                 "HTTPS к облаку IoT недоступен.",
-                                 ip, https[i].url, 1);
-                    if (niot < 48) snprintf(iot_fail[niot++], 64, "%s", https[i].name);
+            ResHttp *htmp = (ResHttp *)calloc((size_t)nh, sizeof(ResHttp));
+            Check *houts = (Check *)calloc((size_t)nh, sizeof(Check));
+            if (htmp && houts) {
+                HttpsResJobCtx hctx;
+                for (i = 0; i < nh; i++) {
+                    snprintf(htmp[i].name, sizeof htmp[i].name, "%s", https[i].name);
+                    snprintf(htmp[i].url, sizeof htmp[i].url, "%s", https[i].url);
+                }
+                hctx.outs = houts; hctx.items = htmp; hctx.cat = "Умный дом / IoT";
+                hctx.multi_ua = 1; hctx.timeout_sec = 3; hctx.ok_403 = 0;
+                run_parallel(nh, opt_jobs, https_res_job, &hctx, "IoT HTTPS");
+                for (i = 0; i < nh; i++) {
+                    houts[i].spoiler = 1;
+                    add_check_from(&houts[i]);
+                    if (strcmp(houts[i].status, "fail") == 0 && niot < 48)
+                        snprintf(iot_fail[niot++], 64, "%s", https[i].name);
                 }
             }
+            free(htmp); free(houts);
         }
 
         {
@@ -4271,31 +4798,42 @@ int main(int argc, char **argv) {
         char sig_slow[40][80];
         int nsig_fail = 0, nsig_slow = 0;
         int n = g_nsig;
-        int before_fail, before_checks;
+        Check *outs = NULL;
+        int *failed = NULL, *slow_ms = NULL;
+        SigJobCtx ctx;
         if (g_resources_from_file)
             add_check("Значимые ресурсы", "Список", "info",
                       "из resources.conf", "");
-        for (i = 0; i < n; i++) {
-            stage_item(g_sig[i].name, i + 1, n);
-            before_fail = nsig_fail;
-            before_checks = nchecks;
-            check_ru("Значимые ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1, 0,
-                     sig_fail, &nsig_fail, sig_slow, &nsig_slow);
-            if (g_sig[i].expected_block && nsig_fail > before_fail) {
-                /* ожидаемый блок РФ: не FAIL/WARN сети */
-                Check *c = &checks[before_checks];
-                if (strcmp(c->status, "fail") == 0) {
-                    snprintf(c->status, sizeof c->status, "info");
-                    fail_n--;
-                } else if (strcmp(c->status, "warn") == 0) {
-                    snprintf(c->status, sizeof c->status, "info");
-                    warn_n--;
+        outs = (Check *)calloc((size_t)n, sizeof(Check));
+        failed = (int *)calloc((size_t)n, sizeof(int));
+        slow_ms = (int *)calloc((size_t)n, sizeof(int));
+        if (outs && failed && slow_ms) {
+            ctx.outs = outs;
+            ctx.failed = failed;
+            ctx.slow_ms = slow_ms;
+            run_parallel(n, opt_jobs, sig_job, &ctx, "значимые");
+            for (i = 0; i < n; i++) {
+                if (g_sig[i].expected_block &&
+                    (strcmp(outs[i].status, "fail") == 0 || strcmp(outs[i].status, "warn") == 0)) {
+                    snprintf(outs[i].status, sizeof outs[i].status, "info");
+                    if (g_sig[i].note[0])
+                        snprintf(outs[i].hint, sizeof outs[i].hint, "%s", g_sig[i].note);
+                    failed[i] = 0;
                 }
-                if (g_sig[i].note[0])
-                    snprintf(c->hint, sizeof c->hint, "%s", g_sig[i].note);
-                nsig_fail = before_fail;
+                add_check_from(&outs[i]);
+                if (failed[i] && nsig_fail < 40)
+                    snprintf(sig_fail[nsig_fail++], 64, "%s", g_sig[i].name);
+                if (slow_ms[i] && nsig_slow < 40)
+                    snprintf(sig_slow[nsig_slow++], 80, "%s %dms", g_sig[i].name, slow_ms[i]);
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                stage_item(g_sig[i].name, i + 1, n);
+                check_ru("Значимые ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1, 0,
+                         sig_fail, &nsig_fail, sig_slow, &nsig_slow);
             }
         }
+        free(outs); free(failed); free(slow_ms);
         stage_done();
         if (nsig_fail > 0) {
             char names[LONGSTR] = "", tx[LONGSTR];
@@ -4317,63 +4855,38 @@ int main(int argc, char **argv) {
         int nfail = 0;
         int n = g_ninfra_tcp;
         int nh = g_ninfra_https;
-        for (i = 0; i < n; i++) {
-            stage_item(g_infra_tcp[i].name, i + 1, n + nh);
-            check_tcp_ep("Облако", g_infra_tcp[i].name, g_infra_tcp[i].host, g_infra_tcp[i].port,
-                         4000, g_infra_tcp[i].crit, 0, &nfail, fail, 64);
-        }
-        for (i = 0; i < nh; i++) {
-            HttpResult r;
-            char host[128], ip[64], ua_sum[256];
-            int ua_mismatch;
-            stage_item(g_infra_https[i].name, n + i + 1, n + nh);
-            /* один UA: для S3/CDN важна доступность, не матрица агентов */
-            r = http_probe_ua(g_infra_https[i].url, 10, 1, ua_default(), 1);
-            if (r.code > 0)
-                snprintf(ua_sum, sizeof ua_sum, "chrome=%d", r.code);
-            else
-                snprintf(ua_sum, sizeof ua_sum, "chrome=нет ответа");
-            ua_mismatch = 0;
-            host_from_url(g_infra_https[i].url, host, sizeof host);
-            ip[0] = 0;
-            if (host[0]) dns_resolve(host, ip, sizeof ip);
-            if (r.code > 0) {
-                if (r.code >= 300 && r.code < 400) {
-                    snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
-                             r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
-                    add_check_ex("Облако", g_infra_https[i].name, "ok", detail,
-                                 "Облако отвечает редиректом.", ip, g_infra_https[i].url, 0);
-                } else if (r.code == 401 || r.code == 403) {
-                    /* S3/CDN без ключа: AccessDenied = хост и TLS живы */
-                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                    add_check_ex("Облако", g_infra_https[i].name, "ok", detail,
-                                 "HTTP 403/401 без ключа — CDN/S3 доступен (ожидаемо, не сбой).",
-                                 ip, g_infra_https[i].url, 0);
-                } else if (r.code >= 500) {
-                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                    add_check_ex("Облако", g_infra_https[i].name, "fail", detail,
-                                 "Сервер облака отвечает 5xx.", ip, g_infra_https[i].url, 0);
-                    if (nfail < 64) snprintf(fail[nfail++], 64, "%s", g_infra_https[i].name);
-                } else {
-                    st = (r.ms > 4000) ? "warn" : "ok";
-                    snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                    add_check_ex("Облако", g_infra_https[i].name, st, detail,
-                                 r.ms > 4000 ? "Медленный ответ облака" : "",
-                                 ip, g_infra_https[i].url, 0);
+        Check *touts = NULL, *houts = NULL;
+        int *critf = NULL;
+        if (n > 0) {
+            TcpResJobCtx tctx;
+            touts = (Check *)calloc((size_t)n, sizeof(Check));
+            critf = (int *)calloc((size_t)n, sizeof(int));
+            if (touts && critf) {
+                tctx.outs = touts; tctx.critf = critf; tctx.items = g_infra_tcp;
+                tctx.cat = "Облако"; tctx.spoiler = 0; tctx.timeout_ms = 4000;
+                run_parallel(n, opt_jobs, tcp_res_job, &tctx, "облако TCP");
+                for (i = 0; i < n; i++) {
+                    add_check_from(&touts[i]);
+                    if (critf[i] && nfail < 64)
+                        snprintf(fail[nfail++], 64, "%s", g_infra_tcp[i].name);
                 }
-            } else if (host_unresolved(host, ip)) {
-                snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-                add_check_ex("Облако", g_infra_https[i].name, "warn", detail,
-                             "Имя не резолвится — сбой DNS, не обязательно блок AWS.",
-                             NULL, g_infra_https[i].url, 0);
-            } else {
-                snprintf(detail, sizeof detail, "%s [%s]",
-                         r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
-                add_check_ex("Облако", g_infra_https[i].name, "fail", detail,
-                             "HTTPS к AWS/S3 недоступен (DPI/фильтр/маршрут).",
-                             ip, g_infra_https[i].url, 0);
-                if (nfail < 64) snprintf(fail[nfail++], 64, "%s", g_infra_https[i].name);
             }
+            free(touts); free(critf);
+        }
+        if (nh > 0) {
+            HttpsResJobCtx hctx;
+            houts = (Check *)calloc((size_t)nh, sizeof(Check));
+            if (houts) {
+                hctx.outs = houts; hctx.items = g_infra_https; hctx.cat = "Облако";
+                hctx.multi_ua = 0; hctx.timeout_sec = 10; hctx.ok_403 = 1;
+                run_parallel(nh, opt_jobs, https_res_job, &hctx, "облако HTTPS");
+                for (i = 0; i < nh; i++) {
+                    add_check_from(&houts[i]);
+                    if (strcmp(houts[i].status, "fail") == 0 && nfail < 64)
+                        snprintf(fail[nfail++], 64, "%s", g_infra_https[i].name);
+                }
+            }
+            free(houts);
         }
         if (nfail > 0) {
             char names[LONGSTR] = "", tx[LONGSTR];
@@ -4393,58 +4906,42 @@ int main(int argc, char **argv) {
         char game_fail[64][64];
         int ngame = 0;
         int n = g_ngame_tcp;
-        for (i = 0; i < n; i++) {
-            stage_item(g_game_tcp[i].name, i + 1, n);
-            check_tcp_ep("Игры", g_game_tcp[i].name, g_game_tcp[i].host, g_game_tcp[i].port,
-                         4000, g_game_tcp[i].crit, 0, &ngame, game_fail, 64);
+        Check *touts = NULL, *houts = NULL;
+        int *critf = NULL;
+        if (n > 0) {
+            TcpResJobCtx tctx;
+            touts = (Check *)calloc((size_t)n, sizeof(Check));
+            critf = (int *)calloc((size_t)n, sizeof(int));
+            if (touts && critf) {
+                tctx.outs = touts; tctx.critf = critf; tctx.items = g_game_tcp;
+                tctx.cat = "Игры"; tctx.spoiler = 0; tctx.timeout_ms = 4000;
+                run_parallel(n, opt_jobs, tcp_res_job, &tctx, "игры TCP");
+                for (i = 0; i < n; i++) {
+                    add_check_from(&touts[i]);
+                    if (critf[i] && ngame < 64)
+                        snprintf(game_fail[ngame++], 64, "%s", g_game_tcp[i].name);
+                }
+            }
+            free(touts); free(critf);
         }
         stage_item("Steam CM", n + 1, n + 1);
         check_steam_cm(&ngame, game_fail, 64);
 
         {
             int nh = g_ngame_https;
-            char host[128], ip[64], ua_sum[256];
-            int ua_mismatch;
-            for (i = 0; i < nh; i++) {
-                HttpResult r;
-                stage_item(g_game_https[i].name, i + 1, nh);
-                r = http_probe_agents(g_game_https[i].url, 5, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-                host_from_url(g_game_https[i].url, host, sizeof host);
-                ip[0] = 0;
-                if (host[0]) dns_resolve(host, ip, sizeof ip);
-                if (r.code > 0) {
-                    if (r.code >= 300 && r.code < 400) {
-                        snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
-                                 r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
-                        add_check_ex("Игры", g_game_https[i].name, "ok", detail,
-                                     "HTTP-редирект: платформа отвечает. Не сбой доступности.",
-                                     ip, g_game_https[i].url, 0);
-                    } else {
-                    st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
-                    if (r.redirect[0])
-                        snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
-                                 r.code, r.redirect, r.ms, ua_sum);
-                    else
-                        snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
-                    add_check_ex("Игры", g_game_https[i].name, st, detail,
-                                 ua_mismatch ? "Ответ зависит от User-Agent."
-                                 : (r.ms > 3000 ? "Медленный ответ игровой платформы" : ""),
-                                 ip, g_game_https[i].url, 0);
-                    }
-                } else if (host_unresolved(host, ip)) {
-                    snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-                    add_check_ex("Игры", g_game_https[i].name, "warn", detail,
-                                 "Имя не резолвится — это сбой DNS, а не недоступность платформы.",
-                                 NULL, g_game_https[i].url, 0);
-                } else {
-                    snprintf(detail, sizeof detail, "%s [%s]",
-                             r.error[0] ? r.error : "таймаут", ua_sum[0] ? ua_sum : "—");
-                    add_check_ex("Игры", g_game_https[i].name, "fail", detail,
-                                 "HTTPS к игровой платформе недоступен (DPI/фильтр).",
-                                 ip, g_game_https[i].url, 0);
-                    if (ngame < 64) snprintf(game_fail[ngame++], 64, "%s", g_game_https[i].name);
+            HttpsResJobCtx hctx;
+            houts = (Check *)calloc((size_t)nh, sizeof(Check));
+            if (houts && nh > 0) {
+                hctx.outs = houts; hctx.items = g_game_https; hctx.cat = "Игры";
+                hctx.multi_ua = 1; hctx.timeout_sec = 5; hctx.ok_403 = 0;
+                run_parallel(nh, opt_jobs, https_res_job, &hctx, "игры HTTPS");
+                for (i = 0; i < nh; i++) {
+                    add_check_from(&houts[i]);
+                    if (strcmp(houts[i].status, "fail") == 0 && ngame < 64)
+                        snprintf(game_fail[ngame++], 64, "%s", g_game_https[i].name);
                 }
             }
+            free(houts);
         }
 
         if (ngame > 0) {
@@ -4470,11 +4967,26 @@ int main(int argc, char **argv) {
         char ai_fail[48][64];
         int nai_fail = 0;
         int n = g_nai;
-        for (i = 0; i < n; i++) {
-            stage_item(g_ai[i].name, i + 1, n);
-            check_tcp_ep("AI / LLM", g_ai[i].name, g_ai[i].host, g_ai[i].port,
-                         4000, g_ai[i].crit, 0, &nai_fail, ai_fail, 48);
+        Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
+        int *critf = (int *)calloc((size_t)n, sizeof(int));
+        if (outs && critf && n > 0) {
+            TcpResJobCtx tctx;
+            tctx.outs = outs; tctx.critf = critf; tctx.items = g_ai;
+            tctx.cat = "AI / LLM"; tctx.spoiler = 0; tctx.timeout_ms = 4000;
+            run_parallel(n, opt_jobs, tcp_res_job, &tctx, "AI TCP");
+            for (i = 0; i < n; i++) {
+                add_check_from(&outs[i]);
+                if (critf[i] && nai_fail < 48)
+                    snprintf(ai_fail[nai_fail++], 64, "%s", g_ai[i].name);
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                stage_item(g_ai[i].name, i + 1, n);
+                check_tcp_ep("AI / LLM", g_ai[i].name, g_ai[i].host, g_ai[i].port,
+                             4000, g_ai[i].crit, 0, &nai_fail, ai_fail, 48);
+            }
         }
+        free(outs); free(critf);
         if (nai_fail > 0) {
             char names[LONGSTR] = "", tx[LONGSTR];
             for (i = 0; i < nai_fail; i++) {
@@ -4497,36 +5009,17 @@ int main(int argc, char **argv) {
                     "Яндекс Видео, VK Видео, IVI, Okko, Rutube — сайт и видео-путь")) {
         int nv = g_nvideo;
         int vfail = 0;
-        for (i = 0; i < nv; i++) {
-            char ua_sum[256], host[128], ip[64];
-            int ua_mismatch = 0;
-            HttpResult r, rv;
-            stage_item(g_video[i].name, i + 1, nv);
-            r = http_probe_agents(g_video[i].home, 8, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-            host_from_url(g_video[i].home, host, sizeof host);
-            ip[0] = 0;
-            if (host[0]) dns_resolve(host, ip, sizeof ip);
-            rv = http_probe_agents(g_video[i].video, 10, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-            if (r.code > 0 && rv.code > 0 && r.code < 500 && rv.code < 500) {
-                snprintf(detail, sizeof detail,
-                         "сайт HTTP %d (%d ms); лента/видео HTTP %d (%d ms) [%s]",
-                         r.code, r.ms, rv.code, rv.ms, ua_sum);
-                add_check_ex("Видео", g_video[i].name, "ok", detail,
-                             "Детально (первое видео с главной): ./probe-video -n 1",
-                             ip, g_video[i].home, 0);
-            } else if (host_unresolved(host, ip)) {
-                snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
-                add_check_ex("Видео", g_video[i].name, "warn", detail,
-                             "Имя не резолвится — это сбой DNS, а не недоступность видео.",
-                             NULL, g_video[i].home, 0);
-            } else {
-                snprintf(detail, sizeof detail, "сайт HTTP %d; видео HTTP %d [%s]",
-                         r.code, rv.code, ua_sum[0] ? ua_sum : "—");
-                add_check_ex("Видео", g_video[i].name, "fail", detail,
-                             "Не открылся сайт или видео-путь.", ip, g_video[i].home, 0);
-                vfail++;
+        Check *outs = (Check *)calloc((size_t)nv, sizeof(Check));
+        VideoJobCtx vctx;
+        if (outs && nv > 0) {
+            vctx.outs = outs;
+            run_parallel(nv, opt_jobs, video_job, &vctx, "видео");
+            for (i = 0; i < nv; i++) {
+                add_check_from(&outs[i]);
+                if (strcmp(outs[i].status, "fail") == 0) vfail++;
             }
         }
+        free(outs);
         if (vfail >= 3)
             add_finding("warning", "Видеохостинги недоступны",
                         "Яндекс/VK/IVI/Okko/Rutube — проверьте DPI/DNS. "
@@ -4743,11 +5236,28 @@ int main(int argc, char **argv) {
     /* RU banks / services */
     if (stage_begin("Банки и сервисы РФ", "Доступность популярных банков и порталов")) {
         int n = g_nbanks;
-        for (i = 0; i < n; i++) {
-            stage_item(g_banks[i].name, i + 1, n);
-            check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0, 0,
-                     fail_names, &nfail, slow_names, &nslow);
+        Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
+        int *failed = (int *)calloc((size_t)n, sizeof(int));
+        int *slow_ms = (int *)calloc((size_t)n, sizeof(int));
+        if (outs && failed && slow_ms && n > 0) {
+            BankJobCtx bctx;
+            bctx.outs = outs; bctx.failed = failed; bctx.slow_ms = slow_ms;
+            run_parallel(n, opt_jobs, bank_job, &bctx, "банки");
+            for (i = 0; i < n; i++) {
+                add_check_from(&outs[i]);
+                if (failed[i] && nfail < 40)
+                    snprintf(fail_names[nfail++], 64, "%s", g_banks[i].name);
+                if (slow_ms[i] && nslow < 40)
+                    snprintf(slow_names[nslow++], 80, "%s %dms", g_banks[i].name, slow_ms[i]);
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                stage_item(g_banks[i].name, i + 1, n);
+                check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0, 0,
+                         fail_names, &nfail, slow_names, &nslow);
+            }
         }
+        free(outs); free(failed); free(slow_ms);
         stage_done();
     }
 
@@ -4779,6 +5289,7 @@ int main(int argc, char **argv) {
                     "и проверьте DFS-канал на AP.");
     }
 
+    enrich_fail_netdiag();
     write_html();
     printf("\nОтчёт: %s\n", report_path);
     printf("Итого: OK=%d WARN=%d FAIL=%d\n", ok_n, warn_n, fail_n);

@@ -23,7 +23,7 @@ $(EMBED_H): $(DOMAINS) scripts/embed_domains.py
 	python3 scripts/embed_domains.py $(DOMAINS) $(EMBED_H)
 
 $(BIN): $(SRC) $(EMBED_H) src/version.h VERSION
-	$(CC) $(CFLAGS) -o $@ $(SRC)
+	$(CC) $(CFLAGS) -pthread -o $@ $(SRC)
 
 win: $(WINBIN)
 
