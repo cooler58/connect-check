@@ -113,7 +113,8 @@ static int opt_jobs = DEFAULT_JOBS; /* параллельные пробы вн�
 static int opt_dns_limit = 1000; /* полный прогон: --dns-limit 10000 */
 static int g_sys_dns_broken; /* getaddrinfo не резолвит известные имена — remote-этапы бессмысленны */
 static char domains_path[STR];
-static char resources_path[STR]; /* --resources FILE; иначе resources.conf рядом */
+static char resources_path[STR]; /* --resources FILE; иначе автопоиск */
+static char resources_loaded[STR]; /* фактический путь загруженного conf (для отчёта) */
 static char output_dir[STR];
 static char report_path[STR];
 static char stamp[32];
@@ -2953,6 +2954,10 @@ static void resources_load_defaults(void) {
         {"Сервисы РФ", "HH.ru", "https://hh.ru/"},
         {"Сервисы РФ", "DNS Shop", "https://www.dns-shop.ru/"},
         {"Сервисы РФ", "ЦИАН", "https://www.cian.ru/"},
+        {"Проблемы провайдера", "Zoom", "https://www.zoom.com/"},
+        {"Проблемы провайдера", "Bitrix24", "https://www.bitrix24.ru/"},
+        {"Проблемы провайдера", "Google Play", "https://play.google.com/"},
+        {"Проблемы провайдера", "Google Play (store)", "https://play.google.com/store"},
     };
     int i, n;
 
@@ -3170,41 +3175,90 @@ static int resources_load_file(const char *path) {
     return 1;
 }
 
+/* Базовое имя каталога (mac / linux / win) — без пути. */
+static int is_os_cli_dirname(const char *base) {
+    return base && (!strcmp(base, "mac") || !strcmp(base, "linux") || !strcmp(base, "win"));
+}
+
+static int resources_try_load(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (!resources_load_file(path)) return 0;
+    g_resources_from_file = 1;
+    snprintf(resources_loaded, sizeof resources_loaded, "%s", path);
+    printf("Списки ресурсов: %s\n", resources_loaded);
+    return 1;
+}
+
 /*
- * Порядок:
+ * Порядок (важно для GUI/пакета: conf в корне архива, CLI в mac|linux|win/):
  *  1) --resources FILE
- *  2) resources.conf рядом с exe
+ *  2) resources.conf в родителе exe, если exe в …/mac|linux|win (корень пакета)
  *  3) resources.conf в cwd
+ *  4) resources.conf рядом с exe
  *  иначе — встроенные списки
+ *
+ * Корень пакета раньше cwd: иначе при запуске из win/ подхватывается устаревшая
+ * копия mac|linux|win/resources.conf вместо отредактированного файла в корне.
  */
 static void resources_init(void) {
     char try1[STR];
 
     resources_load_defaults();
     g_resources_from_file = 0;
+    resources_loaded[0] = 0;
 
     if (resources_path[0]) {
-        if (resources_load_file(resources_path))
-            g_resources_from_file = 1;
+        if (!resources_try_load(resources_path))
+            fprintf(stderr, "Не удалось прочитать --resources %s — встроенные списки\n",
+                    resources_path);
         return;
     }
 
     if (exe_dir[0]) {
-        snprintf(try1, sizeof try1, "%s/resources.conf", exe_dir);
-        if (resources_load_file(try1)) {
-            g_resources_from_file = 1;
-            return;
-        }
+        const char *base;
 #ifdef _WIN32
-        snprintf(try1, sizeof try1, "%s\\resources.conf", exe_dir);
-        if (resources_load_file(try1)) {
-            g_resources_from_file = 1;
-            return;
+        {
+            char *slash = strrchr(exe_dir, '\\');
+            char *slash2 = strrchr(exe_dir, '/');
+            if (slash2 && (!slash || slash2 > slash)) slash = slash2;
+            base = slash ? slash + 1 : exe_dir;
+        }
+#else
+        {
+            const char *slash = strrchr(exe_dir, '/');
+            base = slash ? slash + 1 : exe_dir;
         }
 #endif
+        if (is_os_cli_dirname(base) && base > exe_dir) {
+            char parent[STR];
+            size_t n = (size_t)(base - exe_dir);
+            if (n > 0) n--; /* убрать trailing sep */
+            if (n > 0 && n < sizeof parent) {
+                memcpy(parent, exe_dir, n);
+                parent[n] = 0;
+#ifdef _WIN32
+                snprintf(try1, sizeof try1, "%s\\resources.conf", parent);
+#else
+                snprintf(try1, sizeof try1, "%s/resources.conf", parent);
+#endif
+                if (resources_try_load(try1))
+                    return;
+            }
+        }
     }
-    if (resources_load_file("resources.conf"))
-        g_resources_from_file = 1;
+
+    if (resources_try_load("resources.conf"))
+        return;
+
+    if (exe_dir[0]) {
+#ifdef _WIN32
+        snprintf(try1, sizeof try1, "%s\\resources.conf", exe_dir);
+#else
+        snprintf(try1, sizeof try1, "%s/resources.conf", exe_dir);
+#endif
+        if (resources_try_load(try1))
+            return;
+    }
 }
 
 /* ---------- HTML ---------- */
@@ -5169,7 +5223,7 @@ int main(int argc, char **argv) {
         SigJobCtx ctx;
         if (g_resources_from_file)
             add_check("Значимые ресурсы", "Список", "info",
-                      "из resources.conf", "");
+                      resources_loaded[0] ? resources_loaded : "resources.conf", "");
         outs = (Check *)calloc((size_t)n, sizeof(Check));
         failed = (int *)calloc((size_t)n, sizeof(int));
         slow_ms = (int *)calloc((size_t)n, sizeof(int));
@@ -5596,6 +5650,9 @@ int main(int argc, char **argv) {
         Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
         int *failed = (int *)calloc((size_t)n, sizeof(int));
         int *slow_ms = (int *)calloc((size_t)n, sizeof(int));
+        if (g_resources_from_file)
+            add_check("Банки и сервисы РФ", "Список", "info",
+                      resources_loaded[0] ? resources_loaded : "resources.conf", "");
         if (outs && failed && slow_ms && n > 0) {
             BankJobCtx bctx;
             bctx.outs = outs; bctx.failed = failed; bctx.slow_ms = slow_ms;

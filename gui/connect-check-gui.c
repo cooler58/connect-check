@@ -86,6 +86,7 @@ typedef struct {
 static char g_bindir[PATH_MAX_G];
 static char g_workdir[PATH_MAX_G];
 static LogBuf g_log;
+static int g_log_prog_idx = -1; /* индекс перезаписываемой progress-строки (\r), или -1 */
 static Child g_kids[MAX_PROCS];
 static int g_nkids;
 static char g_status[128] = "Готово";
@@ -147,8 +148,39 @@ static void utf8_trim(char *s) {
     }
 }
 
-static void log_add(const char *prefix, const char *msg) {
-    char line[LOG_LINE];
+/* Убрать CSI/ANSI (например \033[K из stage_progress) и лишние пробелы по краям. */
+static void sanitize_log_text(char *s) {
+    char *r, *w;
+    int esc = 0; /* 0 normal, 1 ESC, 2 ESC[ */
+    if (!s) return;
+    for (r = w = s; *r; r++) {
+        unsigned char c = (unsigned char)*r;
+        if (esc == 1) {
+            if (c == '[') { esc = 2; continue; }
+            esc = 0;
+            continue;
+        }
+        if (esc == 2) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                esc = 0;
+            continue;
+        }
+        if (c == 0x1B) { esc = 1; continue; }
+        if (c == '\t') { *w++ = ' '; continue; }
+        if (c < 0x20 && c != 0x09) continue; /* прочие control */
+        *w++ = (char)c;
+    }
+    *w = 0;
+    /* trim edges */
+    r = s;
+    while (*r == ' ') r++;
+    if (r != s) memmove(s, r, strlen(r) + 1);
+    w = s + strlen(s);
+    while (w > s && w[-1] == ' ') *--w = 0;
+    utf8_trim(s);
+}
+
+static void log_format_line(char *out, size_t n, const char *prefix, const char *msg) {
     time_t t = time(NULL);
     struct tm tm;
     char ts[16];
@@ -159,39 +191,98 @@ static void log_add(const char *prefix, const char *msg) {
 #endif
     strftime(ts, sizeof ts, "%H:%M:%S", &tm);
     if (prefix && prefix[0])
-        snprintf(line, sizeof line, "%s [%s] %s", ts, prefix, msg);
+        snprintf(out, n, "%s [%s] %s", ts, prefix, msg ? msg : "");
     else
-        snprintf(line, sizeof line, "%s %s", ts, msg);
-    utf8_trim(line);
+        snprintf(out, n, "%s %s", ts, msg ? msg : "");
+    utf8_trim(out);
+}
+
+/* Финальная строка лога (обычный вывод с \n). */
+static void log_add(const char *prefix, const char *msg) {
+    char line[LOG_LINE];
+    g_log_prog_idx = -1;
+    log_format_line(line, sizeof line, prefix, msg);
     if (g_log.n < MAX_LOG) {
         snprintf(g_log.lines[g_log.n++], LOG_LINE, "%s", line);
-        utf8_trim(g_log.lines[g_log.n - 1]);
     } else {
         memmove(g_log.lines[0], g_log.lines[1], (MAX_LOG - 1) * LOG_LINE);
         snprintf(g_log.lines[MAX_LOG - 1], LOG_LINE, "%s", line);
-        utf8_trim(g_log.lines[MAX_LOG - 1]);
     }
     g_log.scroll_bottom = 1;
 }
 
-/* Дописать кусок pipe → целые строки в лог (хвост остаётся в c->acc). */
+/*
+ * Progress из CLI (\r / \033[K): одна перезаписываемая строка, без спама.
+ * Пустой msg — убрать progress-строку (stage_done).
+ */
+static void log_progress(const char *prefix, const char *msg) {
+    char line[LOG_LINE];
+    if (!msg || !msg[0]) {
+        if (g_log_prog_idx >= 0 && g_log_prog_idx == g_log.n - 1 && g_log.n > 0) {
+            g_log.n--;
+            g_log_prog_idx = -1;
+            g_log.scroll_bottom = 1;
+        }
+        return;
+    }
+    log_format_line(line, sizeof line, prefix, msg);
+    if (g_log_prog_idx >= 0 && g_log_prog_idx < g_log.n) {
+        snprintf(g_log.lines[g_log_prog_idx], LOG_LINE, "%s", line);
+    } else if (g_log.n < MAX_LOG) {
+        g_log_prog_idx = g_log.n;
+        snprintf(g_log.lines[g_log.n++], LOG_LINE, "%s", line);
+    } else {
+        memmove(g_log.lines[0], g_log.lines[1], (MAX_LOG - 1) * LOG_LINE);
+        g_log_prog_idx = MAX_LOG - 1;
+        snprintf(g_log.lines[MAX_LOG - 1], LOG_LINE, "%s", line);
+    }
+    g_log.scroll_bottom = 1;
+}
+
+/* Дописать кусок pipe: \r = перезапись progress, \n = финальная строка, ANSI выкидываем. */
 static void kid_feed(Child *c, const char *chunk, size_t len) {
     size_t i;
+    int esc = 0; /* 0 normal, 1 ESC, 2 CSI */
     for (i = 0; i < len; i++) {
+        unsigned char uch = (unsigned char)chunk[i];
         char ch = chunk[i];
-        if (ch == '\r') continue;
-        if (ch == '\n') {
+
+        if (esc == 1) {
+            if (uch == '[') { esc = 2; continue; }
+            esc = 0;
+            continue;
+        }
+        if (esc == 2) {
+            if ((uch >= 'A' && uch <= 'Z') || (uch >= 'a' && uch <= 'z'))
+                esc = 0;
+            continue;
+        }
+        if (uch == 0x1B) { esc = 1; continue; }
+
+        if (ch == '\r') {
             c->acc[c->acc_n] = 0;
-            if (c->acc_n > 0) log_add(c->key, c->acc);
+            sanitize_log_text(c->acc);
+            log_progress(c->key, c->acc);
             c->acc_n = 0;
             continue;
         }
+        if (ch == '\n') {
+            c->acc[c->acc_n] = 0;
+            sanitize_log_text(c->acc);
+            if (c->acc_n > 0)
+                log_add(c->key, c->acc);
+            else
+                log_progress(c->key, ""); /* пустой \n после clear — снять progress */
+            c->acc_n = 0;
+            continue;
+        }
+        if (uch < 0x20) continue; /* прочий control */
+
         if (c->acc_n + 1 < PIPE_ACC)
             c->acc[c->acc_n++] = ch;
         else {
-            /* переполнение — сбросить строку как есть */
             c->acc[c->acc_n] = 0;
-            utf8_trim(c->acc);
+            sanitize_log_text(c->acc);
             log_add(c->key, c->acc);
             c->acc_n = 0;
             c->acc[c->acc_n++] = ch;
@@ -202,12 +293,12 @@ static void kid_feed(Child *c, const char *chunk, size_t len) {
 static void kid_flush_acc(Child *c) {
     if (c->acc_n > 0) {
         c->acc[c->acc_n] = 0;
-        utf8_trim(c->acc);
-        log_add(c->key, c->acc);
+        sanitize_log_text(c->acc);
+        if (c->acc[0])
+            log_add(c->key, c->acc);
         c->acc_n = 0;
     }
 }
-
 static void path_join(char *out, size_t n, const char *a, const char *b) {
 #ifdef _WIN32
     snprintf(out, n, "%s\\%s", a, b);
@@ -965,6 +1056,7 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         if (nk_button_label(ctx, "Остановить всё")) stop_all();
         if (nk_button_label(ctx, "Очистить лог")) {
             g_log.n = 0;
+            g_log_prog_idx = -1;
         }
 
         log_h = height - (int)ctx->current->layout->at_y - 40;
@@ -972,13 +1064,20 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         nk_layout_row_dynamic(ctx, (float)log_h, 1);
         if (nk_group_begin(ctx, "log", NK_WINDOW_BORDER)) {
             int i;
-            nk_layout_row_dynamic(ctx, 16, 1);
-            for (i = 0; i < g_log.n; i++)
-                nk_label(ctx, g_log.lines[i], NK_TEXT_LEFT);
-            if (g_log.scroll_bottom) {
-                /* nudge: re-open keeps bottom-ish via many labels */
-                g_log.scroll_bottom = 0;
+            nk_layout_row_dynamic(ctx, 18, 1);
+            for (i = 0; i < g_log.n; i++) {
+                const char *ln = g_log.lines[i];
+                /* progress (\r) — приглушённый; ошибки — краснее */
+                if (i == g_log_prog_idx || strstr(ln, " … "))
+                    nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(140, 150, 160));
+                else if (strstr(ln, "fail") || strstr(ln, "ошиб") || strstr(ln, "Error") ||
+                         strstr(ln, "не найден"))
+                    nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(200, 90, 80));
+                else
+                    nk_label(ctx, ln, NK_TEXT_LEFT);
             }
+            if (g_log.scroll_bottom)
+                g_log.scroll_bottom = 0;
             nk_group_end(ctx);
         }
 
