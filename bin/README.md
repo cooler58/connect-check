@@ -6,7 +6,7 @@
 |------|-----|
 | **`bin/ConnectCheck-mac.app`** | GUI macOS |
 | **`bin/connect-check-gui-linux`** | GUI Linux (+ рядом `libglfw*.so`, `DejaVuSans.ttf` при необходимости) |
-| **`bin/connect-check-gui-win.exe`** | GUI Windows (+ `DejaVuSans.ttf` в корне `bin/`) |
+| **`bin/connect-check-gui-win.exe`** | GUI Windows (+ `DejaVuSans.ttf`, лаунчер `connect-check-gui.cmd`) |
 | `bin/mac/` | CLI macOS: `connect-check`, `probe-*`, `resources.conf` |
 | `bin/linux/` | CLI Linux x86_64 (static musl): то же |
 | `bin/win/` | CLI Windows: `connect-check.exe`, `probe-*.exe`, `connect-check.cmd`, `resources.conf` |
@@ -34,15 +34,21 @@ GUI — **только в корне `bin/`**. Остальные бинарни
 
 ## GUI
 
-```bash
-open bin/ConnectCheck-mac.app
-CONNECT_CHECK_BIN_DIR=bin/mac open bin/ConnectCheck-mac.app
+GUI ищет `connect-check` / `probe-*` **в текущей рабочей папке** (`cwd` или `cwd/mac|linux|win`). Запускайте из корня распакованного архива (лаунчеры ниже делают `cd` сами).
 
-CONNECT_CHECK_BIN_DIR=bin/linux ./bin/connect-check-gui-linux
-CONNECT_CHECK_BIN_DIR=bin/win ./bin/connect-check-gui-win.exe
+```bash
+# mac — из корня архива / bin/
+./ConnectCheck-mac.command
+# или: cd … && open ConnectCheck-mac.app   (cwd должен быть папкой с mac/)
+
+# linux
+./connect-check-gui.sh
+
+# windows — двойной клик
+connect-check-gui.cmd
 ```
 
-Рядом с GUI задайте `CONNECT_CHECK_BIN_DIR` на папку CLI вашей ОС (`bin/mac`, `bin/linux` или `bin/win`).
+Override: `CONNECT_CHECK_BIN_DIR` на каталог с CLI. Шрифт: `DejaVuSans.ttf` рядом, иначе системный mono.
 
 ## Когда что запускать
 

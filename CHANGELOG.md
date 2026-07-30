@@ -2,6 +2,16 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.2.1] — 2026-07-30
+
+### Fixed
+- Windows: сборка через **msvcrt-os** (без `api-ms-win-crt-*`) — надёжнее старт на Win10 без VC++ Redistributable / битого UCRT.
+- Windows GUI: при ошибке OpenGL/GLFW — **MessageBox** вместо тихого выхода (`-mwindows`); fallback контекста GL; DPI awareness.
+- GUI ищет CLI/probes **только в рабочей папке** (`cwd`, `cwd/win|mac|linux`) или `CONNECT_CHECK_BIN_DIR` — без эвристик от пути exe/.app.
+- Шрифт: `DejaVuSans*.ttf` из cwd, иначе системные **моноширинные** (Consolas / Courier New / DejaVuSansMono и т.п.).
+- Лаунчеры в архивах: `connect-check-gui.cmd` (Win), `ConnectCheck-mac.command` (mac), `connect-check-gui.sh` (Linux) — ставят cwd на папку пакета.
+- GUI: проверка обновлений после создания окна (не блокирует старт).
+
 ## [1.2.0] — 2026-07-30
 
 ### Added

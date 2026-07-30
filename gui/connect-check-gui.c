@@ -11,11 +11,14 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <process.h>
+#  include <direct.h>
+#  define getcwd _getcwd
 #else
 #  include <unistd.h>
 #  include <fcntl.h>
@@ -222,100 +225,50 @@ static void tool_name(char *out, size_t n, const char *base) {
 #endif
 }
 
+/* CLI/probes: только cwd (и cwd/<os>) либо CONNECT_CHECK_BIN_DIR — без путей от exe/.app. */
 static int resolve_bindir(void) {
-    char try[PATH_MAX_G], tool[64];
+    char cwd[PATH_MAX_G], sub[PATH_MAX_G], try[PATH_MAX_G], tool[64];
     const char *env = getenv("CONNECT_CHECK_BIN_DIR");
+#if defined(_WIN32)
+    const char *ossub = "win";
+#elif defined(__APPLE__)
+    const char *ossub = "mac";
+#else
+    const char *ossub = "linux";
+#endif
+
     tool_name(tool, sizeof tool, "connect-check");
+    g_bindir[0] = 0;
+    g_workdir[0] = 0;
+
+    if (!getcwd(cwd, sizeof cwd))
+        cwd[0] = 0;
+    else
+        snprintf(g_workdir, sizeof g_workdir, "%s", cwd);
 
     if (env && env[0]) {
         path_join(try, sizeof try, env, tool);
         if (file_exists(try)) {
             snprintf(g_bindir, sizeof g_bindir, "%s", env);
-            snprintf(g_workdir, sizeof g_workdir, "%s", env);
             return 1;
         }
     }
 
-#ifdef _WIN32
-    {
-        char exe[PATH_MAX_G];
-        DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-        if (n > 0) {
-            char *slash = strrchr(exe, '\\');
-            if (slash) *slash = 0;
-            path_join(try, sizeof try, exe, tool);
-            if (file_exists(try)) {
-                snprintf(g_bindir, sizeof g_bindir, "%s", exe);
-                snprintf(g_workdir, sizeof g_workdir, "%s", exe);
-                return 1;
-            }
-        }
+    if (!cwd[0]) return 0;
+
+    path_join(try, sizeof try, cwd, tool);
+    if (file_exists(try)) {
+        snprintf(g_bindir, sizeof g_bindir, "%s", cwd);
+        return 1;
     }
-#else
-    {
-        char exe[PATH_MAX_G] = "";
-#  ifdef __APPLE__
-        uint32_t sz = sizeof exe;
-        if (_NSGetExecutablePath(exe, &sz) == 0) {
-            char real[PATH_MAX_G], up[PATH_MAX_G];
-            if (realpath(exe, real)) snprintf(exe, sizeof exe, "%s", real);
-            {
-                char *slash = strrchr(exe, '/');
-                if (slash) *slash = 0; /* …/MacOS или …/bin/mac */
-            }
-            path_join(try, sizeof try, exe, tool);
-            if (file_exists(try)) {
-                snprintf(g_bindir, sizeof g_bindir, "%s", exe);
-                snprintf(g_workdir, sizeof g_workdir, "%s", exe);
-                return 1;
-            }
-            /* ConnectCheck.app/Contents/MacOS → ../../.. = каталог с .app */
-            snprintf(up, sizeof up, "%s/../../..", exe);
-            if (realpath(up, real)) {
-                path_join(try, sizeof try, real, tool);
-                if (file_exists(try)) {
-                    snprintf(g_bindir, sizeof g_bindir, "%s", real);
-                    snprintf(g_workdir, sizeof g_workdir, "%s", real);
-                    return 1;
-                }
-                /* .app в корне bin/ → CLI лежит в bin/mac/ */
-                {
-                    char macdir[PATH_MAX_G];
-                    path_join(macdir, sizeof macdir, real, "mac");
-                    path_join(try, sizeof try, macdir, tool);
-                    if (file_exists(try)) {
-                        snprintf(g_bindir, sizeof g_bindir, "%s", macdir);
-                        snprintf(g_workdir, sizeof g_workdir, "%s", macdir);
-                        return 1;
-                    }
-                }
-            }
-        }
-#  endif
-        if (getcwd(try, sizeof try)) {
-            char cand[PATH_MAX_G];
-            path_join(cand, sizeof cand, try, tool);
-            if (file_exists(cand)) {
-                snprintf(g_bindir, sizeof g_bindir, "%s", try);
-                snprintf(g_workdir, sizeof g_workdir, "%s", try);
-                return 1;
-            }
-            snprintf(cand, sizeof cand, "%s/bin/mac/%s", try, tool);
-            if (file_exists(cand)) {
-                snprintf(g_bindir, sizeof g_bindir, "%s/bin/mac", try);
-                snprintf(g_workdir, sizeof g_workdir, "%s", try);
-                return 1;
-            }
-            snprintf(cand, sizeof cand, "%s/bin/linux/%s", try, tool);
-            if (file_exists(cand)) {
-                snprintf(g_bindir, sizeof g_bindir, "%s/bin/linux", try);
-                snprintf(g_workdir, sizeof g_workdir, "%s", try);
-                return 1;
-            }
-        }
+
+    path_join(sub, sizeof sub, cwd, ossub);
+    path_join(try, sizeof try, sub, tool);
+    if (file_exists(try)) {
+        snprintf(g_bindir, sizeof g_bindir, "%s", sub);
+        return 1;
     }
-#endif
-    g_bindir[0] = 0;
+
     return 0;
 }
 
@@ -327,79 +280,76 @@ static int tool_path(const char *base, char *out, size_t n) {
     return file_exists(out);
 }
 
-/* Каталог исполняемого файла (для DejaVuSans.ttf рядом с GUI). */
-static int exe_dir(char *out, size_t n) {
-#ifdef _WIN32
-    DWORD len = GetModuleFileNameA(NULL, out, (DWORD)n);
-    char *slash;
-    if (!len || len >= n) return 0;
-    slash = strrchr(out, '\\');
-    if (!slash) return 0;
-    *slash = 0;
-    return 1;
-#else
-    char buf[PATH_MAX_G] = "";
-#  ifdef __APPLE__
-    uint32_t sz = sizeof buf;
-    if (_NSGetExecutablePath(buf, &sz) != 0) return 0;
-#  else
-    ssize_t r = readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (r <= 0) return 0;
-    buf[r] = 0;
-#  endif
-    {
-        char real[PATH_MAX_G];
-        char *slash;
-        if (realpath(buf, real))
-            snprintf(buf, sizeof buf, "%s", real);
-        slash = strrchr(buf, '/');
-        if (!slash) return 0;
-        *slash = 0;
-        snprintf(out, n, "%s", buf);
-        return 1;
-    }
-#endif
-}
-
+/* Шрифт: cwd → системные моноширинные (TTF) с кириллицей. */
 static int find_font(char *out, size_t n) {
-    char dir[PATH_MAX_G], try[PATH_MAX_G];
-    const char *name = "DejaVuSans.ttf";
+    char cwd[PATH_MAX_G], try[PATH_MAX_G], windir[PATH_MAX_G];
     size_t i;
-    const char *rel[] = {
-        NULL, /* filled: <exe_dir>/DejaVuSans.ttf */
-        NULL, /* filled: <bindir>/DejaVuSans.ttf */
-        "third_party/fonts/DejaVuSans.ttf",
-        "../third_party/fonts/DejaVuSans.ttf",
-#ifdef _WIN32
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-#elif defined(__APPLE__)
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-#else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-#endif
+    const char *bundled[] = {
+        "DejaVuSansMono.ttf",
+        "DejaVuSans.ttf",
         NULL
     };
+#ifdef _WIN32
+    const char *sysmono[] = {
+        NULL, NULL, NULL, NULL, NULL, /* filled from %WINDIR%\\Fonts */
+        NULL
+    };
+    char sysbuf[5][PATH_MAX_G];
+#elif defined(__APPLE__)
+    const char *sysmono[] = {
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/Library/Fonts/Courier New.ttf",
+        "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+        "/Library/Fonts/Andale Mono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        NULL
+    };
+#else
+    const char *sysmono[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+        NULL
+    };
+#endif
 
-    if (exe_dir(dir, sizeof dir)) {
-        path_join(try, sizeof try, dir, name);
-        if (file_exists(try)) {
-            snprintf(out, n, "%s", try);
-            return 1;
+    if (getcwd(cwd, sizeof cwd)) {
+        for (i = 0; bundled[i]; i++) {
+            path_join(try, sizeof try, cwd, bundled[i]);
+            if (file_exists(try)) {
+                snprintf(out, n, "%s", try);
+                return 1;
+            }
         }
     }
-    if (g_bindir[0]) {
-        path_join(try, sizeof try, g_bindir, name);
-        if (file_exists(try)) {
-            snprintf(out, n, "%s", try);
-            return 1;
-        }
+
+#ifdef _WIN32
+    {
+        DWORD wlen = GetEnvironmentVariableA("WINDIR", windir, (DWORD)sizeof windir);
+        if (!wlen || wlen >= sizeof windir)
+            snprintf(windir, sizeof windir, "C:\\Windows");
+        snprintf(sysbuf[0], sizeof sysbuf[0], "%s\\Fonts\\consola.ttf", windir);
+        snprintf(sysbuf[1], sizeof sysbuf[1], "%s\\Fonts\\cour.ttf", windir);
+        snprintf(sysbuf[2], sizeof sysbuf[2], "%s\\Fonts\\CascadiaMono.ttf", windir);
+        snprintf(sysbuf[3], sizeof sysbuf[3], "%s\\Fonts\\cascadiamono.ttf", windir);
+        snprintf(sysbuf[4], sizeof sysbuf[4], "%s\\Fonts\\lucon.ttf", windir);
+        sysmono[0] = sysbuf[0];
+        sysmono[1] = sysbuf[1];
+        sysmono[2] = sysbuf[2];
+        sysmono[3] = sysbuf[3];
+        sysmono[4] = sysbuf[4];
     }
-    for (i = 2; rel[i]; i++) {
-        if (file_exists(rel[i])) {
-            snprintf(out, n, "%s", rel[i]);
+#else
+    (void)windir;
+#endif
+
+    for (i = 0; sysmono[i]; i++) {
+        if (file_exists(sysmono[i])) {
+            snprintf(out, n, "%s", sysmono[i]);
             return 1;
         }
     }
@@ -915,9 +865,18 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
     if (nk_begin(ctx, "Connect Check", nk_rect(0, 0, (float)width, (float)height),
                  NK_WINDOW_NO_SCROLLBAR)) {
         if (g_bindir[0])
-            snprintf(hdr, sizeof hdr, "Бинарники: %s", g_bindir);
+            snprintf(hdr, sizeof hdr, "Утилиты: %s", g_bindir);
         else
-            snprintf(hdr, sizeof hdr, "connect-check не найден — CONNECT_CHECK_BIN_DIR или bin/{mac,linux,win}");
+            snprintf(hdr, sizeof hdr,
+                     "connect-check не найден в рабочей папке (cwd / cwd/%s) — или CONNECT_CHECK_BIN_DIR",
+#if defined(_WIN32)
+                     "win"
+#elif defined(__APPLE__)
+                     "mac"
+#else
+                     "linux"
+#endif
+            );
         nk_layout_row_dynamic(ctx, 22, 1);
         nk_label_colored(ctx, hdr, NK_TEXT_LEFT,
                          g_bindir[0] ? nk_rgb(40, 140, 60) : nk_rgb(180, 40, 40));
@@ -972,6 +931,56 @@ static void error_callback(int e, const char *d) {
     fprintf(stderr, "GLFW %d: %s\n", e, d);
 }
 
+#ifdef _WIN32
+static char g_glfw_last_err[512];
+
+static void error_callback_win(int e, const char *d) {
+    snprintf(g_glfw_last_err, sizeof g_glfw_last_err, "GLFW %d: %s", e, d ? d : "");
+    fprintf(stderr, "%s\n", g_glfw_last_err);
+}
+
+static void win_fatal(const char *title, const char *text) {
+    MessageBoxA(NULL, text, title, MB_OK | MB_ICONERROR);
+}
+
+static void win_dpi_aware(void) {
+    HMODULE user32 = LoadLibraryA("user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *SetDpiAwarenessContext_t)(void *);
+        SetDpiAwarenessContext_t set_ctx =
+            (SetDpiAwarenessContext_t)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (set_ctx) {
+            /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+            set_ctx((void *)(intptr_t)-4);
+        } else {
+            typedef BOOL (WINAPI *SetProcessDPIAware_t)(void);
+            SetProcessDPIAware_t legacy =
+                (SetProcessDPIAware_t)GetProcAddress(user32, "SetProcessDPIAware");
+            if (legacy) legacy();
+        }
+        FreeLibrary(user32);
+    }
+}
+
+static GLFWwindow *win_create_gl_window(int width, int height, const char *title) {
+    GLFWwindow *w = NULL;
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_ANY_PROFILE);
+    w = glfwCreateWindow(width, height, title, NULL, NULL);
+    if (w) return w;
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+    w = glfwCreateWindow(width, height, title, NULL, NULL);
+    if (w) return w;
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 1);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    return glfwCreateWindow(width, height, title, NULL, NULL);
+}
+#endif
+
 int main(int argc, char **argv) {
     GLFWwindow *win;
     struct nk_context *ctx;
@@ -983,30 +992,65 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
+#ifdef _WIN32
+    win_dpi_aware();
+    g_glfw_last_err[0] = 0;
+#endif
+
     resolve_bindir();
     log_add("", "Connect Check GUI (Nuklear) " CONNECT_CHECK_VERSION);
-    if (g_bindir[0]) log_add("", g_bindir);
-    else log_add("", "задайте CONNECT_CHECK_BIN_DIR");
-    update_check_startup();
+    if (g_workdir[0]) log_add("cwd", g_workdir);
+    if (g_bindir[0]) log_add("bin", g_bindir);
+    else log_add("", "нет CLI в cwd — запустите из папки пакета или задайте CONNECT_CHECK_BIN_DIR");
 
+#ifdef _WIN32
+    glfwSetErrorCallback(error_callback_win);
+#else
     glfwSetErrorCallback(error_callback);
+#endif
     if (!glfwInit()) {
+#ifdef _WIN32
+        char msg[768];
+        snprintf(msg, sizeof msg,
+                 "Не удалось инициализировать графику (glfwInit).\n\n%s\n\n"
+                 "Частые причины: нет драйвера GPU / OpenGL, RDP без 3D.\n"
+                 "Запустите CLI: win\\connect-check.exe -y",
+                 g_glfw_last_err[0] ? g_glfw_last_err : "(нет деталей)");
+        win_fatal("Connect Check — ошибка запуска", msg);
+#else
         fprintf(stderr, "glfwInit failed\n");
+#endif
         return 1;
     }
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
     {
         char title[96];
         snprintf(title, sizeof title, "Connect Check %s — диагностика сети", CONNECT_CHECK_VERSION);
+#ifdef _WIN32
+        win = win_create_gl_window(width, height, title);
+#else
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
         win = glfwCreateWindow(width, height, title, NULL, NULL);
+#endif
     }
     if (!win) {
+#ifdef _WIN32
+        char msg[768];
+        snprintf(msg, sizeof msg,
+                 "Не удалось создать окно OpenGL.\n\n%s\n\n"
+                 "Обновите драйвер видеокарты или используйте CLI:\n"
+                 "  win\\connect-check.exe -y",
+                 g_glfw_last_err[0] ? g_glfw_last_err : "(нет деталей)");
+        win_fatal("Connect Check — ошибка OpenGL", msg);
+#endif
         glfwTerminate();
         return 1;
     }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
+
+    /* Update check after window is up — не блокировать «молчаливый» старт */
+    update_check_startup();
 
     ctx = nk_glfw3_init(win, NK_GLFW3_INSTALL_CALLBACKS);
     {
@@ -1034,11 +1078,11 @@ int main(int argc, char **argv) {
         if (find_font(fontpath, sizeof fontpath)) {
             font = nk_font_atlas_add_from_file(atlas, fontpath, 18.0f, &cfg);
             if (font)
-                log_add("", fontpath);
+                log_add("font", fontpath);
             else
-                log_add("", "шрифт не загрузился, fallback ASCII");
+                log_add("font", "файл есть, но не загрузился — ASCII fallback");
         } else {
-            log_add("", "DejaVuSans.ttf не найден — кириллица недоступна");
+            log_add("font", "нет TTF (cwd/система) — кириллица недоступна");
         }
         nk_glfw3_font_stash_end();
         if (font)

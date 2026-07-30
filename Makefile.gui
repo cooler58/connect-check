@@ -89,7 +89,8 @@ endif
 # --- Windows: GUI только в корне bin/ ---
 WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
 WIN_CC  := x86_64-w64-mingw32-gcc
-WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(GLFW_WIN)/include $(VER_CFLAG)
+WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(GLFW_WIN)/include $(VER_CFLAG) \
+               -mcrtdll=msvcrt-os -static-libgcc
 WIN_LDFLAGS := -mwindows -L$(GLFW_WIN)/lib -lglfw3 -lopengl32 -lgdi32 -luser32 -lshell32 -lwinmm -lwininet
 
 fetch-glfw-win:
@@ -108,9 +109,12 @@ fetch-glfw-win:
 package-win: fetch-glfw-win $(WIN_STAGED)
 	@cp -f $(WIN_STAGED) bin/connect-check-gui-win.exe
 	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
+	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd 2>/dev/null || true
 	@rm -f bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
 	@ls -lh bin/connect-check-gui-win.exe
 	@file bin/connect-check-gui-win.exe | sed 's|^|  |'
+	@x86_64-w64-mingw32-objdump -p bin/connect-check-gui-win.exe 2>/dev/null | \
+	  awk '/DLL Name/{print "  " $$3}' | head -20
 
 $(WIN_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
 	mkdir -p $(STAGING)/win

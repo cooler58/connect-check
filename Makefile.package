@@ -43,12 +43,16 @@ package: mac linux win
 dist: package
 	mkdir -p dist
 	rm -f dist/connect-check-*-$(VERSION).* dist/SHA256SUMS 2>/dev/null || true
+	@cp -f scripts/connect-check-gui-linux.sh bin/connect-check-gui.sh
+	@cp -f scripts/connect-check-gui-mac.command bin/ConnectCheck-mac.command
+	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd
+	@chmod +x bin/connect-check-gui.sh bin/ConnectCheck-mac.command 2>/dev/null || true
 	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz \
-	  linux connect-check-gui-linux libglfw.so.3 DejaVuSans.ttf VERSION resources.conf
+	  linux connect-check-gui-linux connect-check-gui.sh libglfw.so.3 DejaVuSans.ttf VERSION resources.conf
 	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz \
-	  mac ConnectCheck-mac.app VERSION resources.conf
+	  mac ConnectCheck-mac.app ConnectCheck-mac.command VERSION resources.conf DejaVuSans.ttf
 	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip \
-	  win connect-check-gui-win.exe DejaVuSans.ttf VERSION resources.conf
+	  win connect-check-gui-win.exe connect-check-gui.cmd DejaVuSans.ttf VERSION resources.conf
 	@cd dist && (command -v shasum >/dev/null && shasum -a 256 connect-check-*-$(VERSION).* > SHA256SUMS) || \
 	  (command -v sha256sum >/dev/null && sha256sum connect-check-*-$(VERSION).* > SHA256SUMS) || \
 	  { echo "Нет shasum/sha256sum — SHA256SUMS не создан"; exit 1; }
