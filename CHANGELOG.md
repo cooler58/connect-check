@@ -2,14 +2,26 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.2.3] — 2026-07-30
+
+### Fixed
+- Windows GUI: **GDI+ вместо OpenGL/GLFW** — уходит ошибка GLFW 65542 (`API_UNAVAILABLE`) на машинах без GPU ICD / в RDP.
+- GUI ищет CLI в соседней `mac|linux|win/` от пути приложения (без env).
+- Консольные CLI/probes: Win → `msvcrt` (системная), Mac → только `libSystem`, Linux → static musl — без сторонних runtime DLL.
+
+## [1.2.2] — 2026-07-30
+
+### Fixed
+- GUI снова находит CLI при двойном клике по `.app` / `.exe`: ищет `mac|linux|win/` **рядом с приложением**, не в cwd и без `CONNECT_CHECK_BIN_DIR`.
+- Шрифт: рядом с пакетом / внутри `.app`, иначе системный mono.
+
 ## [1.2.1] — 2026-07-30
 
 ### Fixed
 - Windows: сборка через **msvcrt-os** (без `api-ms-win-crt-*`) — надёжнее старт на Win10 без VC++ Redistributable / битого UCRT.
 - Windows GUI: при ошибке OpenGL/GLFW — **MessageBox** вместо тихого выхода (`-mwindows`); fallback контекста GL; DPI awareness.
-- GUI ищет CLI/probes **только в рабочей папке** (`cwd`, `cwd/win|mac|linux`) или `CONNECT_CHECK_BIN_DIR` — без эвристик от пути exe/.app.
-- Шрифт: `DejaVuSans*.ttf` из cwd, иначе системные **моноширинные** (Consolas / Courier New / DejaVuSansMono и т.п.).
-- Лаунчеры в архивах: `connect-check-gui.cmd` (Win), `ConnectCheck-mac.command` (mac), `connect-check-gui.sh` (Linux) — ставят cwd на папку пакета.
+- Шрифт: `DejaVuSans*.ttf` рядом, иначе системные **моноширинные** (Consolas / Courier New / DejaVuSansMono и т.п.).
+- Лаунчеры в архивах: `connect-check-gui.cmd`, `ConnectCheck-mac.command`, `connect-check-gui.sh`.
 - GUI: проверка обновлений после создания окна (не блокирует старт).
 
 ## [1.2.0] — 2026-07-30

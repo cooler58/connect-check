@@ -34,21 +34,15 @@ GUI — **только в корне `bin/`**. Остальные бинарни
 
 ## GUI
 
-GUI ищет `connect-check` / `probe-*` **в текущей рабочей папке** (`cwd` или `cwd/mac|linux|win`). Запускайте из корня распакованного архива (лаунчеры ниже делают `cd` сами).
+GUI сам находит CLI в соседней папке `mac/` / `linux/` / `win/` (как в release-архиве). Переменные окружения не нужны.
 
 ```bash
-# mac — из корня архива / bin/
-./ConnectCheck-mac.command
-# или: cd … && open ConnectCheck-mac.app   (cwd должен быть папкой с mac/)
-
-# linux
-./connect-check-gui.sh
-
-# windows — двойной клик
-connect-check-gui.cmd
+open bin/ConnectCheck-mac.app          # рядом должен быть bin/mac/
+./bin/connect-check-gui-linux          # рядом bin/linux/
+# Windows: connect-check-gui-win.exe рядом с win\
 ```
 
-Override: `CONNECT_CHECK_BIN_DIR` на каталог с CLI. Шрифт: `DejaVuSans.ttf` рядом, иначе системный mono.
+Шрифт: `DejaVuSans.ttf` рядом с пакетом, иначе системный mono.
 
 ## Когда что запускать
 

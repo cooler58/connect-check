@@ -89,9 +89,10 @@ endif
 # --- Windows: GUI только в корне bin/ ---
 WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
 WIN_CC  := x86_64-w64-mingw32-gcc
-WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(GLFW_WIN)/include $(VER_CFLAG) \
+# Windows GUI: GDI+ (без OpenGL/GLFW — portable на Win10 без GPU ICD)
+WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src $(VER_CFLAG) \
                -mcrtdll=msvcrt-os -static-libgcc
-WIN_LDFLAGS := -mwindows -L$(GLFW_WIN)/lib -lglfw3 -lopengl32 -lgdi32 -luser32 -lshell32 -lwinmm -lwininet
+WIN_LDFLAGS := -mwindows -lgdiplus -lshlwapi -lole32 -luuid -lgdi32 -luser32 -lshell32 -lwinmm -lwininet
 
 fetch-glfw-win:
 	@if [ -f "$(GLFW_WIN)/lib/libglfw3.a" ]; then \
@@ -106,7 +107,7 @@ fetch-glfw-win:
 	  echo "→ $(GLFW_WIN)"; \
 	fi
 
-package-win: fetch-glfw-win $(WIN_STAGED)
+package-win: $(WIN_STAGED)
 	@cp -f $(WIN_STAGED) bin/connect-check-gui-win.exe
 	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd 2>/dev/null || true
@@ -116,7 +117,7 @@ package-win: fetch-glfw-win $(WIN_STAGED)
 	@x86_64-w64-mingw32-objdump -p bin/connect-check-gui-win.exe 2>/dev/null | \
 	  awk '/DLL Name/{print "  " $$3}' | head -20
 
-$(WIN_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
+$(WIN_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_gdip.h
 	mkdir -p $(STAGING)/win
 	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_LDFLAGS)
 
@@ -189,11 +190,11 @@ package-all: package-mac package-win package-linux
 
 run: package
 ifeq ($(UNAME_S),Darwin)
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/mac) open bin/ConnectCheck-mac.app
+	open bin/ConnectCheck-mac.app
 else ifeq ($(UNAME_S),Linux)
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/linux) ./bin/connect-check-gui-linux
+	./bin/connect-check-gui-linux
 else
-	CONNECT_CHECK_BIN_DIR=$(abspath bin/win) ./bin/connect-check-gui-win.exe
+	./bin/connect-check-gui-win.exe
 endif
 
 clean:

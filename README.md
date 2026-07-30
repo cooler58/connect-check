@@ -37,7 +37,7 @@ make -f Makefile.gui package-all          # GUI → корень bin/
 ./bin/linux/connect-check -V
 
 open bin/ConnectCheck-mac.app             # GUI mac (CLI из bin/mac)
-CONNECT_CHECK_BIN_DIR=bin/linux ./bin/connect-check-gui-linux
+./bin/connect-check-gui-linux   # CLI из bin/linux/ рядом
 ```
 
 Рядом с CLI лежит **`resources.conf`**. Без файла — встроенные списки.

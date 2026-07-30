@@ -61,4 +61,4 @@
 - CLI: `bin/<os>/connect-check` (+ `.exe` на Windows)
 - пробы: `bin/<os>/probe-*`
 - GUI: `bin/ConnectCheck-mac.app`, `bin/connect-check-gui-linux`, `bin/connect-check-gui-win.exe`
-- env: `CONNECT_CHECK_BIN_DIR` → каталог CLI (`bin/mac` и т.д.)
+- GUI ищет CLI в соседней папке `mac|linux|win/` (раскладка архива)
