@@ -8,7 +8,7 @@ WINFLAGS := -O2 -Wall -D_WIN32_WINNT=0x0601 -Isrc -Ibuild -DCONNECT_CHECK_VERSIO
 WINLIBS  := -lwininet -lws2_32 -liphlpapi -lshell32
 EMBED_H  := build/top_domains_embed.h
 DOMAINS  := wordlists/top_domains.txt
-SRC      := src/connect-check.c
+SRC      := src/connect-check.c src/selfupdate.c
 BIN      := connect-check
 WINBIN   := connect-check.exe
 
@@ -22,12 +22,12 @@ $(EMBED_H): $(DOMAINS) scripts/embed_domains.py
 	mkdir -p build
 	python3 scripts/embed_domains.py $(DOMAINS) $(EMBED_H)
 
-$(BIN): $(SRC) $(EMBED_H) src/version.h VERSION
+$(BIN): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h VERSION
 	$(CC) $(CFLAGS) -pthread -o $@ $(SRC)
 
 win: $(WINBIN)
 
-$(WINBIN): $(SRC) $(EMBED_H) src/version.h VERSION
+$(WINBIN): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h VERSION
 	$(MINGW) $(WINFLAGS) -o $@ $(SRC) $(WINLIBS)
 
 clean:

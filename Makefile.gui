@@ -11,7 +11,7 @@
 UNAME_S := $(shell uname -s)
 ROOT    := $(CURDIR)
 TP      := $(ROOT)/third_party
-SRC     := gui/connect-check-gui.c
+SRC     := gui/connect-check-gui.c src/selfupdate.c
 FONT    := $(TP)/fonts/DejaVuSans.ttf
 GLFW_WIN ?= $(TP)/win
 VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
@@ -72,7 +72,7 @@ else
 	@echo "package-mac только на Darwin"; exit 1
 endif
 
-$(MAC_STAGED): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(MAC_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Darwin)
 	mkdir -p $(STAGING)/mac
 	$(CC) $(MAC_CFLAGS) -o $@ $(SRC) $(MAC_LDFLAGS)
@@ -90,7 +90,7 @@ endif
 WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
 WIN_CC  := x86_64-w64-mingw32-gcc
 WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(GLFW_WIN)/include $(VER_CFLAG)
-WIN_LDFLAGS := -mwindows -L$(GLFW_WIN)/lib -lglfw3 -lopengl32 -lgdi32 -luser32 -lshell32 -lwinmm
+WIN_LDFLAGS := -mwindows -L$(GLFW_WIN)/lib -lglfw3 -lopengl32 -lgdi32 -luser32 -lshell32 -lwinmm -lwininet
 
 fetch-glfw-win:
 	@if [ -f "$(GLFW_WIN)/lib/libglfw3.a" ]; then \
@@ -112,7 +112,7 @@ package-win: fetch-glfw-win $(WIN_STAGED)
 	@ls -lh bin/connect-check-gui-win.exe
 	@file bin/connect-check-gui-win.exe | sed 's|^|  |'
 
-$(WIN_STAGED): $(SRC) src/version.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
+$(WIN_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h $(GLFW_WIN)/lib/libglfw3.a
 	mkdir -p $(STAGING)/win
 	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_LDFLAGS)
 
@@ -130,7 +130,7 @@ package-linux-native: $(LINUX_STAGED)
 	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
 	@ls -lh bin/connect-check-gui-linux
 
-$(LINUX_STAGED): $(SRC) $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(LINUX_STAGED): $(SRC) src/version.h src/selfupdate.h $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Linux)
 	mkdir -p $(STAGING)/linux
 	$(CC) $(LINUX_CFLAGS) -o $@ $(SRC) $(LINUX_LDFLAGS)
@@ -154,7 +154,7 @@ else
 	      gcc pkg-config libglfw3-dev libgl1-mesa-dev >/dev/null; \
 	    mkdir -p build/gui/linux; \
 	    gcc -O2 -Wall -Ithird_party -Isrc -DCONNECT_CHECK_VERSION=\"$(VERSION)\" $$(pkg-config --cflags glfw3) \
-	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c \
+	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c src/selfupdate.c \
 	      $$(pkg-config --libs glfw3) -lGL -lm -ldl -lpthread -Wl,-rpath,\$$ORIGIN; \
 	    SO=$$(ldd build/gui/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
 	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then \

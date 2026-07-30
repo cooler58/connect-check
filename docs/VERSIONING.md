@@ -24,7 +24,9 @@
 4. Коммит: `release: vX.Y.Z — краткое why` (включая `bin/mac`, `bin/linux`, `bin/win`).
 5. Тег: `git tag -a vX.Y.Z -m "connect-check vX.Y.Z"`.
 6. Пуш: `git push origin main && git push origin vX.Y.Z`.
-7. GitHub Release: прикрепить `dist/connect-check-{linux,mac,win}-*-vX.Y.Z.*` (полный linux-пакет, не один файл).
+7. GitHub Release: прикрепить `dist/connect-check-{linux,mac,win}-*-X.Y.Z.*` и **`dist/SHA256SUMS`** (полный linux-пакет, не один файл).
+
+Автообновление клиентов: [`docs/UPDATE.md`](UPDATE.md).
 
 Каждая опубликованная версия должна уезжать на GitHub (ветка + тег). Не пушить «сырые» WIP-коммиты как релизные теги.
 

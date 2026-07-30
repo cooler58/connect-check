@@ -42,15 +42,18 @@ package: mac linux win
 # Архивы для GitHub Releases (не коммитятся — см. .gitignore *.zip / dist/)
 dist: package
 	mkdir -p dist
-	rm -f dist/connect-check-*-$(VERSION).* 2>/dev/null || true
+	rm -f dist/connect-check-*-$(VERSION).* dist/SHA256SUMS 2>/dev/null || true
 	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz \
 	  linux connect-check-gui-linux libglfw.so.3 DejaVuSans.ttf VERSION resources.conf
 	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz \
 	  mac ConnectCheck-mac.app VERSION resources.conf
 	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip \
 	  win connect-check-gui-win.exe DejaVuSans.ttf VERSION resources.conf
-	@ls -lh dist/connect-check-*-$(VERSION).*
-	@echo "dist/ готов — прикрепить к GitHub Release v$(VERSION)"
+	@cd dist && (command -v shasum >/dev/null && shasum -a 256 connect-check-*-$(VERSION).* > SHA256SUMS) || \
+	  (command -v sha256sum >/dev/null && sha256sum connect-check-*-$(VERSION).* > SHA256SUMS) || \
+	  { echo "Нет shasum/sha256sum — SHA256SUMS не создан"; exit 1; }
+	@ls -lh dist/connect-check-*-$(VERSION).* dist/SHA256SUMS
+	@echo "dist/ готов — прикрепить к GitHub Release v$(VERSION) (включая SHA256SUMS)"
 
 help:
 	@echo "make -f Makefile.package          — mac + linux + win в bin/"
@@ -93,7 +96,7 @@ ifeq ($(LINUX_CC),)
 endif
 	$(MAKE) -f Makefile.diagnose embed
 	mkdir -p bin/linux
-	$(LINUX_CC) $(LINUX_CFLAGS) -pthread -o bin/linux/connect-check src/connect-check.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -pthread -o bin/linux/connect-check src/connect-check.c src/selfupdate.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-quic src/probe-quic.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-battlenet src/probe-battlenet.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o bin/linux/probe-mqtt src/probe-mqtt.c

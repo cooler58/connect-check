@@ -2,6 +2,14 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.2.0] — 2026-07-30
+
+### Added
+- Автообновление с GitHub Releases: CLI `--check-update` / `--self-update`, в GUI баннер и кнопка «Обновить».
+- Модуль `src/selfupdate.c`: semver, download ассета ОС, проверка `SHA256SUMS`, staging + helper relaunch.
+- `make dist` пишет `dist/SHA256SUMS` для проверки целостности.
+- Документация: [`docs/UPDATE.md`](docs/UPDATE.md).
+
 ## [1.1.1] — 2026-07-28
 
 ### Changed

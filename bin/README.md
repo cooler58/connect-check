@@ -22,6 +22,8 @@ GUI — **только в корне `bin/`**. Остальные бинарни
 ./bin/mac/connect-check -V
 ./bin/linux/connect-check -y
 ./bin/win/connect-check.exe -y
+./bin/mac/connect-check --check-update
+./bin/mac/connect-check --self-update   # см. docs/UPDATE.md
 ```
 
 Списки: `resources.conf` (секции `[significant]`, `[games_tcp]`, `[games_https]`, `[ai]`, `[video]`, `[banks]`, `[infra_tcp]`, `[infra_https]`).

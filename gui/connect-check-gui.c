@@ -43,6 +43,7 @@
 #include "nuklear.h"
 #include "nuklear_glfw_gl2.h"
 #include "version.h"
+#include "selfupdate.h"
 
 #define LOG_LINE    768
 #define PATH_MAX_G  1024
@@ -98,6 +99,12 @@ static char url_buf[512] = "https://ya.ru/";
 static int url_interval = 5, url_rounds, url_follow;
 
 static int g_tab; /* 0 diagnose, 1 probes, 2 url */
+
+/* self-update */
+static int g_update_ready;
+static UpdateInfo g_update;
+static char g_update_err[256];
+static char g_update_banner[192];
 
 /* ---------- utils ---------- */
 
@@ -741,6 +748,89 @@ static void run_url(void) {
 #endif
 }
 
+static void update_check_startup(void) {
+    char err[256];
+    g_update_ready = 0;
+    g_update_err[0] = 0;
+    g_update_banner[0] = 0;
+    memset(&g_update, 0, sizeof g_update);
+    if (update_check(&g_update, err, sizeof err) != 0) {
+        snprintf(g_update_err, sizeof g_update_err, "%s", err);
+        log_add("update", err);
+        return;
+    }
+    if (update_semver_gt(g_update.version, CONNECT_CHECK_VERSION)) {
+        g_update_ready = 1;
+        snprintf(g_update_banner, sizeof g_update_banner,
+                 "Доступна %s (сейчас %s)", g_update.tag, CONNECT_CHECK_VERSION);
+        log_add("update", g_update_banner);
+        if (g_update.html_url[0])
+            log_add("update", g_update.html_url);
+    } else {
+        log_add("update", "версия актуальна");
+    }
+}
+
+static void do_self_update(void) {
+    char root[PATH_MAX_G], err[256];
+    char relaunch[PATH_MAX_G];
+    char *rargv[4];
+    int n = 0;
+
+    if (!g_update_ready) return;
+    update_detect_install_root(g_bindir[0] ? g_bindir : NULL, root, sizeof root);
+    log_add("update", root);
+    snprintf(g_status, sizeof g_status, "Обновление до %s…", g_update.tag);
+
+#if defined(__APPLE__)
+    {
+        char app[PATH_MAX_G];
+        path_join(app, sizeof app, root, "ConnectCheck-mac.app");
+        if (access(app, F_OK) == 0) {
+            snprintf(relaunch, sizeof relaunch, "/usr/bin/open");
+            rargv[n++] = relaunch;
+            rargv[n++] = app;
+            rargv[n] = NULL;
+        } else {
+            uint32_t sz = sizeof relaunch;
+            if (_NSGetExecutablePath(relaunch, &sz) != 0)
+                snprintf(relaunch, sizeof relaunch, "%s", "connect-check-gui");
+            rargv[n++] = relaunch;
+            rargv[n] = NULL;
+        }
+    }
+#elif defined(_WIN32)
+    {
+        char gui[PATH_MAX_G];
+        path_join(gui, sizeof gui, root, "connect-check-gui-win.exe");
+        if (GetFileAttributesA(gui) != INVALID_FILE_ATTRIBUTES)
+            snprintf(relaunch, sizeof relaunch, "%s", gui);
+        else if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
+            snprintf(relaunch, sizeof relaunch, "connect-check-gui-win.exe");
+        rargv[n++] = relaunch;
+        rargv[n] = NULL;
+    }
+#else
+    {
+        char gui[PATH_MAX_G];
+        path_join(gui, sizeof gui, root, "connect-check-gui-linux");
+        if (access(gui, X_OK) == 0)
+            snprintf(relaunch, sizeof relaunch, "%s", gui);
+        else
+            snprintf(relaunch, sizeof relaunch, "%s", "connect-check-gui-linux");
+        rargv[n++] = relaunch;
+        rargv[n] = NULL;
+    }
+#endif
+
+    log_add("update", "скачивание и замена пакета…");
+    if (update_apply(&g_update, root, relaunch, rargv, err, sizeof err) != 0) {
+        log_add("update", err);
+        snprintf(g_status, sizeof g_status, "Ошибка обновления");
+        return;
+    }
+}
+
 /* ---------- UI ---------- */
 
 static void ui_tab_diagnose(struct nk_context *ctx) {
@@ -832,6 +922,16 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         nk_label_colored(ctx, hdr, NK_TEXT_LEFT,
                          g_bindir[0] ? nk_rgb(40, 140, 60) : nk_rgb(180, 40, 40));
 
+        if (g_update_ready) {
+            nk_layout_row_begin(ctx, NK_STATIC, 30, 2);
+            nk_layout_row_push(ctx, (float)(width - 160));
+            nk_label_colored(ctx, g_update_banner, NK_TEXT_LEFT, nk_rgb(160, 100, 20));
+            nk_layout_row_push(ctx, 140);
+            if (nk_button_label(ctx, "Обновить"))
+                do_self_update();
+            nk_layout_row_end(ctx);
+        }
+
         nk_layout_row_dynamic(ctx, 28, 3);
         if (nk_button_label(ctx, g_tab == 0 ? "[ Диагностика ]" : "Диагностика")) g_tab = 0;
         if (nk_button_label(ctx, g_tab == 1 ? "[ Пробы ]" : "Пробы")) g_tab = 1;
@@ -887,6 +987,7 @@ int main(int argc, char **argv) {
     log_add("", "Connect Check GUI (Nuklear) " CONNECT_CHECK_VERSION);
     if (g_bindir[0]) log_add("", g_bindir);
     else log_add("", "задайте CONNECT_CHECK_BIN_DIR");
+    update_check_startup();
 
     glfwSetErrorCallback(error_callback);
     if (!glfwInit()) {

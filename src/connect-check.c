@@ -14,6 +14,7 @@
 #include <errno.h>
 
 #include "version.h"
+#include "selfupdate.h"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -4165,6 +4166,8 @@ static void usage(const char *argv0) {
         "  --domains FILE         свой список доменов (иначе файл или встроенный)\n"
         "  --resources FILE       списки ресурсов по группам (иначе resources.conf рядом)\n"
         "  --jobs N               параллельные пробы внутри этапа (по умолчанию %d, env CONNECT_CHECK_JOBS)\n"
+        "  --check-update         проверить GitHub Releases (exit 0 актуально, 2 есть новее, 1 ошибка)\n"
+        "  --self-update          скачать latest release и заменить пакет (см. docs/UPDATE.md)\n"
         "Клавиши на этапах: Enter — далее/запустить, Space — пропустить (без эха).\n",
         argv0, CONNECT_CHECK_VERSION, DEFAULT_JOBS);
 }
@@ -4185,6 +4188,7 @@ int main(int argc, char **argv) {
     char mt[256];
     int mt_n = 0;
     int flaky_ok = 0, flaky_fail = 0, flaky_sum = 0;
+    int opt_check_update = 0, opt_self_update = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -4213,6 +4217,8 @@ int main(int argc, char **argv) {
             printf("connect-check %s\n", CONNECT_CHECK_VERSION);
             return 0;
         }
+        else if (strcmp(argv[i], "--check-update") == 0) opt_check_update = 1;
+        else if (strcmp(argv[i], "--self-update") == 0) opt_self_update = 1;
         else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) opt_yes = 1;
         else if (strcmp(argv[i], "--dns-bulk") == 0) opt_force_dns_bulk = 1;
         else if (strcmp(argv[i], "--skip-dns-bulk") == 0) opt_skip_dns_bulk = 1;
@@ -4240,6 +4246,54 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 2;
         }
+    }
+
+    if (opt_check_update || opt_self_update) {
+        UpdateInfo ui;
+        char err[256];
+        char root[STR];
+        char relaunch[STR];
+        if (update_check(&ui, err, sizeof err) != 0) {
+            fprintf(stderr, "check-update: %s\n", err);
+            return 1;
+        }
+        printf("Локально: %s\n", CONNECT_CHECK_VERSION);
+        printf("GitHub latest: %s (%s)\n", ui.tag, ui.html_url);
+        if (ui.asset_name[0])
+            printf("Ассет: %s\n", ui.asset_name);
+        if (!update_semver_gt(ui.version, CONNECT_CHECK_VERSION)) {
+            printf("Уже актуальная версия.\n");
+            return 0;
+        }
+        printf("Доступно обновление: %s → %s\n", CONNECT_CHECK_VERSION, ui.version);
+        if (opt_check_update && !opt_self_update)
+            return 2;
+        /* --self-update */
+        update_detect_install_root(argv[0], root, sizeof root);
+        printf("Корень установки: %s\n", root);
+#ifdef _WIN32
+        if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
+            snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
+#else
+        {
+            char real[STR];
+            if (realpath(argv[0], real))
+                snprintf(relaunch, sizeof relaunch, "%s", real);
+            else
+                snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
+        }
+#endif
+        {
+            char *rargv[2];
+            rargv[0] = relaunch;
+            rargv[1] = NULL;
+            printf("Скачиваю и применяю обновление...\n");
+            if (update_apply(&ui, root, relaunch, rargv, err, sizeof err) != 0) {
+                fprintf(stderr, "self-update: %s\n", err);
+                return 1;
+            }
+        }
+        return 0; /* helper exits parent */
     }
 
 #ifdef _WIN32
