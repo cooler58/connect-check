@@ -2,6 +2,13 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [1.2.5] — 2026-07-31
+
+### Added
+- Игры: Twitch, Kick, loot.farm, HoYoverse / Genshin / HoYoLAB, PSN Store.
+- CDN этих сервисов: Twitch (jtvnw/usher/VOD), Kick files/images, HoYoverse webstatic/fastcdn/upload, PSN image/download, loot.farm tags/API, IVI thumbs.
+- Видео: Кинопоиск (home + video path).
+
 ## [1.2.4] — 2026-07-30
 
 ### Fixed

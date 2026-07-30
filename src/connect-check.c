@@ -2836,12 +2836,34 @@ static void resources_load_defaults(void) {
         {"Riot auth", "auth.riotgames.com", 443, 0},
         {"Xbox Live", "xboxlive.com", 443, 0},
         {"PlayStation", "www.playstation.com", 443, 0},
+        {"PSN Store", "store.playstation.com", 443, 0},
         {"EA / Origin", "www.ea.com", 443, 0},
         {"Ubisoft Connect", "www.ubisoft.com", 443, 0},
         {"Ubisoft Services", "public-ubiservices.ubi.com", 443, 0},
         {"Ubisoft CDN", "static2.cdn.ubi.com", 443, 0},
         {"GOG", "www.gog.com", 443, 0},
         {"Faceit", "api.faceit.com", 443, 0},
+        {"Twitch", "www.twitch.tv", 443, 1},
+        {"Twitch CDN", "static.twitchcdn.net", 443, 0},
+        {"Twitch static CDN", "static-cdn.jtvnw.net", 443, 1},
+        {"Twitch usher CDN", "usher.ttvnw.net", 443, 0},
+        {"Twitch VOD CDN", "vod-secure.twitch.tv", 443, 0},
+        {"Kick", "kick.com", 443, 1},
+        {"Kick files CDN", "files.kick.com", 443, 1},
+        {"Kick images CDN", "images.kick.com", 443, 0},
+        {"loot.farm", "loot.farm", 443, 0},
+        {"loot.farm tags CDN", "tags.loot.farm", 443, 0},
+        {"loot.farm API CDN", "cbcntvf.loot.farm", 443, 0},
+        {"HoYoverse", "www.hoyoverse.com", 443, 1},
+        {"Genshin Impact", "genshin.hoyoverse.com", 443, 1},
+        {"HoYoLAB", "www.hoyolab.com", 443, 0},
+        {"HoYoLAB API", "sg-public-api.hoyolab.com", 443, 0},
+        {"HoYoverse webstatic CDN", "webstatic.hoyoverse.com", 443, 1},
+        {"HoYoverse fastcdn", "fastcdn.hoyoverse.com", 443, 1},
+        {"HoYoverse upload CDN", "upload-static.hoyoverse.com", 443, 0},
+        {"PSN image CDN", "image.api.playstation.com", 443, 1},
+        {"PSN download CDN", "apollo2.dl.playstation.net", 443, 0},
+        {"IVI thumbs CDN", "thumbs.dfs.ivi.ru", 443, 0},
     };
     /* Selectel: ru-1 ≈ СПб (Дубровка), ru-7 ≈ Москва (Берзарина). SFTP :22 — публично у SPB. */
     static const struct { const char *name, *host; int port, crit; } itcp[] = {
@@ -2884,6 +2906,7 @@ static void resources_load_defaults(void) {
         {"Riot Games", "https://www.riotgames.com/"},
         {"Xbox", "https://www.xbox.com/"},
         {"PlayStation Network", "https://www.playstation.com/"},
+        {"PSN Store", "https://store.playstation.com/"},
         {"EA App", "https://www.ea.com/ea-app"},
         {"Ubisoft Services", "https://public-ubiservices.ubi.com/"},
         {"Ubisoft CDN", "https://static2.cdn.ubi.com/"},
@@ -2893,6 +2916,28 @@ static void resources_load_defaults(void) {
         {"Minecraft / Mojang", "https://www.minecraft.net/"},
         {"VK Play", "https://vkplay.ru/"},
         {"Lesta / Mir Tankov", "https://tanki.su/"},
+        {"Twitch", "https://www.twitch.tv/"},
+        {"Twitch static CDN",
+         "https://static-cdn.jtvnw.net/ttv-static-metadata/twitch_logo3.jpg"},
+        {"Twitch VOD CDN", "https://vod-secure.twitch.tv/"},
+        {"Kick", "https://kick.com/"},
+        {"Kick files CDN", "https://files.kick.com/"},
+        {"Kick images CDN", "https://images.kick.com/"},
+        {"loot.farm", "https://loot.farm/"},
+        {"loot.farm tags CDN", "https://tags.loot.farm/gtm.js"},
+        {"HoYoverse", "https://www.hoyoverse.com/"},
+        {"Genshin Impact", "https://genshin.hoyoverse.com/"},
+        {"HoYoLAB", "https://www.hoyolab.com/"},
+        {"HoYoverse webstatic CDN",
+         "https://webstatic.hoyoverse.com/dora/base/jquery-1.11.1.js"},
+        {"HoYoverse upload CDN",
+         "https://upload-static.hoyoverse.com/hk4e/upload/fb/common.jpg"},
+        {"PSN image CDN",
+         "https://image.api.playstation.com/vulcan/ap/rnd/202506/2509/"
+         "ec1eec85d9130210701491db769cb9874cc09f6512ebca20.png"},
+        {"IVI thumbs CDN",
+         "https://thumbs.dfs.ivi.ru/storage0/contents/d/d/"
+         "7b1fe439034a9da4bc07424e4fb5ec.jpg/10x10/?q=85"},
     };
     /* AI: только TCP :443 — HTTPS часто «умный» таймаут/DPI при живом connect. */
     static const struct { const char *name, *host; int port, crit; } ai[] = {
@@ -2930,6 +2975,7 @@ static void resources_load_defaults(void) {
         {"VK Видео", "https://vkvideo.ru/", "https://vkvideo.ru/sitemaps/sitemap-video-1.xml"},
         {"IVI", "https://www.ivi.ru/", "https://www.ivi.ru/watch/masha_i_medved"},
         {"Okko", "https://okko.tv/", "https://okko.tv/movie/avatar"},
+        {"Кинопоиск", "https://www.kinopoisk.ru/", "https://www.kinopoisk.ru/"},
         {"Rutube", "https://rutube.ru/", "https://rutube.ru/"},
     };
     static const struct { const char *cat, *name, *url; } banks[] = {
@@ -5426,7 +5472,7 @@ int main(int argc, char **argv) {
 
     /* Video hosts: homepage + video path (full «первое видео» — probe-video) */
     if (!opt_skip_video && stage_begin("Видео",
-                    "Яндекс Видео, VK Видео, IVI, Okko, Rutube — сайт и видео-путь")) {
+                    "Яндекс Видео, VK Видео, IVI, Okko, Кинопоиск, Rutube — сайт и видео-путь")) {
         int nv = g_nvideo;
         int vfail = 0;
         Check *outs = (Check *)calloc((size_t)nv, sizeof(Check));
@@ -5442,7 +5488,7 @@ int main(int argc, char **argv) {
         free(outs);
         if (vfail >= 3)
             add_finding("warning", "Видеохостинги недоступны",
-                        "Яндекс/VK/IVI/Okko/Rutube — проверьте DPI/DNS. "
+                        "Яндекс/VK/IVI/Okko/Кинопоиск/Rutube — проверьте DPI/DNS. "
                         "Детальный прогон: ./probe-video");
         stage_done();
     } else if (opt_skip_video) {
