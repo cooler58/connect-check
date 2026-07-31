@@ -2,6 +2,31 @@
 
 Формат: [Keep a Changelog](https://keepachangelog.com/). Версии — semver из файла `VERSION`.
 
+## [Unreleased]
+
+## [1.2.6] — 2026-07-31
+
+### Added
+- Этап **CDN / счётчики**: `yastatic.net` (HTML + asset с ya.ru, magic PNG) и `counter.yadro.ru` (GIF hit/logo) — подтверждение тела ответа, не только TCP.
+- Этап **Почта**: веб (Яндекс/Mail.ru/Gmail/Outlook/iCloud/Rambler/Proton) + SMTP/IMAP/POP3 (баннер `220`/`+OK` или TLS ServerHello на :465/:993/:995).
+- Этап **Значимые ресурсы (Белые списки МЦ)** (секция `[popular_ru]`): расширенный список; зарубежный контроль — этап **Зарубежные ресурсы** (`[significant]`).
+- Игры Lesta/Wargaming: Мир танков (+CDN), Мир кораблей / WoWs RU, War Thunder, Escape from Tarkov.
+- Roblox: TCP + rbxcdn (setup/CSS); раньше был только сайт в HTTPS.
+- Канарейки ASN: Cloudflare / Hetzner / DigitalOcean / OVH / GitHub в `[infra_*]`.
+- **Cloudflare 100KB canary** — детект throttle ≈16KB (ТСПУ / AS13335).
+- **Steam SDR UDP** — GetSDRConfig + UDP к relay (голос/матчмейкинг).
+- Этап **Гео / IX**: точки по странам + DE-CIX / AMS-IX / LINX / DATAIX / Eurasia Peering / HE LG (`[geo]`).
+
+### Changed
+- HTML-отчёт: крупно только **Сбои**; карточки **Внимание** и warning-выводы — свёрнуты; таблицы разделов без свёрток.
+- HTML-отчёт: короткий дисклеймер — не авторизованное заключение; проверки могут не проходить капчи/антиботы.
+- HTML-отчёт: кнопка **Скачать TXT проблемных узлов** (fail+warn) — имя, категория, IP, PORT, PROTO, SNI, URL.
+- HTML-отчёт: URL в допинфо проверки — кликабельная ссылка (`target=_blank`) + кнопка «открыть».
+- HTTPS-пробы сайтов: браузерные заголовки (Sec-Fetch / Accept / Chrome 138); антибот/WAF/капча → **OK** (хост жив), не FAIL.
+- HTTPS-пробы сайтов: скорость **стр+CDN** — HTML + выборка JS/CSS/img; частичная недоступность ассетов при живом HTML → **Внимание** (не Сбой); critical — только если канарейки yastatic/yadro тоже легли.
+- Связность/DNS: **Яндекс DNS**, кеширующие **НСДИ**, **AdGuard**; DoT — `common.dot.dns.yandex.net`, `dns.adguard-dns.com`.
+- Списки ресурсов: убраны дубли; порядок этапов: CDN → значимые МЦ → зарубежные → банки → почта → …
+
 ## [1.2.5] — 2026-07-31
 
 ### Added

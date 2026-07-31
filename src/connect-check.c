@@ -82,10 +82,13 @@ typedef struct {
 typedef struct {
     int ok;
     int code;
-    int ms;
+    int ms;         /* для multi-UA — среднее; иначе время пробы */
+    int xfer_ms;    /* время именно той пробы, что дала .bytes (для скорости) */
+    long bytes;     /* размер скачанного документа (после decompress) */
+    int antibot;    /* 1 = WAF/captcha/JS-challenge, хост отвечает */
     char redirect[STR];
     char error[STR];
-    char body[256];
+    char body[512]; /* префикс тела для детекта antibot */
 } HttpResult;
 
 static Check checks[MAX_CHECKS];
@@ -639,6 +642,10 @@ static const char *dot_sni_for(const char *host) {
         return "dns.google";
     if (strcmp(host, "9.9.9.9") == 0 || strcmp(host, "149.112.112.112") == 0)
         return "dns.quad9.net";
+    if (strcmp(host, "77.88.8.8") == 0 || strcmp(host, "77.88.8.1") == 0)
+        return "common.dot.dns.yandex.net";
+    if (strcmp(host, "94.140.14.14") == 0 || strcmp(host, "94.140.15.15") == 0)
+        return "dns.adguard-dns.com";
     return host;
 }
 
@@ -1097,6 +1104,236 @@ static void check_steam_cm(int *fail_n, char fail_names[][64], int fail_cap) {
         snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam CM");
 }
 
+/* UDP: send probe, wait for any datagram (Steam SDR relays often reply ~28 B). */
+static int udp_probe_any(const char *ip, int port, int timeout_ms, int *ms_out) {
+#ifdef _WIN32
+    SOCKET s;
+#else
+    int s;
+#endif
+    struct sockaddr_in sa;
+    unsigned char req[32], resp[256];
+    fd_set rset;
+    struct timeval tv;
+    long long t0;
+    int n;
+
+    if (ms_out) *ms_out = 0;
+    if (!ip || !ip[0] || port <= 0 || port > 65535) return 0;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) return 0;
+
+#ifdef _WIN32
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+#else
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) return 0;
+#endif
+    memset(req, 0, sizeof req);
+    req[0] = 0x00;
+    t0 = now_ms();
+    if (sendto(s, (const char *)req, 20, 0, (struct sockaddr *)&sa, sizeof sa) < 0) {
+#ifdef _WIN32
+        closesocket(s);
+#else
+        close(s);
+#endif
+        return 0;
+    }
+    FD_ZERO(&rset);
+#ifdef _WIN32
+    FD_SET(s, &rset);
+#else
+    FD_SET(s, &rset);
+#endif
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef _WIN32
+    n = select(0, &rset, NULL, NULL, &tv);
+#else
+    n = select(s + 1, &rset, NULL, NULL, &tv);
+#endif
+    if (n > 0) {
+#ifdef _WIN32
+        n = recvfrom(s, (char *)resp, sizeof resp, 0, NULL, NULL);
+#else
+        n = (int)recvfrom(s, resp, sizeof resp, 0, NULL, NULL);
+#endif
+        if (ms_out) *ms_out = (int)(now_ms() - t0);
+#ifdef _WIN32
+        closesocket(s);
+#else
+        close(s);
+#endif
+        return n > 0 ? 1 : 0;
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+    if (ms_out) *ms_out = (int)(now_ms() - t0);
+    return 0;
+}
+
+/*
+ * Steam Datagram Relay (UDP) — голос/матчмейкинг CS2/Dota.
+ * Список из GetSDRConfig; fallback — известные EU POP.
+ */
+static void check_steam_sdr(int *fail_n, char fail_names[][64], int fail_cap) {
+    char out[65536], detail[STR], ip[64];
+    char ips[8][64];
+    const char *labels[8];
+    int ports[8];
+    int n = 0, ok = 0, i, ms;
+
+    ip[0] = 0;
+    detail[0] = 0;
+    static const struct { const char *label, *ip; int port; } fallback[] = {
+        {"FRA", "155.133.226.68", 27015},
+        {"STO", "162.254.198.41", 27015},
+        {"WAW", "155.133.230.98", 27015},
+        {"AMS", "155.133.248.36", 27015},
+        {"VIE", "146.66.155.66", 27015},
+        {"LHR", "162.254.196.66", 27015},
+    };
+#ifdef _WIN32
+    const char *cmd =
+        "curl.exe -sS --max-time 12 "
+        "\"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730\" 2>nul";
+#else
+    const char *cmd =
+        CURL_SSL_ENV
+        "curl -sS --max-time 12 "
+        "'https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730' 2>/dev/null";
+#endif
+
+    out[0] = 0;
+    if (run_capture(cmd, out, sizeof out) == 0 && out[0] && strstr(out, "\"ipv4\"")) {
+        const char *p = out;
+        while (n < 6 && (p = strstr(p, "\"ipv4\"")) != NULL) {
+            int a, b, c, d;
+            p += 6;
+            while (*p && (*p < '0' || *p > '9')) p++;
+            if (sscanf(p, "%d.%d.%d.%d", &a, &b, &c, &d) == 4 &&
+                a >= 0 && a < 256 && b >= 0 && b < 256 &&
+                c >= 0 && c < 256 && d >= 0 && d < 256) {
+                snprintf(ips[n], sizeof ips[n], "%d.%d.%d.%d", a, b, c, d);
+                ports[n] = 27015;
+                labels[n] = "SDR";
+                n++;
+            }
+            if (*p) p++;
+        }
+    }
+    if (n == 0) {
+        for (i = 0; i < (int)(sizeof fallback / sizeof fallback[0]) && n < 6; i++) {
+            snprintf(ips[n], sizeof ips[n], "%s", fallback[i].ip);
+            ports[n] = fallback[i].port;
+            labels[n] = fallback[i].label;
+            n++;
+        }
+        add_check_ex("Игры", "Steam SDR (GetSDRConfig)", "warn",
+                     "GetSDRConfig недоступен — UDP к известным EU POP",
+                     "API часто режется; проверяем SDR UDP напрямую.",
+                     NULL,
+                     "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730",
+                     0);
+    }
+
+    for (i = 0; i < n; i++) {
+        char piece[96];
+        if (udp_probe_any(ips[i], ports[i], 1500, &ms)) {
+            ok++;
+            snprintf(piece, sizeof piece, "%s %s:%d %dms",
+                     labels[i] ? labels[i] : "SDR", ips[i], ports[i], ms);
+            if (!ip[0]) snprintf(ip, sizeof ip, "%s", ips[i]);
+        } else {
+            snprintf(piece, sizeof piece, "%s %s:%d —",
+                     labels[i] ? labels[i] : "SDR", ips[i], ports[i]);
+        }
+        if (detail[0]) {
+            size_t L = strlen(detail);
+            if (L + 2 < sizeof detail) { detail[L] = ','; detail[L + 1] = ' '; detail[L + 2] = 0; }
+        }
+        {
+            size_t L = strlen(detail);
+            snprintf(detail + L, sizeof detail - L, "%s", piece);
+        }
+    }
+
+    {
+        char sum[STR];
+        snprintf(sum, sizeof sum, "UDP ответ %d/%d · %s", ok, n, detail);
+        if (ok >= 2) {
+            add_check_ex("Игры", "Steam SDR UDP", "ok", sum, "",
+                         ip[0] ? ip : NULL,
+                         "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730", 0);
+        } else if (ok == 1) {
+            add_check_ex("Игры", "Steam SDR UDP", "warn", sum,
+                         "Мало ответов SDR — голос/матчмейкинг могут лагать (UDP-фильтр ТСПУ).",
+                         ip[0] ? ip : NULL,
+                         "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730", 0);
+        } else {
+            add_check_ex("Игры", "Steam SDR UDP", "fail", sum,
+                         "Нет UDP-ответов от Steam Datagram Relay — типичный дружеский огонь "
+                         "при фильтрации VoIP/VPN (Steam Voice / CS2 / Dota).",
+                         NULL,
+                         "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730", 0);
+            if (fail_n && *fail_n < fail_cap)
+                snprintf(fail_names[(*fail_n)++], 64, "%s", "Steam SDR");
+        }
+    }
+}
+
+static int http_download_bytes(const char *url, int timeout_sec, long *bytes_out, int *ms_out);
+static int http_fetch_text_ex(const char *url, char *buf, size_t buflen, int timeout_sec,
+                              int *ms_out, const char *cookie);
+
+/* Cloudflare ~16KB throttle canary (TSPU): request 100KB, see if cut early. */
+static void check_cloudflare_throttle(void) {
+    const char *url = "https://speed.cloudflare.com/__down?bytes=100000";
+    char detail[STR], rip[64], host[128];
+    long bytes = 0;
+    int ms = 0;
+
+    host_from_url(url, host, sizeof host);
+    rip[0] = 0;
+    if (host[0]) dns_resolve(host, rip, sizeof rip);
+
+    if (!http_download_bytes(url, 20, &bytes, &ms) || bytes <= 0) {
+        add_check_ex("Гео / IX", "Cloudflare 100KB canary", "fail",
+                     ms > 0 ? "0 байт / обрыв на старте" : "таймаут / нет ответа",
+                     "Нет загрузки с speed.cloudflare.com — блок/throttle CF или маршрут.",
+                     rip[0] ? rip : NULL, url, 0);
+        add_finding("warning", "Cloudflare недоступен",
+                    "Канарейка 100KB не скачалась. Часто ТСПУ режет AS13335 (в т.ч. лимит ~16KB).");
+        return;
+    }
+
+    snprintf(detail, sizeof detail, "%ld байт за %d ms (цель 100000)", bytes, ms);
+    if (bytes >= 80000) {
+        add_check_ex("Гео / IX", "Cloudflare 100KB canary", "ok", detail,
+                     "Полный ответ — нет типичного CF 16KB throttle.",
+                     rip[0] ? rip : NULL, url, 0);
+    } else if (bytes > 0 && bytes < 25000) {
+        add_check_ex("Гео / IX", "Cloudflare 100KB canary", "fail", detail,
+                     "Обрыв ≈16KB — классический throttle Cloudflare на ТСПУ "
+                     "(сайты за CF «открываются и виснут»).",
+                     rip[0] ? rip : NULL, url, 0);
+        add_finding("critical", "Похоже на throttle Cloudflare (~16KB)",
+                    "Скачано меньше 25KB из 100KB с speed.cloudflare.com. "
+                    "Типичный дружеский огонь ТСПУ по AS13335 — ломает тысячи сайтов на CF.");
+    } else {
+        add_check_ex("Гео / IX", "Cloudflare 100KB canary", "warn", detail,
+                     "Скачано частично — нестабильный маршрут или мягкий throttle.",
+                     rip[0] ? rip : NULL, url, 0);
+    }
+}
+
 /* ---------- HTTP ---------- */
 
 typedef struct {
@@ -1104,23 +1341,23 @@ typedef struct {
     const char *ua;
 } UaProfile;
 
-/* Desktop Win / non-Win, mobile, Smart TV / embed */
+/* Desktop Win / non-Win, mobile, Smart TV / embed — актуальный Chrome, меньше antibot */
 static const UaProfile UA_PROFILES[] = {
     {"win",
      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-     "Chrome/131.0.0.0 Safari/537.36"},
+     "Chrome/138.0.0.0 Safari/537.36"},
     {"mac",
      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/537.36 (KHTML, like Gecko) "
-     "Chrome/131.0.0.0 Safari/537.36"},
+     "Chrome/138.0.0.0 Safari/537.36"},
     {"android",
      "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
-     "Chrome/131.0.0.0 Mobile Safari/537.36"},
+     "Chrome/138.0.0.0 Mobile Safari/537.36"},
     {"tv",
      "Mozilla/5.0 (SMART-TV; Linux; Tizen 7.0) AppleWebKit/537.36 (KHTML, like Gecko) "
-     "Chrome/94.0.4606.65 TV Safari/537.36"},
+     "Chrome/120.0.0.0 TV Safari/537.36"},
     {"embed",
      "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) "
-     "Chrome/91.0.4472.114 Safari/537.36 CrKey/1.54.248666"},
+     "Chrome/120.0.0.0 Safari/537.36 CrKey/1.56.500000"},
 };
 #define N_UA_PROFILES ((int)(sizeof UA_PROFILES / sizeof UA_PROFILES[0]))
 
@@ -1128,22 +1365,688 @@ static const char *ua_default(void) {
     return UA_PROFILES[0].ua; /* Windows desktop */
 }
 
+/* Заголовки как у навигации Chrome — меньше JS-challenge / «бот» у WAF. */
+static const char *http_browser_hdrs_curl(void) {
+    return "-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,"
+           "image/avif,image/webp,image/apng,*/*;q=0.8' "
+           "-H 'Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7' "
+           "-H 'Cache-Control: no-cache' "
+           "-H 'Upgrade-Insecure-Requests: 1' "
+           "-H 'Sec-Fetch-Dest: document' "
+           "-H 'Sec-Fetch-Mode: navigate' "
+           "-H 'Sec-Fetch-Site: none' "
+           "-H 'Sec-Fetch-User: ?1' "
+           "-H 'sec-ch-ua: \"Chromium\";v=\"138\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"138\"' "
+           "-H 'sec-ch-ua-mobile: ?0' "
+           "-H 'sec-ch-ua-platform: \"Windows\"'";
+}
+
+#ifdef _WIN32
+static const char *http_browser_hdrs_wininet(void) {
+    return "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,"
+           "image/avif,image/webp,image/apng,*/*;q=0.8\r\n"
+           "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7\r\n"
+           "Cache-Control: no-cache\r\n"
+           "Upgrade-Insecure-Requests: 1\r\n"
+           "Sec-Fetch-Dest: document\r\n"
+           "Sec-Fetch-Mode: navigate\r\n"
+           "Sec-Fetch-Site: none\r\n"
+           "Sec-Fetch-User: ?1\r\n";
+}
+#endif
+
+/* Cloudflare / DDoS-Guard / Qrator / hCaptcha / типовой HTML 403. */
+static int body_looks_antibot(int code, const char *body) {
+    if (!body || !body[0]) {
+        return (code == 403 || code == 429 || code == 503) ? 1 : 0;
+    }
+    if (strstr(body, "cf-browser-verification") ||
+        strstr(body, "cf-challenge") ||
+        strstr(body, "_cf_chl") ||
+        strstr(body, "challenge-platform") ||
+        strstr(body, "Just a moment") ||
+        strstr(body, "Attention Required") ||
+        strstr(body, "Checking your browser") ||
+        strstr(body, "Enable JavaScript and cookies") ||
+        strstr(body, "managed_checking_msg") ||
+        strstr(body, "ddos-guard") ||
+        strstr(body, "DDoS-Guard") ||
+        strstr(body, "qrator") ||
+        strstr(body, "Qrator") ||
+        strstr(body, "hcaptcha") ||
+        strstr(body, "HCaptcha") ||
+        strstr(body, "recaptcha") ||
+        strstr(body, "g-recaptcha") ||
+        strstr(body, "geetest") ||
+        strstr(body, "Geetest") ||
+        strstr(body, "captcha-delivery") ||
+        strstr(body, "px-captcha") ||
+        strstr(body, "PerimeterX") ||
+        strstr(body, "Please enable JS") ||
+        strstr(body, "robot check") ||
+        strstr(body, "Access denied") ||
+        strstr(body, "error-code"))
+        return 1;
+    if ((code == 403 || code == 429 || code == 503) &&
+        (strstr(body, "<html") || strstr(body, "<!DOCTYPE") || strstr(body, "<!doctype")))
+        return 1;
+    return 0;
+}
+
+static void fmt_doc_speed(char *out, size_t n, long bytes, int ms) {
+    double kb, mbps;
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (bytes <= 0 || ms <= 0) return;
+    kb = bytes / 1024.0;
+    mbps = (bytes * 8.0) / (ms * 1000.0);
+    if (kb >= 1024.0)
+        snprintf(out, n, " · %.2f МБ · %.2f Мбит/с", kb / 1024.0, mbps);
+    else
+        snprintf(out, n, " · %.1f КБ · %.2f Мбит/с", kb, mbps);
+}
+
+/* ---------- страница + ассеты/CDN (не только HTML-stub) ---------- */
+
+#define PAGE_HTML_CAP   (384 * 1024)
+#define PAGE_ASSET_MAX  8
+#define PAGE_ASSET_TO   5   /* сек на ассет */
+#define PAGE_ASSET_BUDGET_MS 10000
+#define PAGE_FAIL_HOSTS 256
+#define PAGE_FAIL_ASSETS 320
+
+typedef struct {
+    long html_bytes;
+    long asset_bytes;
+    int n_try;
+    int n_ok;
+    int n_fail;
+    int n_cdn;       /* ассеты с другого хоста (CDN/static) */
+    int n_cdn_fail;
+    int wall_ms;     /* HTML fetch + ассеты */
+    char fail_hosts[PAGE_FAIL_HOSTS];   /* уникальные хосты через ", " */
+    char fail_assets[PAGE_FAIL_ASSETS]; /* короткие host/file … */
+    int n_fail_listed;
+} PageLoadStats;
+
+static int host_ieq(const char *a, const char *b);
+
+/* агрегация CDN-сбоев по всему прогону → finding */
+#define CDN_TRACK_HOSTS 32
+#define CDN_TRACK_SITES 48
+static struct { char host[80]; int n; } g_cdn_hosts[CDN_TRACK_HOSTS];
+static int g_cdn_nhosts;
+static char g_cdn_sites_fail[CDN_TRACK_SITES][64];
+static char g_cdn_sites_warn[CDN_TRACK_SITES][64];
+static int g_cdn_nfail_sites, g_cdn_nwarn_sites;
+/* сбои канареек этапа «CDN / счётчики» (yastatic/yadro); 0 = канарейки OK */
+static int g_cdn_canary_fail;
+
+static void pl_add_fail_asset(PageLoadStats *st, const char *host, const char *url) {
+    char piece[96];
+    const char *base;
+    char *q;
+    size_t left;
+
+    if (!st) return;
+    if (host && host[0]) {
+        if (!st->fail_hosts[0]) {
+            snprintf(st->fail_hosts, sizeof st->fail_hosts, "%s", host);
+        } else if (!strstr(st->fail_hosts, host)) {
+            left = sizeof st->fail_hosts - strlen(st->fail_hosts) - 1;
+            if (left > strlen(host) + 2) {
+                strncat(st->fail_hosts, ", ", left);
+                strncat(st->fail_hosts, host, left - 2);
+            }
+        }
+    }
+    if (!url || !url[0] || st->n_fail_listed >= 5) return;
+    base = strrchr(url, '/');
+    if (base && base[1] && host && host[0])
+        snprintf(piece, sizeof piece, "%s/%s", host, base + 1);
+    else if (host && host[0])
+        snprintf(piece, sizeof piece, "%s", host);
+    else
+        snprintf(piece, sizeof piece, "%s", url);
+    q = strchr(piece, '?');
+    if (q) *q = 0;
+    if ((int)strlen(piece) > 72) {
+        piece[69] = '.'; piece[70] = '.'; piece[71] = '.'; piece[72] = 0;
+    }
+    if (!st->fail_assets[0]) {
+        snprintf(st->fail_assets, sizeof st->fail_assets, "%s", piece);
+    } else {
+        left = sizeof st->fail_assets - strlen(st->fail_assets) - 1;
+        if (left > strlen(piece) + 2) {
+            strncat(st->fail_assets, "; ", left);
+            strncat(st->fail_assets, piece, left - 2);
+        }
+    }
+    st->n_fail_listed++;
+}
+
+static void cdn_track_host(const char *host) {
+    int i;
+    if (!host || !host[0]) return;
+    for (i = 0; i < g_cdn_nhosts; i++) {
+        if (host_ieq(g_cdn_hosts[i].host, host)) {
+            g_cdn_hosts[i].n++;
+            return;
+        }
+    }
+    if (g_cdn_nhosts >= CDN_TRACK_HOSTS) return;
+    snprintf(g_cdn_hosts[g_cdn_nhosts].host, sizeof g_cdn_hosts[0].host, "%s", host);
+    g_cdn_hosts[g_cdn_nhosts].n = 1;
+    g_cdn_nhosts++;
+}
+
+static void cdn_note_site(const char *site, const PageLoadStats *pl, int severe) {
+    const char *p, *next;
+    char host[80];
+    size_t n;
+
+    if (!site || !site[0] || !pl) return;
+    out_lock();
+    if (severe) {
+        if (g_cdn_nfail_sites < CDN_TRACK_SITES)
+            snprintf(g_cdn_sites_fail[g_cdn_nfail_sites++], 64, "%s", site);
+    } else {
+        if (g_cdn_nwarn_sites < CDN_TRACK_SITES)
+            snprintf(g_cdn_sites_warn[g_cdn_nwarn_sites++], 64, "%s", site);
+    }
+    p = pl->fail_hosts;
+    while (p && *p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        next = strstr(p, ", ");
+        n = next ? (size_t)(next - p) : strlen(p);
+        if (n >= sizeof host) n = sizeof host - 1;
+        memcpy(host, p, n);
+        host[n] = 0;
+        cdn_track_host(host);
+        p = next ? next + 2 : NULL;
+    }
+    out_unlock();
+}
+
+/* 1 = много ассетов (hint жёстче); 0 = частичный; -1 = нет сбоя.
+ * Статус проверки при живом HTML всегда warn — не fail (канарейки — этап CDN). */
+static int page_cdn_severity(const PageLoadStats *pl) {
+    int denom, nfail;
+    if (!pl) return -1;
+    nfail = pl->n_cdn_fail > 0 ? pl->n_cdn_fail : pl->n_fail;
+    if (nfail <= 0) return -1;
+    denom = pl->n_cdn > 0 ? pl->n_cdn : pl->n_try;
+    if (denom < 1) denom = nfail;
+    if ((denom >= 2 && nfail * 2 >= denom) || nfail >= 3 ||
+        (nfail == denom && denom >= 2))
+        return 1;
+    return 0;
+}
+
+static void fmt_cdn_asset_hint(char *hint, size_t hintlen, const char *note,
+                               const PageLoadStats *pl, int severe) {
+    const char *list;
+    int denom, nfail;
+    char prefix[STR];
+
+    if (!hint || !hintlen || !pl) return;
+    denom = pl->n_cdn > 0 ? pl->n_cdn : pl->n_try;
+    nfail = pl->n_cdn_fail > 0 ? pl->n_cdn_fail : pl->n_fail;
+    list = pl->fail_assets[0] ? pl->fail_assets :
+           (pl->fail_hosts[0] ? pl->fail_hosts : "—");
+    prefix[0] = 0;
+    if (note && note[0])
+        snprintf(prefix, sizeof prefix, "%s ", note);
+    if (severe) {
+        if (g_cdn_canary_fail == 0)
+            snprintf(hint, hintlen,
+                     "%sМного ассетов/CDN не отдались (%d/%d): %s. "
+                     "Канарейки yastatic/yadro при этом OK — скорее точечный URL, "
+                     "antibot или выборка, не падение CDN.",
+                     prefix, nfail, denom > 0 ? denom : nfail, list);
+        else
+            snprintf(hint, hintlen,
+                     "%sМного ассетов/CDN не отдались (%d/%d): %s — страница может "
+                     "открываться без стилей/JS. Смотрите этап «CDN / счётчики».",
+                     prefix, nfail, denom > 0 ? denom : nfail, list);
+    } else {
+        if (g_cdn_canary_fail == 0)
+            snprintf(hint, hintlen,
+                     "%sЧасть ассетов/CDN недоступна (%d/%d): %s "
+                     "(канарейки CDN OK — не считаем сбоем сайта).",
+                     prefix, nfail, denom > 0 ? denom : nfail, list);
+        else
+            snprintf(hint, hintlen,
+                     "%sЧасть ассетов/CDN недоступна (%d/%d): %s.",
+                     prefix, nfail, denom > 0 ? denom : nfail, list);
+    }
+}
+
+static void flush_cdn_findings(void) {
+    char common[STR], sites[LONGSTR], detail[STR], tx[LONGSTR];
+    int i, ncommon = 0, total;
+    size_t used;
+
+    total = g_cdn_nfail_sites + g_cdn_nwarn_sites;
+    if (total < 1) return;
+
+    common[0] = 0;
+    for (i = 0; i < g_cdn_nhosts; i++) {
+        if (g_cdn_hosts[i].n < 2) continue;
+        if (common[0]) {
+            used = strlen(common);
+            if (used + 2 + strlen(g_cdn_hosts[i].host) < sizeof common) {
+                strcat(common, ", ");
+                strcat(common, g_cdn_hosts[i].host);
+            }
+        } else {
+            snprintf(common, sizeof common, "%s", g_cdn_hosts[i].host);
+        }
+        ncommon++;
+    }
+
+    sites[0] = 0;
+    for (i = 0; i < g_cdn_nfail_sites && i < 12; i++) {
+        size_t left = sizeof sites - strlen(sites) - 1;
+        if (left < 8) break;
+        if (sites[0]) { strncat(sites, ", ", left); left = sizeof sites - strlen(sites) - 1; }
+        strncat(sites, g_cdn_sites_fail[i], left);
+    }
+    for (i = 0; i < g_cdn_nwarn_sites && i < 8; i++) {
+        size_t left = sizeof sites - strlen(sites) - 1;
+        if (left < 8) break;
+        if (sites[0]) { strncat(sites, ", ", left); left = sizeof sites - strlen(sites) - 1; }
+        strncat(sites, g_cdn_sites_warn[i], left);
+    }
+
+    /* Ассеты на страницах → finding уровня warning; critical только если
+     * канарейки CDN тоже легли и картина массовая. */
+    if (total >= 4 && ncommon > 0) {
+        snprintf(detail, sizeof detail, "Частичная недоступность CDN/ассетов (%d сайт%s)",
+                 total, total == 1 ? "" : (total < 5 ? "а" : "ов"));
+        if (g_cdn_canary_fail == 0)
+            snprintf(tx, sizeof tx,
+                     "На %d сайт%s HTML отвечает, но часть ресурсов страницы "
+                     "(стили/JS/CDN) не отдалась%s%s. Примеры: %s. "
+                     "Канарейки yastatic/yadro при этом OK — скорее точечные URL/"
+                     "antibot/выборка, не падение самих сайтов или CDN.",
+                     total,
+                     total == 1 ? "е" : "ах",
+                     ncommon > 0 ? ". Повторяющиеся хосты: " : "",
+                     ncommon > 0 ? common : "",
+                     sites[0] ? sites : "—");
+        else
+            snprintf(tx, sizeof tx,
+                     "На %d сайт%s HTML отвечает, но ресурсы страницы "
+                     "(стили/JS/CDN) часто не грузятся%s%s. Примеры: %s. "
+                     "Канарейки CDN тоже с проблемами — смотрите этап «CDN / счётчики».",
+                     total,
+                     total == 1 ? "е" : "ах",
+                     ncommon > 0 ? ". Повторяющиеся хосты: " : "",
+                     ncommon > 0 ? common : "",
+                     sites[0] ? sites : "—");
+        add_finding(g_cdn_canary_fail >= 2 && ncommon >= 2 ? "critical" : "warning",
+                    detail, tx);
+    } else if (total >= 2 && ncommon > 0) {
+        snprintf(detail, sizeof detail, "Частичная недоступность CDN/ассетов (%d)", total);
+        snprintf(tx, sizeof tx,
+                 "На части сайтов не отдались ассеты%s%s. Сайты: %s.%s",
+                 ncommon > 0 ? " (" : "",
+                 ncommon > 0 ? common : "",
+                 sites[0] ? sites : "—",
+                 g_cdn_canary_fail == 0
+                     ? " Канарейки CDN OK — не считаем общим сбоем."
+                     : " Проверьте этап «CDN / счётчики».");
+        add_finding("warning", detail, tx);
+    }
+}
+
+static int html_looks_like_page(const char *html) {
+    if (!html || !html[0]) return 0;
+    if (strstr(html, "<html") || strstr(html, "<HTML") ||
+        strstr(html, "<!DOCTYPE") || strstr(html, "<!doctype") ||
+        strstr(html, "<script") || strstr(html, "<link") ||
+        strstr(html, "<img") || strstr(html, "<head"))
+        return 1;
+    return 0;
+}
+
+static int host_looks_cdn(const char *host) {
+    if (!host || !host[0]) return 0;
+    if (strstr(host, "cdn") || strstr(host, "static") || strstr(host, "assets") ||
+        strstr(host, "akamai") || strstr(host, "cloudfront") || strstr(host, "fastly") ||
+        strstr(host, "yastatic") || strstr(host, "mzstatic") || strstr(host, "edgekey") ||
+        strstr(host, "edgecast") || strstr(host, "kxcdn") || strstr(host, "bunnycdn") ||
+        strstr(host, "jsdelivr") || strstr(host, "unpkg") || strstr(host, "cloudflare") ||
+        strstr(host, "googleusercontent") || strstr(host, "gstatic") ||
+        strstr(host, "fbcdn") || strstr(host, "twimg") || strstr(host, "rbxcdn") ||
+        strstr(host, "steamstatic") || strstr(host, "steamcontent") ||
+        strstr(host, "vkuser") || strstr(host, "userapi") || strstr(host, "mycdn") ||
+        strstr(host, "guce") || strstr(host, "s3.") || strstr(host, "storage."))
+        return 1;
+    return 0;
+}
+
+static int host_ieq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    for (; *a && *b; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    }
+    return *a == *b;
+}
+
+/* base — финальный URL страницы; ref — href/src (возможен //, /, относительный). */
+static int url_resolve(const char *base, const char *ref, char *out, size_t n) {
+    char scheme[16], origin[STR], dir[STR];
+    const char *p, *path;
+    size_t i;
+
+    if (!base || !ref || !out || n < 8) return 0;
+    out[0] = 0;
+    while (*ref && isspace((unsigned char)*ref)) ref++;
+    if (!ref[0] || ref[0] == '#' || starts_with(ref, "data:") ||
+        starts_with(ref, "javascript:") || starts_with(ref, "mailto:"))
+        return 0;
+    if (starts_with(ref, "http://") || starts_with(ref, "https://")) {
+        snprintf(out, n, "%s", ref);
+        return 1;
+    }
+
+    scheme[0] = 0;
+    if (starts_with(base, "https://")) { snprintf(scheme, sizeof scheme, "https"); p = base + 8; }
+    else if (starts_with(base, "http://")) { snprintf(scheme, sizeof scheme, "http"); p = base + 7; }
+    else return 0;
+
+    i = 0;
+    while (p[i] && p[i] != '/' && p[i] != '?' && p[i] != '#' && i + 1 < sizeof origin)
+        origin[i] = p[i], i++;
+    origin[i] = 0;
+    path = p + i; /* starts with / or empty */
+
+    if (starts_with(ref, "//")) {
+        snprintf(out, n, "%s:%s", scheme[0] ? scheme : "https", ref);
+        return 1;
+    }
+    if (ref[0] == '/') {
+        snprintf(out, n, "%s://%s%s", scheme, origin, ref);
+        return 1;
+    }
+
+    /* директория base (без query) */
+    {
+        char tmp[STR];
+        char *slash, *q;
+        snprintf(tmp, sizeof tmp, "%s", path[0] ? path : "/");
+        q = strchr(tmp, '?');
+        if (q) *q = 0;
+        q = strchr(tmp, '#');
+        if (q) *q = 0;
+        slash = strrchr(tmp, '/');
+        if (slash) slash[1] = 0;
+        else snprintf(tmp, sizeof tmp, "/");
+        snprintf(dir, sizeof dir, "%s", tmp);
+    }
+    snprintf(out, n, "%s://%s%s%s", scheme, origin, dir, ref);
+    return 1;
+}
+
+static int url_already(char urls[][STR], int n, const char *u) {
+    int i;
+    for (i = 0; i < n; i++)
+        if (strcmp(urls[i], u) == 0) return 1;
+    return 0;
+}
+
+/* Вытащить src/href из HTML; CDN/чужой хост — в начало списка. */
+static int html_collect_assets(const char *html, const char *base_url,
+                               char urls[][STR], int max_urls) {
+    const char *tags[] = {"script", "link", "img", "source", "video", "audio"};
+    char page_host[128];
+    char found[48][STR];
+    int pri[48];
+    int nf = 0, t, i, j, n_out = 0;
+
+    if (!html || !base_url || max_urls <= 0) return 0;
+    host_from_url(base_url, page_host, sizeof page_host);
+
+    for (t = 0; t < (int)(sizeof tags / sizeof tags[0]) && nf < 48; t++) {
+        const char *p = html;
+        size_t tlen = strlen(tags[t]);
+        while (nf < 48 && (p = strstr(p, tags[t])) != NULL) {
+            const char *tag_end, *attr, *q1, *q2;
+            char ref[STR], abs[STR], ahost[128];
+            int is_link = (strcmp(tags[t], "link") == 0);
+            /* убедиться что это начало тега <tag ...> */
+            if (p > html && p[-1] != '<') { p += tlen; continue; }
+            tag_end = strchr(p, '>');
+            if (!tag_end || (size_t)(tag_end - p) > 800) { p += tlen; continue; }
+            if (is_link) {
+                const char *chunk = p;
+                char tmp[900];
+                size_t clen = (size_t)(tag_end - p);
+                if (clen >= sizeof tmp) clen = sizeof tmp - 1;
+                memcpy(tmp, chunk, clen);
+                tmp[clen] = 0;
+                if (!strstr(tmp, "stylesheet") && !strstr(tmp, "preload") &&
+                    !strstr(tmp, "icon") && !strstr(tmp, "font")) {
+                    p = tag_end + 1;
+                    continue;
+                }
+            }
+            attr = NULL;
+            {
+                const char *s1 = strstr(p, "src=\"");
+                const char *s2 = strstr(p, "src='");
+                const char *h1 = strstr(p, "href=\"");
+                const char *h2 = strstr(p, "href='");
+                if (s1 && s1 < tag_end) attr = s1 + 5;
+                else if (s2 && s2 < tag_end) attr = s2 + 5;
+                else if (h1 && h1 < tag_end) attr = h1 + 6;
+                else if (h2 && h2 < tag_end) attr = h2 + 6;
+            }
+            if (!attr || attr >= tag_end) { p = tag_end + 1; continue; }
+            q1 = attr;
+            {
+                char quote = *(attr - 1);
+                q2 = strchr(q1, quote);
+            }
+            if (!q2 || q2 > tag_end || q2 <= q1) { p = tag_end + 1; continue; }
+            if ((size_t)(q2 - q1) >= sizeof ref) { p = tag_end + 1; continue; }
+            memcpy(ref, q1, (size_t)(q2 - q1));
+            ref[q2 - q1] = 0;
+            if (!url_resolve(base_url, ref, abs, sizeof abs)) { p = tag_end + 1; continue; }
+            /* обрезать query для дедупа картинок с cache-bust — оставляем полный URL */
+            if (url_already(found, nf, abs)) { p = tag_end + 1; continue; }
+            host_from_url(abs, ahost, sizeof ahost);
+            snprintf(found[nf], sizeof found[nf], "%s", abs);
+            pri[nf] = 0;
+            if (ahost[0] && page_host[0] && !host_ieq(ahost, page_host))
+                pri[nf] += 10;
+            if (host_looks_cdn(ahost)) pri[nf] += 5;
+            {
+                const char *ext = strrchr(abs, '.');
+                if (ext && (strncmp(ext, ".js", 3) == 0 || strncmp(ext, ".css", 4) == 0 ||
+                            strncmp(ext, ".woff", 5) == 0 || strncmp(ext, ".mjs", 4) == 0))
+                    pri[nf] += 2;
+            }
+            nf++;
+            p = tag_end + 1;
+        }
+    }
+
+    /* сортировка по приоритету (убыв.) — простой selection */
+    for (i = 0; i < nf; i++) {
+        for (j = i + 1; j < nf; j++) {
+            if (pri[j] > pri[i]) {
+                char tmpu[STR];
+                int tmpp = pri[i];
+                pri[i] = pri[j]; pri[j] = tmpp;
+                snprintf(tmpu, sizeof tmpu, "%s", found[i]);
+                snprintf(found[i], sizeof found[i], "%s", found[j]);
+                snprintf(found[j], sizeof found[j], "%s", tmpu);
+            }
+        }
+    }
+    for (i = 0; i < nf && n_out < max_urls; i++) {
+        snprintf(urls[n_out], STR, "%s", found[i]);
+        n_out++;
+    }
+    return n_out;
+}
+
+static int http_download_asset(const char *url, int timeout_sec, long *bytes_out, int *ms_out) {
+    long long t0 = now_ms();
+    long bytes = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (ms_out) *ms_out = 0;
+#ifdef _WIN32
+    {
+        HINTERNET hNet, hUrl;
+        DWORD flags, read;
+        char buf[8192];
+        DWORD to = (DWORD)timeout_sec * 1000;
+        hNet = InternetOpenA(ua_default(), INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+        if (!hNet) return 0;
+        InternetSetOptionA(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
+        InternetSetOptionA(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
+        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID |
+                INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+        hUrl = InternetOpenUrlA(hNet, url, NULL, 0, flags, 0);
+        if (!hUrl) { InternetCloseHandle(hNet); return 0; }
+        while (InternetReadFile(hUrl, buf, sizeof buf, &read) && read > 0) {
+            bytes += read;
+            if (bytes > 2 * 1024 * 1024) break;
+        }
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hNet);
+    }
+#else
+    {
+        char cmd[LONGSTR * 2], out[64];
+        snprintf(cmd, sizeof cmd,
+                 CURL_SSL_ENV
+                 "curl -k -sS -L --max-time %d --connect-timeout %d "
+                 "--max-filesize 2097152 -o /dev/null -w '%%{size_download}' "
+                 "-A '%s' "
+                 "-H 'Accept: */*' "
+                 "-H 'Sec-Fetch-Dest: empty' "
+                 "-H 'Sec-Fetch-Mode: no-cors' "
+                 "'%s' 2>/dev/null",
+                 timeout_sec, timeout_sec > 1 ? timeout_sec - 1 : timeout_sec,
+                 ua_default(), url);
+        if (run_capture(cmd, out, sizeof out) != 0) return 0;
+        str_trim(out);
+        bytes = atol(out);
+    }
+#endif
+    if (ms_out) *ms_out = (int)(now_ms() - t0);
+    if (bytes_out) *bytes_out = bytes;
+    return bytes > 0;
+}
+
+/*
+ * Скачать HTML страницы, вытащить JS/CSS/img (приоритет CDN), замерить суммарную скорость.
+ * page_url — исходный или финальный (после редиректа) URL.
+ * Возвращает 1 если удалось хоть что-то померить.
+ */
+static int page_load_with_assets(const char *page_url, PageLoadStats *st) {
+    char *html = NULL;
+    char assets[PAGE_ASSET_MAX][STR];
+    char page_host[128];
+    int code, html_ms = 0, n_assets, i;
+    long long t0;
+
+    if (!page_url || !st) return 0;
+    memset(st, 0, sizeof *st);
+    t0 = now_ms();
+
+    html = (char *)malloc(PAGE_HTML_CAP);
+    if (!html) return 0;
+    code = http_fetch_text_ex(page_url, html, PAGE_HTML_CAP, 12, &html_ms, NULL);
+    if (code < 200 || code >= 400 || !html[0]) {
+        free(html);
+        return 0;
+    }
+    (void)html_ms;
+    st->html_bytes = (long)strlen(html);
+    if (st->html_bytes < 64 || !html_looks_like_page(html) || body_looks_antibot(code, html)) {
+        st->wall_ms = (int)(now_ms() - t0);
+        free(html);
+        return 1; /* только HTML / challenge — без ассетов */
+    }
+
+    host_from_url(page_url, page_host, sizeof page_host);
+    n_assets = html_collect_assets(html, page_url, assets, PAGE_ASSET_MAX);
+    free(html);
+    html = NULL;
+
+    for (i = 0; i < n_assets; i++) {
+        char ahost[128];
+        long abytes = 0;
+        int ams = 0;
+        int is_cdn;
+        if ((int)(now_ms() - t0) > PAGE_ASSET_BUDGET_MS) break;
+        host_from_url(assets[i], ahost, sizeof ahost);
+        is_cdn = (ahost[0] && page_host[0] && !host_ieq(ahost, page_host)) ||
+                 host_looks_cdn(ahost);
+        st->n_try++;
+        if (is_cdn) st->n_cdn++;
+        if (http_download_asset(assets[i], PAGE_ASSET_TO, &abytes, &ams) && abytes > 0) {
+            st->n_ok++;
+            st->asset_bytes += abytes;
+        } else {
+            st->n_fail++;
+            if (is_cdn) st->n_cdn_fail++;
+            pl_add_fail_asset(st, ahost[0] ? ahost : "?", assets[i]);
+        }
+    }
+    st->wall_ms = (int)(now_ms() - t0);
+    if (st->wall_ms < 1) st->wall_ms = 1;
+    return 1;
+}
+
+static void fmt_page_speed(char *out, size_t n, const PageLoadStats *st) {
+    long tot;
+    double mb, mbps;
+    if (!out || n == 0 || !st) return;
+    out[0] = 0;
+    tot = st->html_bytes + st->asset_bytes;
+    if (tot <= 0 || st->wall_ms <= 0) return;
+    mb = tot / (1024.0 * 1024.0);
+    mbps = (tot * 8.0) / (st->wall_ms * 1000.0);
+    if (st->n_try > 0) {
+        if (mb >= 1.0)
+            snprintf(out, n, " · стр+CDN %.2f МБ · %.2f Мбит/с (ассеты %d/%d)",
+                     mb, mbps, st->n_ok, st->n_try);
+        else
+            snprintf(out, n, " · стр+CDN %.1f КБ · %.2f Мбит/с (ассеты %d/%d)",
+                     tot / 1024.0, mbps, st->n_ok, st->n_try);
+    } else {
+        fmt_doc_speed(out, n, st->html_bytes, st->wall_ms);
+    }
+}
+
 #ifdef _WIN32
 static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, const char *ua, int follow) {
     HttpResult r;
     HINTERNET hNet = NULL, hUrl = NULL;
     DWORD flags, code = 0, code_len = sizeof code, read;
-    char buf[4096];
+    char buf[8192];
     char redir[STR];
     char final_url[STR];
+    const char *hdrs;
     DWORD redir_len = sizeof redir;
     DWORD final_len = sizeof final_url;
     long long t0;
     DWORD to = (DWORD)timeout_sec * 1000;
+    long total = 0;
 
     memset(&r, 0, sizeof r);
     (void)insecure;
     t0 = now_ms();
+    hdrs = http_browser_hdrs_wininet();
 
     hNet = InternetOpenA(ua && ua[0] ? ua : ua_default(),
                          INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -1163,7 +2066,7 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
         flags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID |
                  INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
 
-    hUrl = InternetOpenUrlA(hNet, url, NULL, 0, flags, 0);
+    hUrl = InternetOpenUrlA(hNet, url, hdrs, (DWORD)strlen(hdrs), flags, 0);
     if (!hUrl) {
         DWORD err = GetLastError();
         snprintf(r.error, sizeof r.error, "ошибка WinINet %lu", (unsigned long)err);
@@ -1187,7 +2090,6 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
             if (strcmp(final_url, url) != 0)
                 snprintf(r.redirect, sizeof r.redirect, "%s", final_url);
         }
-        /* если follow, но всё ещё 3xx — цепочка оборвалась */
         if (r.code >= 300 && r.code < 400) {
             redir_len = sizeof redir;
             if (HttpQueryInfoA(hUrl, HTTP_QUERY_LOCATION, redir, &redir_len, NULL) && redir[0])
@@ -1195,18 +2097,28 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
         }
     }
 
-    if (InternetReadFile(hUrl, buf, sizeof buf - 1, &read) && read > 0) {
-        if (read > sizeof r.body - 1) read = (DWORD)(sizeof r.body - 1);
-        memcpy(r.body, buf, read);
-        r.body[read] = 0;
-        str_trim(r.body);
+    /* читаем весь документ (лимит 4 МБ) — для скорости и детекта antibot */
+    while (total < 4 * 1024 * 1024 &&
+           InternetReadFile(hUrl, buf, sizeof buf, &read) && read > 0) {
+        if (total < (long)(sizeof r.body - 1)) {
+            DWORD copy = read;
+            if (total + (long)copy > (long)(sizeof r.body - 1))
+                copy = (DWORD)((sizeof r.body - 1) - (size_t)total);
+            memcpy(r.body + total, buf, copy);
+            r.body[total + (long)copy] = 0;
+        }
+        total += (long)read;
     }
+    r.bytes = total;
+    str_trim(r.body);
+    r.antibot = body_looks_antibot(r.code, r.body);
 
     r.ms = (int)(now_ms() - t0);
+    r.xfer_ms = r.ms;
     if (follow)
-        r.ok = (r.code >= 200 && r.code < 400);
+        r.ok = (r.code >= 200 && r.code < 400) || r.antibot;
     else
-        r.ok = (r.code >= 200 && r.code < 400 && r.redirect[0] == 0);
+        r.ok = ((r.code >= 200 && r.code < 400) || r.antibot) && r.redirect[0] == 0;
     InternetCloseHandle(hUrl);
     InternetCloseHandle(hNet);
     return r;
@@ -1214,78 +2126,106 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
 #else
 static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, const char *ua, int follow) {
     HttpResult r;
-    char cmd[LONGSTR];
+    char cmd[LONGSTR * 2];
     char out[STR];
+    char tmp[] = "/tmp/netdiag_body_XXXXXX";
     char *p, *q;
     long long t0 = now_ms();
     const char *agent = ua && ua[0] ? ua : ua_default();
-    int nredir = 0;
+    int nredir = 0, fd;
+    FILE *bf;
+
     memset(&r, 0, sizeof r);
-    /* follow: идём по 301/302/… и смотрим финальный код + url_effective
-     * nofollow: как для captive — редирект сам по себе сигнал.
-     * Не форсируем --http1.1: госсайты/CDN часто лучше на HTTP/2 + TLS1.3. */
+    fd = mkstemp(tmp);
+    if (fd < 0) {
+        snprintf(r.error, sizeof r.error, "tmpfile failed");
+        return r;
+    }
+    close(fd);
+
+    /* follow: финальный код + документ; size_download = полный документ (gzip уже разжат).
+     * Браузерные Sec-Fetch / Accept — меньше challenge у CF/WAF. */
     snprintf(cmd, sizeof cmd,
              CURL_SSL_ENV
-             "curl -sS -o /tmp/netdiag_body.$$ -w "
-             "'%%{http_code}\\t%%{time_total}\\t%%{url_effective}\\t%%{num_redirects}\\t%%{redirect_url}' "
-             "--max-time %d --connect-timeout %d "
-             "-A '%s' "
+             "curl -sS -o '%s' -w "
+             "'%%{http_code}\\t%%{time_total}\\t%%{url_effective}\\t%%{num_redirects}\\t%%{redirect_url}\\t%%{size_download}' "
+             "--max-time %d --connect-timeout %d --max-filesize 4194304 "
+             "-A '%s' %s "
              "%s --max-redirs %d %s '%s' 2>/dev/null",
+             tmp,
              timeout_sec, timeout_sec > 2 ? timeout_sec - 1 : timeout_sec, agent,
+             http_browser_hdrs_curl(),
              follow ? "-L" : "",
              follow ? 8 : 0,
              insecure ? "-k" : "", url);
     if (run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
+        unlink(tmp);
         snprintf(r.error, sizeof r.error, "curl failed");
         r.ms = (int)(now_ms() - t0);
         return r;
     }
-    p = out;
-    r.code = atoi(p);
-    q = strchr(p, '\t');
-    if (q) {
-        double sec = atof(q + 1);
-        r.ms = (int)(sec * 1000 + 0.5);
-        /* url_effective */
-        q = strchr(q + 1, '\t');
-        if (q) {
-            char effective[STR];
-            char *q2 = strchr(q + 1, '\t');
-            size_t elen;
-            if (q2) {
-                elen = (size_t)(q2 - (q + 1));
-                if (elen >= sizeof effective) elen = sizeof effective - 1;
-                memcpy(effective, q + 1, elen);
-                effective[elen] = 0;
-                str_trim(effective);
-                nredir = atoi(q2 + 1);
-                /* redirect_url (nofollow Location) */
-                {
-                    char *q3 = strchr(q2 + 1, '\t');
-                    if (!follow && q3 && q3[1] && strcmp(q3 + 1, "0") != 0) {
-                        snprintf(r.redirect, sizeof r.redirect, "%s", q3 + 1);
-                        str_trim(r.redirect);
-                    }
-                }
-            } else {
-                snprintf(effective, sizeof effective, "%s", q + 1);
-                str_trim(effective);
-            }
-            if (follow) {
-                if (nredir > 0 && effective[0] && strcmp(effective, url) != 0)
-                    snprintf(r.redirect, sizeof r.redirect, "%s", effective);
-                /* финальный 3xx = цепочка не завершилась успешно */
-                if (r.code >= 300 && r.code < 400 && !r.redirect[0] && effective[0])
-                    snprintf(r.redirect, sizeof r.redirect, "%s", effective);
+    {
+        /* code \t time \t effective \t nredir \t redirect_url \t size_download */
+        char *fields[6];
+        int nf = 0;
+        char effective[STR];
+        p = out;
+        while (nf < 6) {
+            fields[nf++] = p;
+            q = strchr(p, '\t');
+            if (!q) break;
+            *q = 0;
+            p = q + 1;
+        }
+        r.code = atoi(fields[0]);
+        if (nf > 1) {
+            double sec = atof(fields[1]);
+            r.ms = (int)(sec * 1000 + 0.5);
+        } else {
+            r.ms = (int)(now_ms() - t0);
+        }
+        effective[0] = 0;
+        if (nf > 2) {
+            snprintf(effective, sizeof effective, "%s", fields[2]);
+            str_trim(effective);
+        }
+        if (nf > 3) nredir = atoi(fields[3]);
+        if (!follow && nf > 4 && fields[4][0] && strcmp(fields[4], "0") != 0) {
+            snprintf(r.redirect, sizeof r.redirect, "%s", fields[4]);
+            str_trim(r.redirect);
+        }
+        if (nf > 5) r.bytes = atol(fields[5]);
+        if (follow) {
+            if (nredir > 0 && effective[0] && strcmp(effective, url) != 0)
+                snprintf(r.redirect, sizeof r.redirect, "%s", effective);
+            if (r.code >= 300 && r.code < 400 && !r.redirect[0] && effective[0])
+                snprintf(r.redirect, sizeof r.redirect, "%s", effective);
+        }
+    }
+
+    bf = fopen(tmp, "rb");
+    if (bf) {
+        size_t n = fread(r.body, 1, sizeof r.body - 1, bf);
+        r.body[n] = 0;
+        str_trim(r.body);
+        if (r.bytes <= 0) {
+            long pos;
+            if (fseek(bf, 0, SEEK_END) == 0) {
+                pos = ftell(bf);
+                if (pos > 0) r.bytes = pos;
             }
         }
-    } else {
-        r.ms = (int)(now_ms() - t0);
+        fclose(bf);
     }
+    unlink(tmp);
+
+    if (r.ms <= 0) r.ms = (int)(now_ms() - t0);
+    r.xfer_ms = r.ms;
+    r.antibot = body_looks_antibot(r.code, r.body);
     if (follow)
-        r.ok = (r.code >= 200 && r.code < 400);
+        r.ok = (r.code >= 200 && r.code < 400) || r.antibot;
     else
-        r.ok = (r.code >= 200 && r.code < 400 && r.redirect[0] == 0);
+        r.ok = ((r.code >= 200 && r.code < 400) || r.antibot) && r.redirect[0] == 0;
     return r;
 }
 #endif
@@ -1354,6 +2294,9 @@ static HttpResult http_probe_agents(const char *url, int timeout_sec, int insecu
     int codes[16];
     int n = N_UA_PROFILES;
     int i, all_same = 1, any_ok = 0, sum_ms = 0, n_done = 0;
+    long long sum_bytes = 0;
+    long sum_xfer = 0;
+    int n_xfer = 0;
     size_t used = 0;
 
     memset(&best, 0, sizeof best);
@@ -1377,18 +2320,41 @@ static HttpResult http_probe_agents(const char *url, int timeout_sec, int insecu
             sum_ms += r.ms;
             n_done++;
         }
+        if (r.bytes > 0 && r.xfer_ms > 0 &&
+            ((r.code >= 200 && r.code < 400) || r.antibot)) {
+            sum_bytes += r.bytes;
+            sum_xfer += r.xfer_ms;
+            n_xfer++;
+        }
         if (r.code >= 200 && r.code < 500) any_ok = 1;
-        if (i == 0) best = r;
-        else if ((!best.code && r.code) ||
-                 (r.code >= 200 && r.code < 400 && !(best.code >= 200 && best.code < 400)) ||
-                 (r.code > 0 && best.code > 0 && r.ms < best.ms &&
-                  (r.code >= 200 && r.code < 400) == (best.code >= 200 && best.code < 400)))
+        if (i == 0) {
             best = r;
+        } else {
+            int r_good = (r.code >= 200 && r.code < 400) || r.antibot;
+            int b_good = (best.code >= 200 && best.code < 400) || best.antibot;
+            int r_clean = (r.code >= 200 && r.code < 400) && !r.antibot;
+            int b_clean = (best.code >= 200 && best.code < 400) && !best.antibot;
+            if ((!best.code && r.code) ||
+                (r_clean && !b_clean) ||
+                (r_good && !b_good) ||
+                (r_good && b_good && r.bytes > best.bytes) ||
+                (r_good && b_good && r.bytes == best.bytes && r.ms < best.ms))
+                best = r;
+        }
         if (i > 0 && codes[i] != codes[0]) all_same = 0;
     }
 
+    /* среднее время ответа по UA; скорость документа — средняя по успешным пробам;
+     * размер в отчёте — у лучшей (самой полной) пробы */
     if (n_done > 0)
         best.ms = sum_ms / n_done;
+    if (n_xfer > 0 && best.bytes > 0 && sum_xfer > 0) {
+        double avg_mbps = (sum_bytes * 8.0) / ((double)sum_xfer * 1000.0);
+        if (avg_mbps > 0.0) {
+            best.xfer_ms = (int)((best.bytes * 8.0) / (avg_mbps * 1000.0) + 0.5);
+            if (best.xfer_ms < 1) best.xfer_ms = 1;
+        }
+    }
 
     if (ua_summary && ua_summary_len > 8) {
         if (all_same && codes[0] > 0) {
@@ -2129,7 +3095,7 @@ static int dns_query_udp(const char *server, const char *name, int timeout_ms,
  */
 static void assess_system_dns(void) {
     const char *names[] = {"ya.ru", "dns.google", "cloudflare.com", "microsoft.com"};
-    const char *pub[] = {"8.8.8.8", "1.1.1.1", "77.88.8.8"};
+    const char *pub[] = {"8.8.8.8", "1.1.1.1", "77.88.8.8", "195.208.4.1"};
     int n = (int)(sizeof names / sizeof names[0]);
     int sys_ok = 0, pub_ok = 0, i, j;
     char ip[64], detail[STR], samples[256];
@@ -2173,8 +3139,9 @@ static void assess_system_dns(void) {
                       "Сеть/публичный DNS живы, сломан системный резолвер. "
                       "Проверки по именам пропущены — иначе ложные «ресурсы недоступны».");
             add_finding("critical", "Системный DNS не резолвит имена",
-                        "getaddrinfo не решает известные домены, при этом 8.8.8.8 / 1.1.1.1 / "
-                        "77.88.8.8 отвечают. Почините DNS на роутере/ОС (или отключите Private DNS). "
+                        "getaddrinfo не решает известные домены, при этом публичные резолверы "
+                        "(8.8.8.8 / 1.1.1.1 / Яндекс 77.88.8.8 / НСДИ) отвечают. "
+                        "Почините DNS на роутере/ОС (или отключите Private DNS). "
                         "Дальнейшие проверки сайтов/IoT/captive по hostname пропущены.");
         } else {
             add_check("DNS", "Резолв имён (система)", "fail", detail,
@@ -2308,6 +3275,189 @@ static int http_download_bytes(const char *url, int timeout_sec, long *bytes_out
     if (ms_out) *ms_out = (int)(now_ms() - t0);
     if (bytes_out) *bytes_out = bytes;
     return bytes > 0;
+}
+
+/*
+ * Скачать ответ и проверить «живость» по magic/размеру (не только TCP).
+ * magic: "PNG" | "GIF" | "HTML" | NULL (только min_bytes).
+ * Возврат: 1 = ок, 0 = нет.
+ */
+static int http_fetch_verify(const char *url, int timeout_sec,
+                             const char *magic, long min_bytes,
+                             long *bytes_out, int *code_out, int *ms_out) {
+    unsigned char head[16];
+    long bytes = 0;
+    int code = 0;
+    long long t0 = now_ms();
+    size_t head_n = 0;
+
+    if (bytes_out) *bytes_out = 0;
+    if (code_out) *code_out = 0;
+    if (ms_out) *ms_out = 0;
+    memset(head, 0, sizeof head);
+
+#ifdef _WIN32
+    {
+        HINTERNET hNet, hUrl;
+        DWORD flags, read;
+        char buf[8192];
+        DWORD to = (DWORD)timeout_sec * 1000;
+        hNet = InternetOpenA(ua_default(), INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+        if (!hNet) return 0;
+        InternetSetOptionA(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
+        InternetSetOptionA(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
+        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE |
+                INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+        hUrl = InternetOpenUrlA(hNet, url, NULL, 0, flags, 0);
+        if (!hUrl) { InternetCloseHandle(hNet); return 0; }
+        {
+            DWORD scode = 0, slen = sizeof scode;
+            if (HttpQueryInfoA(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &scode, &slen, NULL))
+                code = (int)scode;
+        }
+        while (InternetReadFile(hUrl, buf, sizeof buf, &read) && read > 0) {
+            if (head_n < sizeof head) {
+                size_t copy = read;
+                if (head_n + copy > sizeof head) copy = sizeof head - head_n;
+                memcpy(head + head_n, buf, copy);
+                head_n += copy;
+            }
+            bytes += read;
+            if (bytes > 2 * 1024 * 1024) break;
+        }
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hNet);
+    }
+#else
+    {
+        char cmd[LONGSTR * 2], meta[64];
+        char tmp[] = "/tmp/netdiag_canary_XXXXXX";
+        FILE *f;
+        int fd;
+        fd = mkstemp(tmp);
+        if (fd < 0) return 0;
+        close(fd);
+        snprintf(cmd, sizeof cmd,
+                 CURL_SSL_ENV
+                 "curl -k -sS -L --max-time %d --max-filesize 2097152 "
+                 "-o '%s' -w '%%{http_code}\\t%%{size_download}' '%s' 2>/dev/null",
+                 timeout_sec, tmp, url);
+        if (run_capture(cmd, meta, sizeof meta) != 0) {
+            unlink(tmp);
+            return 0;
+        }
+        {
+            char *tab = strchr(meta, '\t');
+            code = atoi(meta);
+            if (tab) bytes = atol(tab + 1);
+        }
+        f = fopen(tmp, "rb");
+        if (f) {
+            head_n = fread(head, 1, sizeof head, f);
+            if (bytes <= 0) {
+                if (fseek(f, 0, SEEK_END) == 0) {
+                    long pos = ftell(f);
+                    if (pos > 0) bytes = pos;
+                }
+            }
+            fclose(f);
+        }
+        unlink(tmp);
+    }
+#endif
+    if (ms_out) *ms_out = (int)(now_ms() - t0);
+    if (bytes_out) *bytes_out = bytes;
+    if (code_out) *code_out = code;
+    if (code > 0 && (code < 200 || code >= 400)) return 0;
+    if (min_bytes > 0 && bytes < min_bytes) return 0;
+    if (magic && magic[0]) {
+        if (strcmp(magic, "PNG") == 0) {
+            if (head_n < 8 || head[0] != 0x89 || head[1] != 'P' || head[2] != 'N' || head[3] != 'G')
+                return 0;
+        } else if (strcmp(magic, "GIF") == 0) {
+            if (head_n < 6 || memcmp(head, "GIF8", 4) != 0) return 0;
+        } else if (strcmp(magic, "HTML") == 0) {
+            int ok = 0;
+            size_t i;
+            for (i = 0; i + 4 < head_n; i++) {
+                if ((head[i] == '<' && (head[i + 1] == '!' || head[i + 1] == 'h' || head[i + 1] == 'H')) ||
+                    (head[i] == '<' && head[i + 1] == 'H' && head[i + 2] == 'T')) {
+                    ok = 1; break;
+                }
+            }
+            if (!ok && bytes >= min_bytes && min_bytes >= 200) ok = 1; /* крупный HTML без BOM в head */
+            if (!ok) return 0;
+        }
+    }
+    return bytes > 0;
+}
+
+/* Баннер почтового протокола или TLS ClientHello на SMTPS/IMAPS/POP3S.
+ * kind: "smtp" | "imap" | "pop3" | "tls"
+ * Возврат: 2 = баннер/TLS ок, 1 = TCP открыт без баннера, 0 = закрыт. */
+static int mail_proto_probe(const char *host, int port, const char *kind, int use_tls,
+                            int timeout_ms, int *ms_out, char *banner_out, size_t banner_len) {
+    net_sock s;
+    long long t0 = now_ms();
+    unsigned char buf[256];
+    int n, rc = 0;
+
+    if (ms_out) *ms_out = 0;
+    if (banner_out && banner_len) banner_out[0] = 0;
+    s = tcp_connect_sock(host, port, timeout_ms);
+    if (s == NET_SOCK_BAD) {
+        if (ms_out) *ms_out = (int)(now_ms() - t0);
+        return 0;
+    }
+    if (use_tls) {
+        if (tls_clienthello_sni(s, host, timeout_ms))
+            rc = 2;
+        else
+            rc = 1;
+        net_sock_close(s);
+        if (ms_out) *ms_out = (int)(now_ms() - t0);
+        if (banner_out && banner_len && rc == 2)
+            snprintf(banner_out, banner_len, "TLS ServerHello OK (SNI %s)", host);
+        return rc;
+    }
+    n = net_wait_recv(s, buf, sizeof buf - 1, timeout_ms);
+    net_sock_close(s);
+    if (ms_out) *ms_out = (int)(now_ms() - t0);
+    if (n <= 0) return 1;
+    buf[n] = 0;
+    {
+        char *p;
+        for (p = (char *)buf; *p; p++)
+            if (*p == '\r' || *p == '\n') { *p = 0; break; }
+    }
+    if (banner_out && banner_len)
+        snprintf(banner_out, banner_len, "%s", (char *)buf);
+    if (kind && strcmp(kind, "smtp") == 0 && strncmp((char *)buf, "220", 3) == 0) return 2;
+    if (kind && strcmp(kind, "imap") == 0 && strstr((char *)buf, "OK")) return 2;
+    if (kind && strcmp(kind, "pop3") == 0 && strncmp((char *)buf, "+OK", 3) == 0) return 2;
+    if (kind && strcmp(kind, "tls") == 0) return 1;
+    return 1;
+}
+
+static int extract_yastatic_asset(const char *html, char *url_out, size_t n) {
+    const char *p;
+    if (!html || !url_out || n < 32) return 0;
+    url_out[0] = 0;
+    p = html;
+    while ((p = strstr(p, "https://yastatic.net/")) != NULL) {
+        size_t i = 0;
+        while (p[i] && p[i] != '"' && p[i] != '\'' && p[i] != ' ' &&
+               p[i] != ')' && p[i] != '<' && p[i] != '>' && i + 1 < n) {
+            url_out[i] = p[i];
+            i++;
+        }
+        url_out[i] = 0;
+        if (strstr(url_out, ".png") || strstr(url_out, ".jpg") || strstr(url_out, ".js") ||
+            strstr(url_out, ".css") || strstr(url_out, ".svg") || strstr(url_out, ".woff"))
+            return 1;
+        p += 22;
+    }
+    return 0;
 }
 
 /* Скачать тело ответа (до buflen-1). cookie — опционально ("a=b; c=d"). Возвращает HTTP-код или 0. */
@@ -2666,7 +3816,7 @@ static int load_domains(char domains[][128], int maxn, int *used_embed) {
 
 /* ---------- resources.conf (группы URL/endpoints) ---------- */
 
-#define MAX_RES      96
+#define MAX_RES      160
 #define RES_NAME     128
 #define RES_URL      256
 #define RES_NOTE     256
@@ -2706,6 +3856,8 @@ typedef struct {
 
 static ResSig g_sig[MAX_RES];
 static int g_nsig;
+static ResSig g_ru[MAX_RES];
+static int g_nru;
 static ResTcp g_game_tcp[MAX_RES];
 static int g_ngame_tcp;
 static ResTcp g_infra_tcp[MAX_RES];
@@ -2714,6 +3866,8 @@ static ResHttp g_infra_https[MAX_RES];
 static int g_ninfra_https;
 static ResHttp g_game_https[MAX_RES];
 static int g_ngame_https;
+static ResHttp g_geo[MAX_RES];
+static int g_ngeo;
 static ResTcp g_ai[MAX_RES];
 static int g_nai;
 static ResVideo g_video[MAX_RES];
@@ -2741,48 +3895,105 @@ static int split_pipe(char *line, char **fields, int maxf) {
 }
 
 static void resources_load_defaults(void) {
+    static const struct { const char *name, *url, *note; int eb; } ru[] = {
+        /* Значимые ресурсы (Белые списки МЦ) */
+        {"Госуслуги", "https://www.gosuslugi.ru/", "", 0},
+        {"Президент РФ", "http://www.kremlin.ru/",
+         "HTTP; :443 часто недоступен", 0},
+        {"Правительство РФ", "http://government.ru/",
+         "HTTP; :443 часто недоступен", 0},
+        {"Госдума", "http://duma.gov.ru/",
+         "HTTP; :443 часто недоступен", 0},
+        {"Совет Федерации", "https://www.council.gov.ru/", "", 0},
+        {"ЦБ РФ", "https://www.cbr.ru/", "", 0},
+        {"Почта России", "https://www.pochta.ru/", "", 0},
+        {"Честный знак", "https://crpt.ru/", "", 0},
+        {"Платёжная система Мир", "https://vamprivet.ru/", "", 0},
+        {"ГИС ЖКХ", "https://dom.gosuslugi.ru/", "", 0},
+        {"Объясняем.рф", "https://xn--90aivcdt6dxbc.xn--p1ai/", "", 0},
+        {"Движение первых", "https://xn--90acagbhgpca7c8c7f.xn--p1ai/", "", 0},
+        {"Московская биржа", "https://www.moex.com/", "", 0},
+        {"МВД", "https://xn--b1aew.xn--p1ai/", "", 0},
+        {"МЧС", "https://www.mchs.gov.ru/", "", 0},
+        {"ФНС", "https://www.nalog.gov.ru/", "", 0},
+        {"Роскачество", "https://rskrf.ru/", "", 0},
+        {"Яндекс (yandex.ru)", "https://yandex.ru/", "", 0},
+        {"Яндекс (ya.ru)", "https://ya.ru/", "", 0},
+        {"Яндекс Карты", "https://yandex.ru/maps/", "", 0},
+        {"Яндекс Маркет", "https://market.yandex.ru/", "", 0},
+        {"Яндекс Музыка", "https://music.yandex.ru/", "", 0},
+        {"Яндекс Go", "https://go.yandex/", "", 0},
+        {"Яндекс Еда", "https://eda.yandex.ru/", "", 0},
+        {"Яндекс Лавка", "https://lavka.yandex.ru/", "", 0},
+        {"VK (vk.com)", "https://vk.com/", "", 0},
+        {"VK (vk.ru)", "https://vk.ru/", "", 0},
+        {"VK Видео", "https://vkvideo.ru/", "", 0},
+        {"OK.ru", "https://ok.ru/", "", 0},
+        {"Mail.ru", "https://mail.ru/", "", 0},
+        {"MAX", "https://max.ru/", "", 0},
+        {"Дзен", "https://dzen.ru/", "", 0},
+        {"Rutube", "https://rutube.ru/", "", 0},
+        {"IVI", "https://www.ivi.ru/", "", 0},
+        {"Okko", "https://okko.tv/", "", 0},
+        {"Premier", "https://premier.one/", "", 0},
+        {"Кинопоиск", "https://www.kinopoisk.ru/", "", 0},
+        {"РИА Новости", "https://ria.ru/", "", 0},
+        {"ТАСС", "https://tass.ru/", "", 0},
+        {"РБК", "https://www.rbc.ru/", "", 0},
+        {"Лента.ру", "https://lenta.ru/", "", 0},
+        {"Комсомольская правда", "https://www.kp.ru/", "", 0},
+        {"Газета.ру", "https://www.gazeta.ru/", "", 0},
+        {"Известия", "https://iz.ru/", "", 0},
+        {"Аргументы и факты", "https://aif.ru/", "", 0},
+        {"Российская газета", "https://rg.ru/", "", 0},
+        {"Ведомости", "https://www.vedomosti.ru/", "", 0},
+        {"МК", "https://www.mk.ru/", "", 0},
+        {"Коммерсантъ", "https://www.kommersant.ru/", "", 0},
+        {"Первый канал", "https://www.1tv.ru/", "", 0},
+        {"НТВ", "https://www.ntv.ru/", "", 0},
+        {"RT", "https://russian.rt.com/", "", 0},
+        {"Матч ТВ", "https://matchtv.ru/", "", 0},
+        {"Рувики", "https://ru.ruwiki.ru/", "", 0},
+        {"Ozon", "https://www.ozon.ru/", "", 0},
+        {"Wildberries", "https://napi.wildberries.ru/",
+         "главная www — antibot/JS; проба через napi API", 0},
+        {"Мегамаркет", "https://megamarket.ru/", "", 0},
+        {"Avito", "https://www.avito.ru/", "", 0},
+        {"Домклик", "https://domclick.ru/", "", 0},
+        {"HH.ru", "https://hh.ru/", "", 0},
+        {"Детский мир", "https://www.detmir.ru/", "", 0},
+        {"РЖД", "https://www.rzd.ru/", "", 0},
+        {"Туту.ру", "https://www.tutu.ru/", "", 0},
+        {"2ГИС", "https://mapgl.2gis.com/api/js",
+         "главная 2gis.ru — antibot/TLS; проба MapGL API", 0},
+        {"Такси Максим", "https://taximaxim.ru/", "", 0},
+        {"Делимобиль", "https://delimobil.ru/", "", 0},
+        {"Ситидрайв", "https://citydrive.ru/", "", 0},
+        {"Деловые линии", "https://www.dellin.ru/", "", 0},
+        {"Аэрофлот", "https://www.aeroflot.ru/", "", 0},
+        {"ВкусВилл", "https://vkusvill.ru/", "", 0},
+        {"Ашан", "https://www.auchan.ru/", "", 0},
+        {"Самокат", "https://samokat.ru/", "", 0},
+        {"СДЭК", "https://www.cdek.ru/", "", 0},
+        {"Магнит", "https://magnit.ru/", "", 0},
+        {"Пятёрочка", "https://5ka.ru/", "", 0},
+        {"Лента", "https://lenta.com/", "", 0},
+        {"МТС", "https://www.mts.ru/", "", 0},
+        {"МегаФон", "https://www.megafon.ru/", "", 0},
+        {"Билайн", "https://www.beeline.ru/", "", 0},
+        {"t2", "https://t2.ru/", "", 0},
+        {"Ростелеком", "https://www.rt.ru/", "", 0},
+        {"Gismeteo", "https://www.gismeteo.ru/", "", 0},
+        {"Россети", "https://www.rosseti.ru/", "", 0},
+        {"СКБ Контур", "https://kontur.ru/", "", 0},
+        {"1С", "https://1c.ru/", "", 0},
+        {"КХЛ", "https://www.khl.ru/", "", 0},
+        {"Медси", "https://medsi.ru/", "", 0},
+        {"Добро.рф", "https://dobro.ru/", "", 0},
+        {"ЛизаАлерт", "https://lizaalert.org/", "", 0},
+    };
     static const struct { const char *name, *url, *note; int eb; } sig[] = {
-        /* РФ: топ из «белого списка» Минцифры */
-        {"Госуслуги", "https://www.gosuslugi.ru/", "белый список Минцифры", 0},
-        {"Президент РФ", "http://www.kremlin.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
-        {"Правительство РФ", "http://government.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
-        {"Госдума", "http://duma.gov.ru/", "белый список Минцифры (HTTP; :443 часто недоступен)", 0},
-        {"ЦБ РФ", "https://www.cbr.ru/", "белый список Минцифры", 0},
-        {"Почта России", "https://www.pochta.ru/", "белый список Минцифры", 0},
-        {"Честный знак", "https://crpt.ru/", "белый список Минцифры (ЦРПТ)", 0},
-        {"Платёжная система Мир", "https://vamprivet.ru/", "белый список Минцифры (НСПК/Мир)", 0},
-        {"Яндекс (yandex.ru)", "https://yandex.ru/", "белый список Минцифры", 0},
-        {"Яндекс (ya.ru)", "https://ya.ru/", "белый список Минцифры", 0},
-        {"Яндекс Карты", "https://yandex.ru/maps/", "белый список Минцифры", 0},
-        {"Яндекс Маркет", "https://market.yandex.ru/", "белый список Минцифры", 0},
-        {"VK (vk.com)", "https://vk.com/", "белый список Минцифры", 0},
-        {"VK (vk.ru)", "https://vk.ru/", "белый список Минцифры", 0},
-        {"OK.ru", "https://ok.ru/", "белый список Минцифры", 0},
-        {"Mail.ru", "https://mail.ru/", "белый список Минцифры", 0},
-        {"MAX", "https://max.ru/", "белый список Минцифры", 0},
-        {"Дзен", "https://dzen.ru/", "белый список Минцифры", 0},
-        {"Rutube", "https://rutube.ru/", "белый список Минцифры", 0},
-        {"IVI", "https://www.ivi.ru/", "белый список Минцифры", 0},
-        {"Okko", "https://okko.tv/", "белый список Минцифры", 0},
-        {"Premier", "https://premier.one/", "белый список Минцифры", 0},
-        {"Кинопоиск", "https://www.kinopoisk.ru/", "белый список Минцифры", 0},
-        {"РИА Новости", "https://ria.ru/", "белый список Минцифры", 0},
-        {"ТАСС", "https://tass.ru/", "белый список Минцифры", 0},
-        {"РБК", "https://www.rbc.ru/", "белый список Минцифры", 0},
-        {"Лента.ру", "https://lenta.ru/", "белый список Минцифры", 0},
-        {"Рувики", "https://ru.ruwiki.ru/", "белый список Минцифры", 0},
-        {"Ozon", "https://www.ozon.ru/", "белый список Минцифры", 0},
-        {"Wildberries", "https://napi.wildberries.ru/", "белый список; главная www — antibot/JS, проба через napi API", 0},
-        {"Мегамаркет", "https://megamarket.ru/", "белый список Минцифры", 0},
-        {"Avito", "https://www.avito.ru/", "белый список Минцифры", 0},
-        {"Домклик", "https://domclick.ru/", "белый список Минцифры", 0},
-        {"2ГИС", "https://mapgl.2gis.com/api/js", "белый список; главная 2gis.ru — antibot/TLS, проба через MapGL API", 0},
-        {"HH.ru", "https://hh.ru/", "белый список Минцифры", 0},
-        {"РЖД", "https://www.rzd.ru/", "белый список Минцифры", 0},
-        {"Туту.ру", "https://www.tutu.ru/", "белый список Минцифры", 0},
-        {"Gismeteo", "https://www.gismeteo.ru/", "белый список Минцифры", 0},
-        {"Сбербанк", "https://www.sberbank.ru/", "белый список Минцифры", 0},
-        /* контроль: зарубежные (часть — ожидаемый блок в РФ) */
+        /* зарубежные / контроль (блок РФ ≠ сбой сети) */
         {"Google", "https://www.google.com/", "", 0},
         {"Gmail", "https://mail.google.com/", "", 0},
         {"Google Play", "https://play.google.com/", "", 0},
@@ -2807,7 +4018,6 @@ static void resources_load_defaults(void) {
         {"WhatsApp", "https://web.whatsapp.com/",
          "Ожидаемо: Meta, часто ограничен в РФ — не проблема сети.", 1},
         {"Wikipedia", "https://ru.wikipedia.org/", "", 0},
-        {"Cloudflare", "https://www.cloudflare.com/", "", 0},
     };
     static const struct { const char *name, *host; int port, crit; } gtcp[] = {
         {"Battle.net HTTPS", "battle.net", 443, 1},
@@ -2843,6 +4053,19 @@ static void resources_load_defaults(void) {
         {"Ubisoft CDN", "static2.cdn.ubi.com", 443, 0},
         {"GOG", "www.gog.com", 443, 0},
         {"Faceit", "api.faceit.com", 443, 0},
+        {"Roblox", "www.roblox.com", 443, 1},
+        {"Roblox economy", "economy.roblox.com", 443, 0},
+        {"Roblox CDN", "setup.rbxcdn.com", 443, 1},
+        {"Roblox CSS CDN", "css.rbxcdn.com", 443, 0},
+        {"Lesta", "lesta.ru", 443, 0},
+        {"Мир танков", "tanki.su", 443, 1},
+        {"Мир танков CDN", "tanki-media-content.tanki.su", 443, 1},
+        {"Lesta vol", "vol.lesta.ru", 443, 0},
+        {"Мир кораблей", "korabli.su", 443, 1},
+        {"World of Warships RU", "worldofwarships.ru", 443, 0},
+        {"Wargaming RCDS", "rcds.wargaming.net", 443, 0},
+        {"War Thunder", "www.warthunder.com", 443, 0},
+        {"Escape from Tarkov", "www.escapefromtarkov.com", 443, 0},
         {"Twitch", "www.twitch.tv", 443, 1},
         {"Twitch CDN", "static.twitchcdn.net", 443, 0},
         {"Twitch static CDN", "static-cdn.jtvnw.net", 443, 1},
@@ -2863,7 +4086,6 @@ static void resources_load_defaults(void) {
         {"HoYoverse upload CDN", "upload-static.hoyoverse.com", 443, 0},
         {"PSN image CDN", "image.api.playstation.com", 443, 1},
         {"PSN download CDN", "apollo2.dl.playstation.net", 443, 0},
-        {"IVI thumbs CDN", "thumbs.dfs.ivi.ru", 443, 0},
     };
     /* Selectel: ru-1 ≈ СПб (Дубровка), ru-7 ≈ Москва (Берзарина). SFTP :22 — публично у SPB. */
     static const struct { const char *name, *host; int port, crit; } itcp[] = {
@@ -2882,6 +4104,19 @@ static void resources_load_defaults(void) {
         {"Azure management :443", "management.azure.com", 443, 0},
         {"Azure login :443", "login.microsoftonline.com", 443, 0},
         {"Azure Blob East US :443", "eastus.blob.core.windows.net", 443, 0},
+        {"Cloudflare :443", "www.cloudflare.com", 443, 1},
+        {"Cloudflare 1.1.1.1 :443", "1.1.1.1", 443, 0},
+        {"Cloudflare speed :443", "speed.cloudflare.com", 443, 1},
+        {"Hetzner Console :443", "console.hetzner.cloud", 443, 1},
+        {"Hetzner www :443", "www.hetzner.com", 443, 0},
+        {"DigitalOcean :443", "www.digitalocean.com", 443, 1},
+        {"DigitalOcean cloud :443", "cloud.digitalocean.com", 443, 0},
+        {"OVH :443", "www.ovh.com", 443, 0},
+        {"OVH Cloud :443", "www.ovhcloud.com", 443, 0},
+        {"OVH proof :443", "proof.ovh.net", 443, 0},
+        {"GitHub :443", "github.com", 443, 1},
+        {"GitHub API :443", "api.github.com", 443, 0},
+        {"GitHub Assets :443", "github.githubassets.com", 443, 0},
     };
     /* HTTPS-проверки облаков: 200/301/403 XML от S3 = сервис отвечает */
     static const struct { const char *name, *url; } ihttps[] = {
@@ -2889,6 +4124,26 @@ static void resources_load_defaults(void) {
         {"AWS Status", "https://status.aws.amazon.com/"},
         {"AWS S3 (landsat-pds)", "https://landsat-pds.s3.amazonaws.com/"},
         {"AWS S3 CDN (amazonlinux)", "https://cdn.amazonlinux.com/"},
+        {"Cloudflare trace", "https://www.cloudflare.com/cdn-cgi/trace"},
+        {"Cloudflare speed 20KB", "https://speed.cloudflare.com/__down?bytes=20000"},
+        {"Hetzner Console", "https://console.hetzner.cloud/"},
+        {"DigitalOcean", "https://www.digitalocean.com/"},
+        {"OVH proof 1MB", "https://proof.ovh.net/files/1Mb.dat"},
+        {"GitHub", "https://github.com/"},
+        {"GitHub Assets", "https://github.githubassets.com/favicons/favicon.svg"},
+        {"GitHub raw", "https://raw.githubusercontent.com/github/gitignore/main/C.gitignore"},
+    };
+    static const struct { const char *name, *url; } geo[] = {
+        {"HE Looking Glass (US)", "https://lg.he.net/"},
+        {"Hurricane Electric (US)", "https://www.he.net/"},
+        {"DE-CIX (DE · IX)", "https://www.de-cix.net/"},
+        {"DE-CIX LG (DE · IX)", "https://lg.de-cix.net/"},
+        {"AMS-IX (NL · IX)", "https://www.ams-ix.net/"},
+        {"AMS-IX LG (NL · IX)", "https://lg.ams-ix.net/"},
+        {"LINX (UK · IX)", "https://www.linx.net/"},
+        {"DATAIX (RU · IX)", "https://www.dataix.ru/"},
+        {"Eurasia Peering (RU · IX)", "https://www.eurasiapeering.ru/"},
+        {"Selectel speed 10MB (RU)", "https://speedtest.selectel.ru/10MB"},
     };
     static const struct { const char *name, *url; } ghttps[] = {
         {"Battle.net", "https://battle.net/"},
@@ -2913,9 +4168,20 @@ static void resources_load_defaults(void) {
         {"GOG Galaxy", "https://www.gog.com/"},
         {"Nintendo", "https://www.nintendo.com/"},
         {"Roblox", "https://www.roblox.com/"},
+        {"Roblox CSS CDN",
+         "https://css.rbxcdn.com/"
+         "7dfc7837b5da6850e13413c630b37da7e88aeb610ca2c7d4e8b71b02cbdc6ba6.css"},
+        {"Roblox setup CDN", "https://setup.rbxcdn.com/"},
         {"Minecraft / Mojang", "https://www.minecraft.net/"},
         {"VK Play", "https://vkplay.ru/"},
-        {"Lesta / Mir Tankov", "https://tanki.su/"},
+        {"Мир танков", "https://tanki.su/"},
+        {"Мир танков CDN",
+         "https://tanki-media-content.tanki.su/tanki-media/fonts/MT-sans/index.css"},
+        {"Lesta", "https://lesta.ru/"},
+        {"Мир кораблей", "https://korabli.su/"},
+        {"World of Warships RU", "https://worldofwarships.ru/"},
+        {"War Thunder", "https://www.warthunder.com/"},
+        {"Escape from Tarkov", "https://www.escapefromtarkov.com/"},
         {"Twitch", "https://www.twitch.tv/"},
         {"Twitch static CDN",
          "https://static-cdn.jtvnw.net/ttv-static-metadata/twitch_logo3.jpg"},
@@ -2935,9 +4201,6 @@ static void resources_load_defaults(void) {
         {"PSN image CDN",
          "https://image.api.playstation.com/vulcan/ap/rnd/202506/2509/"
          "ec1eec85d9130210701491db769cb9874cc09f6512ebca20.png"},
-        {"IVI thumbs CDN",
-         "https://thumbs.dfs.ivi.ru/storage0/contents/d/d/"
-         "7b1fe439034a9da4bc07424e4fb5ec.jpg/10x10/?q=85"},
     };
     /* AI: только TCP :443 — HTTPS часто «умный» таймаут/DPI при живом connect. */
     static const struct { const char *name, *host; int port, crit; } ai[] = {
@@ -2956,7 +4219,6 @@ static void resources_load_defaults(void) {
         {"Google AI Studio", "aistudio.google.com", 443, 0},
         {"Google AI / Generative", "generativelanguage.googleapis.com", 443, 0},
         {"Microsoft Copilot", "copilot.microsoft.com", 443, 0},
-        {"GitHub Copilot", "github.com", 443, 0},
         {"Perplexity", "www.perplexity.ai", 443, 0},
         {"DeepSeek", "www.deepseek.com", 443, 0},
         {"DeepSeek Chat", "chat.deepseek.com", 443, 0},
@@ -2966,7 +4228,6 @@ static void resources_load_defaults(void) {
         {"Groq", "groq.com", 443, 0},
         {"Together AI", "www.together.ai", 443, 0},
         {"Poe", "poe.com", 443, 0},
-        {"Notion AI", "www.notion.so", 443, 0},
         {"YandexGPT / Alice AI", "alice.yandex.ru", 443, 0},
         {"GigaChat", "giga.chat", 443, 0},
     };
@@ -2975,8 +4236,8 @@ static void resources_load_defaults(void) {
         {"VK Видео", "https://vkvideo.ru/", "https://vkvideo.ru/sitemaps/sitemap-video-1.xml"},
         {"IVI", "https://www.ivi.ru/", "https://www.ivi.ru/watch/masha_i_medved"},
         {"Okko", "https://okko.tv/", "https://okko.tv/movie/avatar"},
-        {"Кинопоиск", "https://www.kinopoisk.ru/", "https://www.kinopoisk.ru/"},
-        {"Rutube", "https://rutube.ru/", "https://rutube.ru/"},
+        {"Кинопоиск", "https://www.kinopoisk.ru/", "https://www.kinopoisk.ru/lists/movies/popular/"},
+        {"Rutube", "https://rutube.ru/", "https://rutube.ru/feeds/top/"},
     };
     static const struct { const char *cat, *name, *url; } banks[] = {
         {"Банки РФ", "Сбербанк", "https://www.sberbank.ru/"},
@@ -2992,20 +4253,22 @@ static void resources_load_defaults(void) {
         {"Банки РФ", "Райффайзен", "https://www.raiffeisen.ru/"},
         {"Банки РФ", "ПСБ", "https://www.psbank.ru/"},
         {"Банки РФ", "Росбанк", "https://www.rosbank.ru/"},
-        {"Сервисы РФ", "Mail.ru", "https://mail.ru/"},
-        {"Сервисы РФ", "2ГИС", "https://mapgl.2gis.com/api/js"},
-        {"Сервисы РФ", "Wildberries", "https://napi.wildberries.ru/"},
-        {"Сервисы РФ", "Ozon", "https://www.ozon.ru/"},
-        {"Сервисы РФ", "Avito", "https://www.avito.ru/"},
-        {"Сервисы РФ", "HH.ru", "https://hh.ru/"},
         {"Сервисы РФ", "DNS Shop", "https://www.dns-shop.ru/"},
         {"Сервисы РФ", "ЦИАН", "https://www.cian.ru/"},
         {"Проблемы провайдера", "Zoom", "https://www.zoom.com/"},
         {"Проблемы провайдера", "Bitrix24", "https://www.bitrix24.ru/"},
-        {"Проблемы провайдера", "Google Play", "https://play.google.com/"},
-        {"Проблемы провайдера", "Google Play (store)", "https://play.google.com/store"},
     };
     int i, n;
+
+    n = (int)(sizeof ru / sizeof ru[0]);
+    if (n > MAX_RES) n = MAX_RES;
+    g_nru = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_ru[i].name, sizeof g_ru[i].name, "%s", ru[i].name);
+        snprintf(g_ru[i].url, sizeof g_ru[i].url, "%s", ru[i].url);
+        snprintf(g_ru[i].note, sizeof g_ru[i].note, "%s", ru[i].note);
+        g_ru[i].expected_block = ru[i].eb;
+    }
 
     n = (int)(sizeof sig / sizeof sig[0]);
     if (n > MAX_RES) n = MAX_RES;
@@ -3043,6 +4306,14 @@ static void resources_load_defaults(void) {
     for (i = 0; i < n; i++) {
         snprintf(g_infra_https[i].name, sizeof g_infra_https[i].name, "%s", ihttps[i].name);
         snprintf(g_infra_https[i].url, sizeof g_infra_https[i].url, "%s", ihttps[i].url);
+    }
+
+    n = (int)(sizeof geo / sizeof geo[0]);
+    if (n > MAX_RES) n = MAX_RES;
+    g_ngeo = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_geo[i].name, sizeof g_geo[i].name, "%s", geo[i].name);
+        snprintf(g_geo[i].url, sizeof g_geo[i].url, "%s", geo[i].url);
     }
 
     n = (int)(sizeof ghttps / sizeof ghttps[0]);
@@ -3090,13 +4361,15 @@ static int resources_load_file(const char *path) {
     FILE *f;
     char line[1024];
     char section[64] = "";
-    int got_sig = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_ai = 0, got_vid = 0, got_bank = 0;
-    int nsig = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, nai = 0, nvid = 0, nbank = 0;
+    int got_sig = 0, got_ru = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_geo = 0, got_ai = 0, got_vid = 0, got_bank = 0;
+    int nsig = 0, nru = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, ngeo = 0, nai = 0, nvid = 0, nbank = 0;
     ResSig sig[MAX_RES];
+    ResSig ru[MAX_RES];
     ResTcp gtcp[MAX_RES];
     ResTcp itcp[MAX_RES];
     ResHttp ihttps[MAX_RES];
     ResHttp ghttps[MAX_RES];
+    ResHttp geo[MAX_RES];
     ResTcp ai[MAX_RES];
     ResVideo vids[MAX_RES];
     ResBank banks[MAX_RES];
@@ -3121,7 +4394,14 @@ static int resources_load_file(const char *path) {
         nf = split_pipe(line, fields, 8);
         if (!section[0] || nf < 2) continue;
 
-        if (strcmp(section, "significant") == 0 && nsig < MAX_RES) {
+        if (strcmp(section, "popular_ru") == 0 && nru < MAX_RES) {
+            snprintf(ru[nru].name, sizeof ru[nru].name, "%s", fields[0]);
+            snprintf(ru[nru].url, sizeof ru[nru].url, "%s", fields[1]);
+            snprintf(ru[nru].note, sizeof ru[nru].note, "%s", nf > 2 ? fields[2] : "");
+            ru[nru].expected_block = (nf > 3 && fields[3][0] == '1') ? 1 : 0;
+            nru++;
+            got_ru = 1;
+        } else if (strcmp(section, "significant") == 0 && nsig < MAX_RES) {
             snprintf(sig[nsig].name, sizeof sig[nsig].name, "%s", fields[0]);
             snprintf(sig[nsig].url, sizeof sig[nsig].url, "%s", fields[1]);
             snprintf(sig[nsig].note, sizeof sig[nsig].note, "%s", nf > 2 ? fields[2] : "");
@@ -3152,6 +4432,11 @@ static int resources_load_file(const char *path) {
             snprintf(ghttps[nghttps].url, sizeof ghttps[nghttps].url, "%s", fields[1]);
             nghttps++;
             got_ghttps = 1;
+        } else if (strcmp(section, "geo") == 0 && ngeo < MAX_RES) {
+            snprintf(geo[ngeo].name, sizeof geo[ngeo].name, "%s", fields[0]);
+            snprintf(geo[ngeo].url, sizeof geo[ngeo].url, "%s", fields[1]);
+            ngeo++;
+            got_geo = 1;
         } else if (strcmp(section, "ai") == 0 && nai < MAX_RES) {
             /* name|host|port|crit — или устаревшее name|https://…|crit */
             snprintf(ai[nai].name, sizeof ai[nai].name, "%s", fields[0]);
@@ -3186,6 +4471,10 @@ static int resources_load_file(const char *path) {
     }
     fclose(f);
 
+    if (got_ru) {
+        memcpy(g_ru, ru, (size_t)nru * sizeof ru[0]);
+        g_nru = nru;
+    }
     if (got_sig) {
         memcpy(g_sig, sig, (size_t)nsig * sizeof sig[0]);
         g_nsig = nsig;
@@ -3205,6 +4494,10 @@ static int resources_load_file(const char *path) {
     if (got_ghttps) {
         memcpy(g_game_https, ghttps, (size_t)nghttps * sizeof ghttps[0]);
         g_ngame_https = nghttps;
+    }
+    if (got_geo) {
+        memcpy(g_geo, geo, (size_t)ngeo * sizeof geo[0]);
+        g_ngeo = ngeo;
     }
     if (got_ai) {
         memcpy(g_ai, ai, (size_t)nai * sizeof ai[0]);
@@ -3316,6 +4609,127 @@ static const char *status_label(const char *st) {
     return "Инфо";
 }
 
+static void json_esc(FILE *f, const char *s) {
+    if (!s) return;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { fputc('\\', f); fputc((char)c, f); }
+        else if (c == '\n') fputs("\\n", f);
+        else if (c == '\r') fputs("\\r", f);
+        else if (c == '\t') fputs("\\t", f);
+        else if (c < 0x20) fprintf(f, "\\u%04x", c);
+        else fputc((char)c, f);
+    }
+}
+
+/* PORT / PROTO / SNI / URL из diag_url + эвристик по имени/detail. */
+static void check_endpoint_fields(const Check *c,
+                                  char *ip, size_t iplen,
+                                  char *port, size_t portlen,
+                                  char *proto, size_t protolen,
+                                  char *sni, size_t snilen,
+                                  char *url, size_t urllen) {
+    const char *p;
+
+    if (ip && iplen) ip[0] = 0;
+    if (port && portlen) port[0] = 0;
+    if (proto && protolen) proto[0] = 0;
+    if (sni && snilen) sni[0] = 0;
+    if (url && urllen) url[0] = 0;
+    if (!c) return;
+
+    if (ip && iplen && c->resolved_ip[0])
+        snprintf(ip, iplen, "%s", c->resolved_ip);
+    if (url && urllen && c->diag_url[0])
+        snprintf(url, urllen, "%s", c->diag_url);
+
+    if (c->diag_url[0]) {
+        host_from_url(c->diag_url, sni, snilen);
+        p = c->diag_url;
+        if (starts_with(p, "https://")) {
+            p += 8;
+            if (proto && protolen) snprintf(proto, protolen, "HTTPS");
+            if (port && portlen) snprintf(port, portlen, "443");
+        } else if (starts_with(p, "http://")) {
+            p += 7;
+            if (proto && protolen) snprintf(proto, protolen, "HTTP");
+            if (port && portlen) snprintf(port, portlen, "80");
+        }
+        while (p && *p && *p != '/' && *p != '?' && *p != '#') {
+            if (*p == ':' && isdigit((unsigned char)p[1])) {
+                int pr = atoi(p + 1);
+                if (pr > 0 && pr <= 65535 && port && portlen)
+                    snprintf(port, portlen, "%d", pr);
+                break;
+            }
+            p++;
+        }
+    }
+
+    /* эвристики по типу проверки */
+    if (strstr(c->name, "DoT") || strstr(c->detail, ":853") || strstr(c->detail, "853")) {
+        if (proto && protolen) snprintf(proto, protolen, "DoT/TLS");
+        if (port && portlen) snprintf(port, portlen, "853");
+    } else if (strstr(c->name, "DoH") || strstr(c->category, "DoH")) {
+        if (proto && protolen) snprintf(proto, protolen, "DoH/HTTPS");
+        if (port && portlen && !port[0]) snprintf(port, portlen, "443");
+    } else if (strstr(c->name, "QUIC") || strstr(c->detail, "QUIC")) {
+        if (proto && protolen) snprintf(proto, protolen, "QUIC/UDP");
+        if (port && portlen && !port[0]) snprintf(port, portlen, "443");
+    } else if (strstr(c->name, "Ping ") || starts_with(c->name, "Ping")) {
+        if (proto && protolen) snprintf(proto, protolen, "ICMP");
+        if (port && portlen) snprintf(port, portlen, "-");
+    } else if (strstr(c->name, "NTP") || strcmp(c->category, "NTP") == 0) {
+        if (proto && protolen) snprintf(proto, protolen, "NTP/UDP");
+        if (port && portlen) snprintf(port, portlen, "123");
+    } else if (strstr(c->name, "Резолвер") || strstr(c->name, "DNS ") ||
+               strcmp(c->category, "DNS") == 0 || strcmp(c->category, "DNS-прогон") == 0) {
+        if (proto && protolen && (!proto[0] || strcmp(proto, "HTTPS") != 0))
+            snprintf(proto, protolen, "DNS/UDP");
+        if (port && portlen && (!port[0] || strcmp(port, "443") == 0) &&
+            !c->diag_url[0])
+            snprintf(port, portlen, "53");
+    } else if (strstr(c->detail, "MQTT") || strstr(c->name, "MQTT") || strstr(c->detail, ":8883")) {
+        if (proto && protolen) snprintf(proto, protolen, "MQTT/TLS");
+        if (port && portlen) snprintf(port, portlen, "8883");
+    } else if (strstr(c->detail, "UDP") && (!proto || !proto[0])) {
+        if (proto && protolen) snprintf(proto, protolen, "UDP");
+    }
+
+    /* порт из detail вида host:443 / TCP :443 */
+    if (port && portlen && (!port[0] || strcmp(port, "-") == 0)) {
+        const char *t = c->detail;
+        for (; t && *t; t++) {
+            if (*t == ':' && isdigit((unsigned char)t[1])) {
+                int pr = atoi(t + 1);
+                if (pr > 0 && pr <= 65535) {
+                    snprintf(port, portlen, "%d", pr);
+                    if (proto && protolen && !proto[0])
+                        snprintf(proto, protolen, "TCP");
+                    break;
+                }
+            }
+        }
+    }
+
+    if (proto && protolen && !proto[0] && c->diag_url[0])
+        snprintf(proto, protolen, "TCP");
+    if (sni && snilen && !sni[0] && c->diag_url[0])
+        host_from_url(c->diag_url, sni, snilen);
+    /* SNI из имени, если IP-проверка с hostname в detail */
+    if (sni && snilen && !sni[0]) {
+        const char *t = c->detail;
+        if (t && (strstr(t, ".ru") || strstr(t, ".com") || strstr(t, ".net"))) {
+            /* оставить пустым — надёжнее не угадывать */
+        }
+    }
+    if (ip && iplen && !ip[0] && sni && sni[0] &&
+        isdigit((unsigned char)sni[0])) {
+        /* diag host is IP */
+        snprintf(ip, iplen, "%s", sni);
+    }
+}
+
 static void write_html(void) {
     FILE *f;
     int i;
@@ -3355,11 +4769,18 @@ static void write_html(void) {
         "*{box-sizing:border-box}body{margin:0;font-family:\"Segoe UI\",system-ui,sans-serif;"
         "background:radial-gradient(1200px 600px at 10%% -10%%,#1a2a3a 0%%,var(--bg) 55%%);"
         "color:var(--text);line-height:1.45;padding:24px}\n"
-        "h1{font-size:1.5rem;margin:0 0 4px;font-weight:650}.sub{color:var(--muted);margin-bottom:20px}\n"
-        ".cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px}\n"
+        "h1{font-size:1.5rem;margin:0 0 4px;font-weight:650}.sub{color:var(--muted);margin-bottom:12px}\n"
+        ".disclaimer{margin:0 0 18px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);"
+        "background:rgba(102,179,255,.06);color:var(--muted);font-size:.88rem;line-height:1.4;"
+        "border-left:3px solid var(--info)}\n"
+        ".disclaimer strong{color:var(--text);font-weight:650}\n"
+        ".cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px;align-items:stretch}\n"
         ".card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:120px}\n"
         ".card .n{font-size:1.6rem;font-weight:700}.card .l{color:var(--muted);font-size:.85rem}\n"
         ".card.ok .n{color:var(--ok)}.card.warn .n{color:var(--warn)}.card.fail .n{color:var(--fail)}\n"
+        ".card.fail{min-width:160px;padding:18px 22px;border-color:rgba(243,18,96,.35)}\n"
+        ".card.fail .n{font-size:2.1rem}.card.ok{min-width:100px;opacity:.92}\n"
+        ".card.warn{min-width:140px;border-color:rgba(255,184,0,.35)}\n"
         ".finding{border-radius:12px;padding:14px 16px;margin-bottom:10px;border:1px solid var(--line);background:var(--panel)}\n"
         ".finding.critical{border-left:4px solid var(--fail)}.finding.warning{border-left:4px solid var(--warn)}"
         ".finding.info{border-left:4px solid var(--info)}.finding p{margin:6px 0 0;color:var(--muted)}\n"
@@ -3368,8 +4789,19 @@ static void write_html(void) {
         ".prob.fail{border-left:4px solid var(--fail)}.prob.warn{border-left:4px solid var(--warn)}\n"
         ".prob .meta{color:var(--muted);font-size:.85rem;flex:1 1 180px}.prob .det{color:var(--muted);font-size:.9rem;"
         "flex:2 1 240px;min-width:0;word-break:break-word}\n"
+        "details.warn-fold{margin:10px 0 0;border:1px solid var(--line);border-radius:12px;"
+        "background:var(--panel);padding:10px 14px}\n"
+        "details.warn-fold>summary{cursor:pointer;color:var(--warn);font-weight:650;user-select:none;"
+        "list-style:none;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}\n"
+        "details.warn-fold>summary::-webkit-details-marker{display:none}\n"
+        "details.warn-fold>summary .n{font-size:1.35rem;font-weight:700;color:var(--warn)}\n"
+        "details.warn-fold>summary .hint{color:var(--muted);font-weight:400;font-size:.85rem}\n"
+        "details.warn-fold[open]>summary{margin-bottom:10px}\n"
+        "details.warn-fold .prob{margin-bottom:6px}\n"
         "a.jumplink{color:var(--info);text-decoration:none;font-weight:650;white-space:nowrap}"
         "a.jumplink:hover{text-decoration:underline}\n"
+        "a.extlink{color:var(--info);text-decoration:none;word-break:break-all}"
+        "a.extlink:hover{text-decoration:underline}a.extlink code{color:inherit}\n"
         "tr.target-hl>td{background:#2a2418!important;box-shadow:inset 0 0 0 2px var(--warn)}\n"
         "table{width:100%%;border-collapse:collapse;background:var(--panel);border-radius:12px;overflow:hidden;border:1px solid var(--line)}\n"
         "th,td{text-align:left;padding:10px 12px;vertical-align:top;border-bottom:1px solid var(--line)}\n"
@@ -3388,6 +4820,10 @@ static void write_html(void) {
         "button.copy{background:#243040;border:1px solid var(--line);color:var(--text);border-radius:6px;"
         "padding:2px 8px;font-size:.75rem;cursor:pointer}\n"
         "button.copy:hover{border-color:var(--info)}\n"
+        ".toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 18px}\n"
+        "button.btn-dl{background:#243040;border:1px solid var(--info);color:var(--text);border-radius:10px;"
+        "padding:10px 16px;font-size:.95rem;font-weight:650;cursor:pointer}\n"
+        "button.btn-dl:hover{background:#2c3a4c}.toolbar .muted{color:var(--muted);font-size:.85rem}\n"
         "pre.netdiag{margin:6px 0 4px;padding:8px 10px;background:#0c1015;border-radius:8px;"
         "border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;max-height:280px;"
         "overflow:auto;font-size:.78rem;line-height:1.35;color:var(--text)}\n"
@@ -3409,6 +4845,30 @@ static void write_html(void) {
         "setTimeout(()=>el.scrollIntoView({behavior:'smooth',block:'center'}),30)}\n"
         "window.addEventListener('hashchange',revealTarget);"
         "window.addEventListener('DOMContentLoaded',revealTarget);\n"
+        "function downloadProblemsTxt(){\n"
+        "const rows=window.CC_PROBLEMS||[];\n"
+        "const stamp=window.CC_STAMP||'report';\n"
+        "let t='# connect-check problem nodes (fail + warn)\\n';\n"
+        "t+='# generated: '+stamp+' · connect-check '+((window.CC_VER)||'')+'\\n';\n"
+        "t+='# NAME | CHECKED | STATUS | IP | PORT | PROTO | SNI | URL\\n\\n';\n"
+        "if(!rows.length){t+='(нет проблемных узлов)\\n';}\n"
+        "for(const r of rows){\n"
+        "  t+=r.name+'\\n';\n"
+        "  t+='  checked: '+r.cat+'\\n';\n"
+        "  t+='  status:  '+r.status+'\\n';\n"
+        "  t+='  IP: '+r.ip+'  PORT: '+r.port+'  PROTO: '+r.proto+'\\n';\n"
+        "  t+='  SNI: '+r.sni+'\\n';\n"
+        "  t+='  URL: '+r.url+'\\n';\n"
+        "  if(r.detail)t+='  detail: '+r.detail+'\\n';\n"
+        "  t+='\\n';\n"
+        "}\n"
+        "const blob=new Blob([t],{type:'text/plain;charset=utf-8'});\n"
+        "const a=document.createElement('a');\n"
+        "a.href=URL.createObjectURL(blob);\n"
+        "a.download='connect-check-problems-'+stamp+'.txt';\n"
+        "document.body.appendChild(a);a.click();a.remove();\n"
+        "setTimeout(()=>URL.revokeObjectURL(a.href),1500);\n"
+        "}\n"
         "</script></head><body>\n",
         CONNECT_CHECK_VERSION, CONNECT_CHECK_VERSION, stamp);
 
@@ -3423,26 +4883,66 @@ static void write_html(void) {
     fputs(" · DNS: ", f); html_esc(f, dns_line);
     fputs("</div>\n", f);
 
+    fputs("<div class=\"disclaimer\"><strong>Дисклеймер.</strong> "
+          "Отчёт не является авторизованным заключением и служит только для быстрого "
+          "понимания ситуации. Проверки несовершенны и могут не проходить капчи и антиботы — "
+          "перепроверяйте важные ресурсы вручную.</div>\n", f);
+
+    /* Шапка: крупно только Сбои; OK мелко; Внимание — в свёртке ниже */
     fprintf(f,
         "<div class=\"cards\">"
-        "<div class=\"card ok\"><div class=\"n\">%d</div><div class=\"l\">OK</div></div>"
-        "<div class=\"card warn\"><div class=\"n\">%d</div><div class=\"l\">Внимание</div></div>"
         "<div class=\"card fail\"><div class=\"n\">%d</div><div class=\"l\">Сбои</div></div>"
-        "</div>\n", ok_n, warn_n, fail_n);
+        "<div class=\"card ok\"><div class=\"n\">%d</div><div class=\"l\">OK</div></div>"
+        "</div>\n", fail_n, ok_n);
 
-    /* Проблемы сверху — все fail/warn со ссылкой на строку проверки */
+    /* Кнопка TXT проблемных узлов + данные для скачивания */
     {
-        int nprob = 0;
-        fputs("<div class=\"problems\"><h2 style=\"font-size:1.15rem;margin:0 0 10px\">Проблемы</h2>\n", f);
+        int nprob = 0, first = 1;
+        fputs("<div class=\"toolbar\">"
+              "<button type=\"button\" class=\"btn-dl\" onclick=\"downloadProblemsTxt()\">"
+              "Скачать TXT проблемных узлов</button>"
+              "<span class=\"muted\">fail + warn · имя, что проверяли, IP : PORT PROTO SNI URL</span>"
+              "</div>\n", f);
+        fputs("<script>\nwindow.CC_STAMP=\"", f);
+        json_esc(f, stamp);
+        fputs("\";\nwindow.CC_VER=\"", f);
+        json_esc(f, CONNECT_CHECK_VERSION);
+        fputs("\";\nwindow.CC_PROBLEMS=[", f);
         for (i = 0; i < nchecks; i++) {
             Check *c = &checks[i];
-            const char *cls;
+            char ip[64], port[16], proto[32], sni[128], url[256];
             if (strcmp(c->status, "fail") != 0 && strcmp(c->status, "warn") != 0)
                 continue;
+            check_endpoint_fields(c, ip, sizeof ip, port, sizeof port,
+                                  proto, sizeof proto, sni, sizeof sni, url, sizeof url);
+            if (!first) fputc(',', f);
+            first = 0;
+            fputs("\n{", f);
+            fputs("\"name\":\"", f); json_esc(f, c->name); fputs("\",", f);
+            fputs("\"cat\":\"", f); json_esc(f, c->category); fputs("\",", f);
+            fputs("\"status\":\"", f); json_esc(f, c->status); fputs("\",", f);
+            fputs("\"ip\":\"", f); json_esc(f, ip[0] ? ip : "-"); fputs("\",", f);
+            fputs("\"port\":\"", f); json_esc(f, port[0] ? port : "-"); fputs("\",", f);
+            fputs("\"proto\":\"", f); json_esc(f, proto[0] ? proto : "-"); fputs("\",", f);
+            fputs("\"sni\":\"", f); json_esc(f, sni[0] ? sni : "-"); fputs("\",", f);
+            fputs("\"url\":\"", f); json_esc(f, url[0] ? url : "-"); fputs("\",", f);
+            fputs("\"detail\":\"", f); json_esc(f, c->detail); fputs("\"}", f);
             nprob++;
-            cls = strcmp(c->status, "fail") == 0 ? "fail" : "warn";
-            fprintf(f, "<div class=\"prob %s\"><span class=\"badge\">%s</span>"
-                       "<span class=\"meta\">", cls, status_label(c->status));
+        }
+        fputs("\n];\n</script>\n", f);
+        (void)nprob;
+    }
+
+    /* Проблемы сверху: Сбои крупно/открыто; Внимание — свёртка */
+    {
+        int nfail_prob = 0, nwarn_prob = 0, nwarn_find = 0;
+        fputs("<div class=\"problems\"><h2 style=\"font-size:1.15rem;margin:0 0 10px\">Сбои</h2>\n", f);
+        for (i = 0; i < nchecks; i++) {
+            Check *c = &checks[i];
+            if (strcmp(c->status, "fail") != 0) continue;
+            nfail_prob++;
+            fputs("<div class=\"prob fail\"><span class=\"badge\">Сбой</span>"
+                  "<span class=\"meta\">", f);
             html_esc(f, c->category);
             fputs(" · ", f);
             html_esc(f, c->name);
@@ -3450,57 +4950,83 @@ static void write_html(void) {
             html_esc(f, c->detail[0] ? c->detail : (c->hint[0] ? c->hint : "—"));
             fprintf(f, "</span><a class=\"jumplink\" href=\"#c%d\">к проверке →</a></div>\n", i);
         }
-        if (nprob == 0)
-            fputs("<div class=\"finding info\"><strong>Проблем не найдено</strong>"
-                  "<p>Сбои и предупреждения отсутствуют (ожидаемые блокировки в РФ не считаются).</p></div>\n", f);
-        fputs("</div>\n", f);
-    }
+        if (nfail_prob == 0)
+            fputs("<div class=\"finding info\"><strong>Сбоев нет</strong>"
+                  "<p>Критичных FAIL нет"
+                  " (ожидаемые блокировки в РФ и «Внимание» не считаются сбоем).</p></div>\n", f);
 
-    fputs("<h2 style=\"font-size:1.1rem;margin:0 0 10px\">Выводы</h2>\n", f);
-    for (i = 0; i < nfindings; i++) {
-        fprintf(f, "<div class=\"finding %s\"><strong>", findings[i].level);
-        html_esc(f, findings[i].title);
-        fputs("</strong><p>", f);
-        html_esc(f, findings[i].text);
-        fputs("</p></div>\n", f);
+        for (i = 0; i < nchecks; i++)
+            if (strcmp(checks[i].status, "warn") == 0) nwarn_prob++;
+        if (nwarn_prob > 0) {
+            fprintf(f,
+                "<details class=\"warn-fold\">"
+                "<summary><span class=\"n\">%d</span> Внимание"
+                "<span class=\"hint\">— развернуть карточки</span></summary>\n",
+                nwarn_prob);
+            for (i = 0; i < nchecks; i++) {
+                Check *c = &checks[i];
+                if (strcmp(c->status, "warn") != 0) continue;
+                fputs("<div class=\"prob warn\"><span class=\"badge\">Внимание</span>"
+                      "<span class=\"meta\">", f);
+                html_esc(f, c->category);
+                fputs(" · ", f);
+                html_esc(f, c->name);
+                fputs("</span><span class=\"det\">", f);
+                html_esc(f, c->detail[0] ? c->detail : (c->hint[0] ? c->hint : "—"));
+                fprintf(f, "</span><a class=\"jumplink\" href=\"#c%d\">к проверке →</a></div>\n", i);
+            }
+            fputs("</details>\n", f);
+        }
+        fputs("</div>\n", f);
+
+        fputs("<h2 style=\"font-size:1.1rem;margin:0 0 10px\">Выводы</h2>\n", f);
+        for (i = 0; i < nfindings; i++) {
+            if (strcmp(findings[i].level, "warning") == 0) {
+                nwarn_find++;
+                continue;
+            }
+            fprintf(f, "<div class=\"finding %s\"><strong>", findings[i].level);
+            html_esc(f, findings[i].title);
+            fputs("</strong><p>", f);
+            html_esc(f, findings[i].text);
+            fputs("</p></div>\n", f);
+        }
+        if (nwarn_find > 0) {
+            fprintf(f,
+                "<details class=\"warn-fold\">"
+                "<summary><span class=\"n\">%d</span> выводы · Внимание"
+                "<span class=\"hint\">— развернуть</span></summary>\n",
+                nwarn_find);
+            for (i = 0; i < nfindings; i++) {
+                if (strcmp(findings[i].level, "warning") != 0) continue;
+                fprintf(f, "<div class=\"finding %s\"><strong>", findings[i].level);
+                html_esc(f, findings[i].title);
+                fputs("</strong><p>", f);
+                html_esc(f, findings[i].text);
+                fputs("</p></div>\n", f);
+            }
+            fputs("</details>\n", f);
+        }
+        if (nfindings == 0)
+            fputs("<div class=\"finding info\"><strong>Выводов нет</strong>"
+                  "<p>Автоматические выводы по итогам прогона не сформированы.</p></div>\n", f);
     }
 
     fputs("<h2 id=\"checks\" style=\"font-size:1.1rem;margin:18px 0 10px\">Проверки</h2>\n"
           "<table><thead><tr><th>Проверка</th><th>Статус</th><th>Детали</th><th>Что делать</th></tr></thead><tbody>\n", f);
 
     {
-        int in_spoiler = 0;
-        int spoiler_count = 0;
         for (i = 0; i < nchecks; i++) {
             Check *c = &checks[i];
-            int cat_spoiler = 0;
             int j, cat_n = 0;
             if (strcmp(c->category, prev_cat) != 0) {
-                if (in_spoiler) {
-                    fputs("</tbody></table></details>\n", f);
-                    in_spoiler = 0;
-                }
-                for (j = i; j < nchecks && strcmp(checks[j].category, c->category) == 0; j++) {
+                for (j = i; j < nchecks && strcmp(checks[j].category, c->category) == 0; j++)
                     cat_n++;
-                    if (checks[j].spoiler) cat_spoiler = 1;
-                }
-                /* long IoT / popular lists → fold */
-                if (cat_spoiler || cat_n >= 12 ||
-                    strcmp(c->category, "Умный дом / IoT") == 0 ||
-                    strcmp(c->category, "Значимые ресурсы") == 0) {
-                    fputs("<tr class=\"cat\"><td colspan=\"4\">", f);
-                    html_esc(f, c->category);
-                    fprintf(f, " <span style=\"color:var(--muted);font-weight:400\">(%d)</span></td></tr>\n", cat_n);
-                    fputs("<tr><td colspan=\"4\">", f);
-                    fputs("<details class=\"spoiler\"><summary>Показать все проверки раздела</summary>\n"
-                          "<table style=\"width:100%;border:0;background:transparent\"><tbody>\n", f);
-                    in_spoiler = 1;
-                    spoiler_count++;
-                } else {
-                    fputs("<tr class=\"cat\"><td colspan=\"4\">", f);
-                    html_esc(f, c->category);
-                    fputs("</td></tr>\n", f);
-                }
+                fputs("<tr class=\"cat\"><td colspan=\"4\">", f);
+                html_esc(f, c->category);
+                if (cat_n > 1)
+                    fprintf(f, " <span style=\"color:var(--muted);font-weight:400\">(%d)</span>", cat_n);
+                fputs("</td></tr>\n", f);
                 prev_cat = c->category;
             }
             fprintf(f, "<tr id=\"c%d\" class=\"%s\"><td>", i, c->status);
@@ -3548,9 +5074,16 @@ static void write_html(void) {
                     fputs("',this)\">копировать</button></span>", f);
                 }
                 if (c->diag_url[0]) {
-                    fputs("<span>URL: <code>", f);
+                    fputs("<span>URL: <a class=\"extlink\" href=\"", f);
                     html_esc(f, c->diag_url);
-                    fputs("</code> <button type=\"button\" class=\"copy\" onclick=\"copyText('", f);
+                    fputs("\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Открыть в новой вкладке\">"
+                          "<code>", f);
+                    html_esc(f, c->diag_url);
+                    fputs("</code></a> "
+                          "<a class=\"jumplink\" href=\"", f);
+                    html_esc(f, c->diag_url);
+                    fputs("\" target=\"_blank\" rel=\"noopener noreferrer\">открыть ↗</a> "
+                          "<button type=\"button\" class=\"copy\" onclick=\"copyText('", f);
                     html_esc(f, c->diag_url);
                     fputs("',this)\">копировать</button></span>", f);
                 }
@@ -3585,15 +5118,14 @@ static void write_html(void) {
             html_esc(f, c->hint);
             fputs("</td></tr>\n", f);
         }
-        if (in_spoiler) fputs("</tbody></table></details></td></tr>\n", f);
-        (void)spoiler_count;
     }
 
     fputs(
         "</tbody></table>\n"
         "<div class=\"howto\"><h2>Как читать отчёт</h2><ul>"
-        "<li><strong>Выводы сверху</strong> — сначала смотрите блоки finding (critical / warning / info), "
-        "потом таблицы по разделам.</li>"
+        "<li><strong>Шапка</strong> — крупно только <em>Сбои</em>; <em>Внимание</em> свёрнуто "
+        "(карточки и warning-выводы по клику). Critical-выводы открыты. "
+        "Кнопка TXT проблемных узлов (имя, IP, PORT, PROTO, SNI, URL), затем таблицы проверок.</li>"
         "<li><strong>SNI / IP / URL / сеть</strong> — в спойлере у проверки: хост, IP, URL; "
         "для сбоев (fail) дополнительно ping и traceroute с кнопками копирования.</li>"
         "<li><strong>Captive / OS</strong> — URL, по которым телефон/ПК решают «есть ли интернет». "
@@ -3603,6 +5135,10 @@ static void write_html(void) {
         "Сети часто режут одно и оставляют другое: если DoH падает, а DoT открыт — на клиентах "
         "ставьте Private DNS с именем хоста (DoT), а не DoH-приложения; наоборот — выключите "
         "Private DNS «Автоматически», обычный DNS роутера и при необходимости DoH в браузере.</li>"
+        "<li><strong>CDN / счётчики</strong> — yastatic.net и counter.yadro.ru: скачивание реального PNG/GIF/HTML (magic), не только открытый порт.</li>"
+        "<li><strong>Значимые ресурсы (Белые списки МЦ)</strong> — госуслуги, медиа, маркетплейсы, операторы, Яндекс/VK.</li>"
+        "<li><strong>Зарубежные ресурсы</strong> — контроль зарубежных сервисов (блок в РФ ≠ сбой сети).</li>"
+        "<li><strong>Почта</strong> — веб-интерфейсы и SMTP/IMAP/POP3 (баннер или TLS на :587/:465/:993/:995).</li>"
         "<li><strong>Умный дом / IoT</strong> — облака и MQTT (:443 / :8883); браузер может жить, а Tuya/Алиса — нет.</li>"
         "<li><strong>Игры / AI / Видео</strong> — отдельные контуры (Battle.net, LLM API, видеохостинги РФ).</li>"
         "<li><strong>DPI</strong> — служебные порты, DoH, SNI, QUIC. Живой HTTPS к ya.ru не значит, что MQTT/QUIC/DoH тоже живы.</li>"
@@ -3783,39 +5319,110 @@ static void check_ru_fill(Check *out, const char *cat, const char *name, const c
         if (failed) *failed = 1;
         return;
     }
-    if (r.redirect[0])
-        snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
-                 r.code, r.redirect, r.ms, ua_sum);
-    else
-        snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
 
+    if (r.antibot) {
+        char spd[64];
+        int sms = r.xfer_ms > 0 ? r.xfer_ms : r.ms;
+        fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+        if (r.redirect[0])
+            snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms%s [%s]",
+                     r.code, r.redirect, r.ms, spd, ua_sum);
+        else
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
+        snprintf(hint, sizeof hint,
+                 "%s%sАнтибот/WAF/капча (Cloudflare и т.п.) — документ получен, JS-challenge; "
+                 "для сети это не сбой доступности. Ассеты/CDN не качаем (challenge).",
+                 note && note[0] ? note : "", note && note[0] ? " " : "");
+        check_set(out, cat, name, "ok", detail, hint, ip, url, spoiler);
+        return;
+    }
     if (r.code >= 300 && r.code < 400) {
+        char spd[64];
+        fmt_doc_speed(spd, sizeof spd, r.bytes, r.xfer_ms > 0 ? r.xfer_ms : r.ms);
+        if (r.redirect[0])
+            snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms%s [%s]",
+                     r.code, r.redirect, r.ms, spd, ua_sum);
+        else
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
         check_set(out, cat, name, "ok", detail,
                   "HTTP-редирект (301/302/…): хост отвечает. Не считаем сбоем доступности.",
                   ip, url, spoiler);
         return;
     }
     if (r.code >= 500) {
+        char spd[64];
+        fmt_doc_speed(spd, sizeof spd, r.bytes, r.xfer_ms > 0 ? r.xfer_ms : r.ms);
+        snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                 r.code, r.ms, spd, ua_sum);
         check_set(out, cat, name, "fail", detail, "Сервер отвечает 5xx.", ip, url, spoiler);
         if (failed) *failed = 1;
         return;
     }
-    st = "ok";
-    hint[0] = 0;
-    if (note && note[0]) snprintf(hint, sizeof hint, "%s", note);
-    if (ua_mismatch) {
-        st = "warn";
-        snprintf(hint, sizeof hint,
-                 "%s%sОтвет зависит от User-Agent (win/mac/android/tv/embed).",
-                 note && note[0] ? note : "", note && note[0] ? " " : "");
+
+    /* 2xx: HTML + выборка ассетов/CDN — реальная загрузка страницы */
+    {
+        PageLoadStats pl;
+        char spd[96];
+        const char *final_u = r.redirect[0] ? r.redirect : url;
+        int have_pl = page_load_with_assets(final_u, &pl);
+
+        if (have_pl && (pl.html_bytes + pl.asset_bytes) > 0)
+            fmt_page_speed(spd, sizeof spd, &pl);
+        else
+            fmt_doc_speed(spd, sizeof spd, r.bytes, r.xfer_ms > 0 ? r.xfer_ms : r.ms);
+
+        if (r.redirect[0])
+            snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms%s [%s]",
+                     r.code, r.redirect, r.ms, spd, ua_sum);
+        else
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
+
+        st = "ok";
+        hint[0] = 0;
+        if (note && note[0]) snprintf(hint, sizeof hint, "%s", note);
+        if (ua_mismatch) {
+            st = "warn";
+            snprintf(hint, sizeof hint,
+                     "%s%sОтвет зависит от User-Agent (win/mac/android/tv/embed).",
+                     note && note[0] ? note : "", note && note[0] ? " " : "");
+        }
+        if (r.ms > 3000) {
+            st = "warn";
+            snprintf(hint, sizeof hint, "%s%sМедленный ответ (>3000 ms).",
+                     note && note[0] ? note : "", note && note[0] ? " " : "");
+            if (slow_ms) *slow_ms = r.ms;
+        }
+        {
+            int cdn_sev = have_pl ? page_cdn_severity(&pl) : -1;
+            if (cdn_sev >= 0) {
+                char more[160];
+                /* живой HTML + битые ассеты → Внимание, не Сбой */
+                st = "warn";
+                fmt_cdn_asset_hint(hint, sizeof hint, note, &pl, cdn_sev);
+                if (pl.fail_hosts[0] && strlen(detail) + 24 < sizeof detail) {
+                    snprintf(more, sizeof more, " · ассеты✗ %s", pl.fail_hosts);
+                    if (strlen(detail) + strlen(more) < sizeof detail)
+                        strcat(detail, more);
+                }
+                cdn_note_site(name, &pl, 0);
+            } else if (have_pl && pl.n_try > 0) {
+                long tot = pl.html_bytes + pl.asset_bytes;
+                if (tot >= 48 * 1024 && pl.wall_ms > 0) {
+                    double mbps = (tot * 8.0) / (pl.wall_ms * 1000.0);
+                    if (mbps < 0.5 && st[0] == 'o') {
+                        st = "warn";
+                        snprintf(hint, sizeof hint,
+                                 "%s%sНизкая скорость стр+CDN (%.2f Мбит/с) — узкое место или throttle.",
+                                 note && note[0] ? note : "", note && note[0] ? " " : "", mbps);
+                    }
+                }
+            }
+        }
+        check_set(out, cat, name, st, detail, hint, ip, url, spoiler);
     }
-    if (r.ms > 3000) {
-        st = "warn";
-        snprintf(hint, sizeof hint, "%s%sМедленный ответ (>3000 ms).",
-                 note && note[0] ? note : "", note && note[0] ? " " : "");
-        if (slow_ms) *slow_ms = r.ms;
-    }
-    check_set(out, cat, name, st, detail, hint, ip, url, spoiler);
 }
 
 static void check_ru(const char *cat, const char *name, const char *url,
@@ -3839,9 +5446,15 @@ typedef struct {
     int *slow_ms;
 } SigJobCtx;
 
+static void ru_job(int idx, void *v) {
+    SigJobCtx *ctx = (SigJobCtx *)v;
+    check_ru_fill(&ctx->outs[idx], "Значимые ресурсы (Белые списки МЦ)", g_ru[idx].name, g_ru[idx].url,
+                  g_ru[idx].note, 1, 0, &ctx->failed[idx], &ctx->slow_ms[idx]);
+}
+
 static void sig_job(int idx, void *v) {
     SigJobCtx *ctx = (SigJobCtx *)v;
-    check_ru_fill(&ctx->outs[idx], "Значимые ресурсы", g_sig[idx].name, g_sig[idx].url,
+    check_ru_fill(&ctx->outs[idx], "Зарубежные ресурсы", g_sig[idx].name, g_sig[idx].url,
                   g_sig[idx].note, 1, 0, &ctx->failed[idx], &ctx->slow_ms[idx]);
 }
 
@@ -3900,31 +5513,104 @@ static void https_res_job(int idx, void *v) {
     ip[0] = 0;
     if (host[0]) dns_resolve(host, ip, sizeof ip);
 
-    if (r.code > 0) {
-        if (r.code >= 300 && r.code < 400) {
-            snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms [%s]",
-                     r.code, r.redirect[0] ? r.redirect : "?", r.ms, ua_sum);
+    if (r.code > 0 || r.antibot) {
+        char spd[96], hint[STR];
+        int sms = r.xfer_ms > 0 ? r.xfer_ms : r.ms;
+
+        if (r.antibot) {
+            fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+            if (r.redirect[0])
+                snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms%s [%s]",
+                         r.code, r.redirect, r.ms, spd, ua_sum);
+            else
+                snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                         r.code, r.ms, spd, ua_sum);
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "ok", detail,
+                      "Антибот/WAF/капча — хост отвечает, JS-challenge; не сбой сети. "
+                      "Ассеты/CDN не качаем (challenge).",
+                      ip, ctx->items[idx].url, 0);
+        } else if (r.code >= 300 && r.code < 400) {
+            fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+            if (r.redirect[0])
+                snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms%s [%s]",
+                         r.code, r.redirect, r.ms, spd, ua_sum);
+            else
+                snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                         r.code, r.ms, spd, ua_sum);
             check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "ok", detail,
                       "HTTP-редирект: хост отвечает.", ip, ctx->items[idx].url, 0);
         } else if (ctx->ok_403 && (r.code == 401 || r.code == 403)) {
-            snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+            fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
             check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "ok", detail,
                       "HTTP 403/401 без ключа — CDN/S3 доступен (ожидаемо, не сбой).",
                       ip, ctx->items[idx].url, 0);
         } else if (r.code >= 500) {
-            snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
+            fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
             check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, "fail", detail,
                       "Сервер отвечает 5xx.", ip, ctx->items[idx].url, 0);
-        } else {
+        } else if (ctx->ok_403) {
+            /* канарейки/S3/API — не HTML-страницы, только документ */
+            fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+            snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                     r.code, r.ms, spd, ua_sum);
             st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
-            if (r.redirect[0])
-                snprintf(detail, sizeof detail, "HTTP %d (финал ← %s), %d ms [%s]",
-                         r.code, r.redirect, r.ms, ua_sum);
-            else
-                snprintf(detail, sizeof detail, "HTTP %d, %d ms [%s]", r.code, r.ms, ua_sum);
             check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, st, detail,
                       ua_mismatch ? "Ответ зависит от User-Agent."
                       : (r.ms > 3000 ? "Медленный ответ" : ""),
+                      ip, ctx->items[idx].url, 0);
+        } else {
+            PageLoadStats pl;
+            const char *final_u = r.redirect[0] ? r.redirect : ctx->items[idx].url;
+            int have_pl = page_load_with_assets(final_u, &pl);
+
+            if (have_pl && (pl.html_bytes + pl.asset_bytes) > 0)
+                fmt_page_speed(spd, sizeof spd, &pl);
+            else
+                fmt_doc_speed(spd, sizeof spd, r.bytes, sms);
+
+            if (r.redirect[0])
+                snprintf(detail, sizeof detail, "HTTP %d (редирект → %s), %d ms%s [%s]",
+                         r.code, r.redirect, r.ms, spd, ua_sum);
+            else
+                snprintf(detail, sizeof detail, "HTTP %d, %d ms%s [%s]",
+                         r.code, r.ms, spd, ua_sum);
+
+            st = (r.ms > 3000 || ua_mismatch) ? "warn" : "ok";
+            hint[0] = 0;
+            if (ua_mismatch)
+                snprintf(hint, sizeof hint, "Ответ зависит от User-Agent.");
+            else if (r.ms > 3000)
+                snprintf(hint, sizeof hint, "Медленный ответ");
+            {
+                int cdn_sev = have_pl ? page_cdn_severity(&pl) : -1;
+                if (cdn_sev >= 0) {
+                    char more[160];
+                    st = "warn";
+                    fmt_cdn_asset_hint(hint, sizeof hint, NULL, &pl, cdn_sev);
+                    if (pl.fail_hosts[0] && strlen(detail) + 24 < sizeof detail) {
+                        snprintf(more, sizeof more, " · ассеты✗ %s", pl.fail_hosts);
+                        if (strlen(detail) + strlen(more) < sizeof detail)
+                            strcat(detail, more);
+                    }
+                    cdn_note_site(ctx->items[idx].name, &pl, 0);
+                } else if (have_pl && pl.n_try > 0) {
+                    long tot = pl.html_bytes + pl.asset_bytes;
+                    if (tot >= 48 * 1024 && pl.wall_ms > 0) {
+                        double mbps = (tot * 8.0) / (pl.wall_ms * 1000.0);
+                        if (mbps < 0.5 && st[0] == 'o') {
+                            st = "warn";
+                            snprintf(hint, sizeof hint,
+                                     "Низкая скорость стр+CDN (%.2f Мбит/с) — узкое место или throttle.",
+                                     mbps);
+                        }
+                    }
+                }
+            }
+            check_set(&ctx->outs[idx], ctx->cat, ctx->items[idx].name, st, detail, hint,
                       ip, ctx->items[idx].url, 0);
         }
     } else if (host_unresolved(host, ip)) {
@@ -3963,12 +5649,19 @@ static void video_job(int idx, void *v) {
     ip[0] = 0;
     if (host[0]) dns_resolve(host, ip, sizeof ip);
     rv = http_probe_agents(g_video[idx].video, 10, 1, ua_sum, sizeof ua_sum, &ua_mismatch);
-    if (r.code > 0 && rv.code > 0 && r.code < 500 && rv.code < 500) {
+    if (((r.code > 0 && r.code < 500) || r.antibot) &&
+        ((rv.code > 0 && rv.code < 500) || rv.antibot)) {
+        char spd[64], spdv[64];
+        fmt_doc_speed(spd, sizeof spd, r.bytes, r.xfer_ms > 0 ? r.xfer_ms : r.ms);
+        fmt_doc_speed(spdv, sizeof spdv, rv.bytes, rv.xfer_ms > 0 ? rv.xfer_ms : rv.ms);
         snprintf(detail, sizeof detail,
-                 "сайт HTTP %d (%d ms); лента/видео HTTP %d (%d ms) [%s]",
-                 r.code, r.ms, rv.code, rv.ms, ua_sum);
+                 "сайт HTTP %d (%d ms%s)%s; лента/видео HTTP %d (%d ms%s)%s [%s]",
+                 r.code, r.ms, spd, r.antibot ? " antibot" : "",
+                 rv.code, rv.ms, spdv, rv.antibot ? " antibot" : "", ua_sum);
         check_set(&ctx->outs[idx], "Видео", g_video[idx].name, "ok", detail,
-                  "Детально (первое видео с главной): ./probe-video -n 1",
+                  r.antibot || rv.antibot
+                      ? "Антибот на сайте/ленте — хост отвечает; детально: ./probe-video -n 1"
+                      : "Детально (первое видео с главной): ./probe-video -n 1",
                   ip, g_video[idx].home, 0);
     } else if (host_unresolved(host, ip)) {
         snprintf(detail, sizeof detail, "DNS не резолвит %s", host);
@@ -4276,7 +5969,18 @@ int main(int argc, char **argv) {
     int i;
     time_t now;
     struct tm *tm;
-    char dns_extra[][16] = {"1.1.1.1", "8.8.8.8", "9.9.9.9"};
+    /* публичные резолверы: ping + latency + (часть) DoT; системные DNS подмешиваются отдельно */
+    static const struct { const char *name; const char *ip; } dns_pub[] = {
+        {"Cloudflare", "1.1.1.1"},
+        {"Google", "8.8.8.8"},
+        {"Quad9", "9.9.9.9"},
+        {"Яндекс DNS", "77.88.8.8"},
+        {"Яндекс DNS 2", "77.88.8.1"},
+        {"НСДИ a.res-nsdi.ru", "195.208.4.1"},
+        {"НСДИ b.res-nsdi.ru", "195.208.5.1"},
+        {"AdGuard DNS", "94.140.14.14"},
+    };
+    const int n_dns_pub = (int)(sizeof dns_pub / sizeof dns_pub[0]);
     char fail_names[40][64];
     char slow_names[40][80];
     int nfail = 0, nslow = 0;
@@ -4514,34 +6218,49 @@ int main(int argc, char **argv) {
         }
     }
     {
-        const char *hosts[] = {"1.1.1.1", "8.8.8.8", "9.9.9.9"};
-        char name[64];
-        for (i = 0; i < 3; i++) {
-            snprintf(name, sizeof name, "Ping %s", hosts[i]);
+        /* ICMP до публичных DNS: CF/Google/Quad9 + Яндекс + НСДИ + AdGuard */
+        static const struct { const char *label; const char *ip; } ping_dns[] = {
+            {"Cloudflare", "1.1.1.1"},
+            {"Google", "8.8.8.8"},
+            {"Quad9", "9.9.9.9"},
+            {"Яндекс DNS", "77.88.8.8"},
+            {"НСДИ", "195.208.4.1"},
+            {"AdGuard", "94.140.14.14"},
+        };
+        const int np = (int)(sizeof ping_dns / sizeof ping_dns[0]);
+        char name[80];
+        for (i = 0; i < np; i++) {
+            snprintf(name, sizeof name, "Ping %s (%s)", ping_dns[i].label, ping_dns[i].ip);
             stage_progress(name, 4, 6);
-            ping_summary(hosts[i], 5, &loss, &avg);
+            ping_summary(ping_dns[i].ip, 5, &loss, &avg);
             st = (loss == 0) ? "ok" : (loss < 20 ? "warn" : "fail");
             snprintf(detail, sizeof detail, "loss=%d%%, avg=%.1f ms", loss, avg);
             add_check("Связность", name, st, detail, "");
         }
     }
 
-    /* DNS targets */
+    /* DNS targets: системные + публичные (Яндекс / НСДИ / AdGuard / …) */
     {
-        char targets[12][64];
+        char targets[16][64];
+        const char *tnames[16];
         int nt = 0, j, k;
-        for (i = 0; i < ndns && nt < 12; i++) {
-            snprintf(targets[nt++], 64, "%s", dns_list[i]);
+        for (i = 0; i < ndns && nt < 16; i++) {
+            snprintf(targets[nt], 64, "%s", dns_list[i]);
+            tnames[nt] = "системный";
+            nt++;
         }
-        for (i = 0; i < 3 && nt < 12; i++) {
+        for (i = 0; i < n_dns_pub && nt < 16; i++) {
             for (j = 0; j < nt; j++)
-                if (strcmp(targets[j], dns_extra[i]) == 0) break;
-            if (j == nt) snprintf(targets[nt++], 64, "%s", dns_extra[i]);
+                if (strcmp(targets[j], dns_pub[i].ip) == 0) break;
+            if (j == nt) {
+                snprintf(targets[nt], 64, "%s", dns_pub[i].ip);
+                tnames[nt] = dns_pub[i].name;
+                nt++;
+            }
         }
-        if (nt > 6) nt = 6;
         for (i = 0; i < nt; i++) {
             int okc = 0, failc = 0, sum = 0, ms;
-            char name[80];
+            char name[96];
             snprintf(name, sizeof name, "DNS %s", targets[i]);
             stage_progress(name, 5, 6);
             for (k = 0; k < 3; k++) {
@@ -4550,27 +6269,33 @@ int main(int argc, char **argv) {
                     sum += ms;
                 } else failc++;
             }
-            snprintf(name, sizeof name, "Резолвер %s", targets[i]);
+            snprintf(name, sizeof name, "Резолвер %s (%s)", tnames[i], targets[i]);
             if (okc == 0) {
-                add_check("DNS", name, "fail", "не отвечает",
-                          "DNS не отвечает — проверки связности клиентов падают");
-                snprintf(detail, sizeof detail, "DNS %s недоступен", targets[i]);
+                add_check_ex("DNS", name, "fail", "не отвечает",
+                             "DNS не отвечает — проверки связности клиентов падают",
+                             targets[i], NULL, 0);
+                snprintf(detail, sizeof detail, "DNS %s (%s) недоступен", tnames[i], targets[i]);
                 add_finding("critical", detail, "Устройства с этим DNS будут считать сеть без интернета.");
             } else {
                 int a = sum / okc;
                 st = (failc > 0 || a > 200) ? "warn" : "ok";
                 snprintf(detail, sizeof detail, "avg=%d ms, fails=%d/3", a, failc);
-                add_check("DNS", name, st, detail,
-                          a > 200 ? "Медленный DNS — таймауты проверок связности" : "");
+                add_check_ex("DNS", name, st, detail,
+                             a > 200 ? "Медленный DNS — таймауты проверок связности" : "",
+                             targets[i], NULL, 0);
             }
         }
     }
 
     {
-        const char *dots[] = {"dns.google", "1.1.1.1", "8.8.8.8", "9.9.9.9"};
+        const char *dots[] = {
+            "dns.google", "1.1.1.1", "8.8.8.8", "9.9.9.9",
+            "common.dot.dns.yandex.net", "dns.adguard-dns.com",
+        };
+        const int ndot = (int)(sizeof dots / sizeof dots[0]);
         char name[80];
         int any_dot_tls = 0;
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < ndot; i++) {
             int rc, ms = 0;
             const char *sni = dot_sni_for(dots[i]);
             snprintf(name, sizeof name, "DoT %s", dots[i]);
@@ -5257,9 +6982,193 @@ int main(int argc, char **argv) {
         add_check("DPI", "Этап", "info", "пропущен пользователем", "");
     }
 
-    /* Significant resources — блок РФ (YouTube/Telegram/…) не считаем проблемой сети */
-    if (stage_begin("Значимые ресурсы",
-                    "Топ белого списка Минцифры + контроль зарубежных (блок РФ ≠ сбой сети)")) {
+    /* CDN / счётчики — реальная отдача байтов (magic PNG/GIF/HTML), не только TCP */
+    if (stage_begin("CDN / счётчики",
+                    "yastatic.net, counter.yadro.ru — проверка содержимого (от них зависят многие сайты РФ)")) {
+        char detail[STR], hint[STR], ip[64], host[128];
+        long bytes = 0;
+        int code = 0, ms = 0, ok_n_cdn = 0, fail_n_cdn = 0;
+
+        /* 1) yastatic HTML root */
+        host_from_url("https://yastatic.net/", host, sizeof host);
+        ip[0] = 0;
+        if (host[0]) dns_resolve(host, ip, sizeof ip);
+        stage_progress("yastatic.net HTML", 1, 4);
+        if (http_fetch_verify("https://yastatic.net/", 12, "HTML", 500, &bytes, &code, &ms)) {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт, %d ms · HTML OK", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "yastatic.net (HTML)", "ok", detail,
+                         "Корень CDN Яндекса отдаёт документ — хост жив.",
+                         ip[0] ? ip : NULL, "https://yastatic.net/", 0);
+            ok_n_cdn++;
+        } else {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт, %d ms", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "yastatic.net (HTML)", "fail", detail,
+                         "Не получили HTML с yastatic.net — многие сайты Яндекса/партнёров "
+                         "откроются «пустыми» без стилей/JS.",
+                         ip[0] ? ip : NULL, "https://yastatic.net/", 0);
+            fail_n_cdn++;
+        }
+
+        /* 2) yastatic asset: взять URL с ya.ru и проверить PNG/JS magic */
+        {
+            char *page = (char *)malloc(PAGE_HTML_CAP);
+            char asset[STR];
+            int pcode = 0, pms = 0;
+            const char *magic = NULL;
+            stage_progress("yastatic asset", 2, 4);
+            asset[0] = 0;
+            if (page)
+                pcode = http_fetch_text_ex("https://ya.ru/", page, PAGE_HTML_CAP, 12, &pms, NULL);
+            if (page && pcode >= 200 && pcode < 400 &&
+                extract_yastatic_asset(page, asset, sizeof asset)) {
+                if (strstr(asset, ".png")) magic = "PNG";
+                else if (strstr(asset, ".gif")) magic = "GIF";
+                else magic = NULL; /* js/css — по размеру */
+                bytes = 0; code = 0; ms = 0;
+                if (http_fetch_verify(asset, 12, magic, magic ? 64 : 200, &bytes, &code, &ms)) {
+                    snprintf(detail, sizeof detail,
+                             "HTTP %d, %ld байт, %d ms · %s · с ya.ru",
+                             code, bytes, ms, magic ? magic : "тело OK");
+                    add_check_ex("CDN / счётчики", "yastatic.net (asset)", "ok", detail,
+                                 "Реальный статический файл с CDN скачался (magic/размер).",
+                                 ip[0] ? ip : NULL, asset, 0);
+                    ok_n_cdn++;
+                } else {
+                    snprintf(detail, sizeof detail, "HTTP %d, %ld байт · %s", code, bytes, asset);
+                    add_check_ex("CDN / счётчики", "yastatic.net (asset)", "fail", detail,
+                                 "HTML ya.ru ссылается на yastatic, но файл не отдался — "
+                                 "типичный симптом блока/throttle CDN.",
+                                 ip[0] ? ip : NULL, asset, 0);
+                    fail_n_cdn++;
+                }
+            } else {
+                /* fallback: фиксированный PNG (может устареть) + проверка magic */
+                const char *fb =
+                    "https://yastatic.net/s3/home-static/_/37/37a02b5dc7a51abac55d8a5b6c865f0e.png";
+                bytes = 0; code = 0; ms = 0;
+                if (http_fetch_verify(fb, 12, "PNG", 100, &bytes, &code, &ms)) {
+                    snprintf(detail, sizeof detail, "HTTP %d, %ld байт PNG · fallback", code, bytes);
+                    add_check_ex("CDN / счётчики", "yastatic.net (asset)", "ok", detail,
+                                 "Запасной PNG с yastatic отдался.",
+                                 ip[0] ? ip : NULL, fb, 0);
+                    ok_n_cdn++;
+                } else {
+                    add_check_ex("CDN / счётчики", "yastatic.net (asset)", "warn",
+                                 "не удалось взять asset с ya.ru и fallback PNG",
+                                 "Смотрите проверку HTML yastatic.net.",
+                                 ip[0] ? ip : NULL, "https://yastatic.net/", 0);
+                }
+            }
+            free(page);
+        }
+
+        /* 3) LiveInternet counter GIF 1×1 */
+        host_from_url("https://counter.yadro.ru/hit;0", host, sizeof host);
+        ip[0] = 0;
+        if (host[0]) dns_resolve(host, ip, sizeof ip);
+        stage_progress("yadro hit GIF", 3, 4);
+        bytes = 0; code = 0; ms = 0;
+        if (http_fetch_verify("https://counter.yadro.ru/hit;0", 10, "GIF", 20, &bytes, &code, &ms)) {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт GIF, %d ms · пиксель hit", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "counter.yadro.ru (hit GIF)", "ok", detail,
+                         "Счётчик LiveInternet отдал GIF — хост реально отвечает телом.",
+                         ip[0] ? ip : NULL, "https://counter.yadro.ru/hit;0", 0);
+            ok_n_cdn++;
+        } else {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт, %d ms", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "counter.yadro.ru (hit GIF)", "fail", detail,
+                         "Пиксель счётчика не скачался — на многих СМИ/блогах «ломается» аналитика "
+                         "и часть вёрстки, завязанная на yadro.",
+                         ip[0] ? ip : NULL, "https://counter.yadro.ru/hit;0", 0);
+            fail_n_cdn++;
+        }
+
+        /* 4) logo GIF */
+        stage_progress("yadro logo GIF", 4, 4);
+        bytes = 0; code = 0; ms = 0;
+        if (http_fetch_verify("https://counter.yadro.ru/logo?24.6", 10, "GIF", 40, &bytes, &code, &ms)) {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт GIF, %d ms · logo", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "counter.yadro.ru (logo GIF)", "ok", detail,
+                         "Логотип-счётчик отдался как GIF.",
+                         ip[0] ? ip : NULL, "https://counter.yadro.ru/logo?24.6", 0);
+            ok_n_cdn++;
+        } else {
+            snprintf(detail, sizeof detail, "HTTP %d, %ld байт, %d ms", code, bytes, ms);
+            add_check_ex("CDN / счётчики", "counter.yadro.ru (logo GIF)",
+                         fail_n_cdn > 0 ? "fail" : "warn", detail,
+                         "logo не отдался — смотрите hit GIF.",
+                         ip[0] ? ip : NULL, "https://counter.yadro.ru/logo?24.6", 0);
+            if (code <= 0 || bytes < 40) fail_n_cdn++;
+        }
+
+        g_cdn_canary_fail = fail_n_cdn;
+        if (fail_n_cdn >= 2) {
+            snprintf(hint, sizeof hint, "Сбои CDN/счётчиков (%d)", fail_n_cdn);
+            add_finding("critical", hint,
+                        "yastatic.net и/или counter.yadro.ru не отдают содержимое. "
+                        "Сайты РФ часто открываются «пустым» каркасом без CSS/JS/счётчиков. "
+                        "Проверьте фильтр по CDN/AS Яндекса и LiveInternet.");
+        } else if (fail_n_cdn == 1) {
+            add_finding("warning", "Частичный сбой CDN/счётчиков",
+                        "Один из канареечных хостов (yastatic / yadro) не отдал файл. "
+                        "Смотрите раздел «CDN / счётчики».");
+        }
+        (void)ok_n_cdn;
+        stage_done();
+    }
+
+    /* Значимые ресурсы (Белые списки МЦ) — отдельный этап от зарубежного контроля */
+    if (stage_begin("Значимые ресурсы (Белые списки МЦ)",
+                    "Госуслуги, медиа, маркетплейсы, операторы, сервисы Яндекса и VK")) {
+        char ru_fail[40][64];
+        char ru_slow[40][80];
+        int nru_fail = 0, nru_slow = 0;
+        int n = g_nru;
+        Check *outs = NULL;
+        int *failed = NULL, *slow_ms = NULL;
+        SigJobCtx ctx;
+        if (g_resources_from_file)
+            add_check("Значимые ресурсы (Белые списки МЦ)", "Список", "info",
+                      resources_loaded[0] ? resources_loaded : "resources.conf", "");
+        outs = (Check *)calloc((size_t)n, sizeof(Check));
+        failed = (int *)calloc((size_t)n, sizeof(int));
+        slow_ms = (int *)calloc((size_t)n, sizeof(int));
+        if (outs && failed && slow_ms && n > 0) {
+            ctx.outs = outs;
+            ctx.failed = failed;
+            ctx.slow_ms = slow_ms;
+            run_parallel(n, opt_jobs, ru_job, &ctx, "значимые МЦ");
+            for (i = 0; i < n; i++) {
+                add_check_from(&outs[i]);
+                if (failed[i] && nru_fail < 40)
+                    snprintf(ru_fail[nru_fail++], 64, "%s", g_ru[i].name);
+                if (slow_ms[i] && nru_slow < 40)
+                    snprintf(ru_slow[nru_slow++], 80, "%s %dms", g_ru[i].name, slow_ms[i]);
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                stage_item(g_ru[i].name, i + 1, n);
+                check_ru("Значимые ресурсы (Белые списки МЦ)", g_ru[i].name, g_ru[i].url, g_ru[i].note, 1, 0,
+                         ru_fail, &nru_fail, ru_slow, &nru_slow);
+            }
+        }
+        free(outs); free(failed); free(slow_ms);
+        stage_done();
+        if (nru_fail > 0) {
+            char names[LONGSTR] = "", tx[LONGSTR];
+            for (i = 0; i < nru_fail; i++) {
+                if (i) strcat(names, ", ");
+                strcat(names, ru_fail[i]);
+            }
+            snprintf(detail, sizeof detail, "Недоступны значимые ресурсы МЦ (%d)", nru_fail);
+            snprintf(tx, sizeof tx, "Не отвечают: %s.", names);
+            add_finding("warning", detail, tx);
+        }
+    }
+
+    /* Зарубежные ресурсы — контроль; блок РФ (YouTube/Telegram/…) ≠ сбой сети */
+    if (stage_begin("Зарубежные ресурсы",
+                    "Контроль зарубежных сервисов; блок в РФ не считаем сбоем сети")) {
         char sig_fail[40][64];
         char sig_slow[40][80];
         int nsig_fail = 0, nsig_slow = 0;
@@ -5268,7 +7177,7 @@ int main(int argc, char **argv) {
         int *failed = NULL, *slow_ms = NULL;
         SigJobCtx ctx;
         if (g_resources_from_file)
-            add_check("Значимые ресурсы", "Список", "info",
+            add_check("Зарубежные ресурсы", "Список", "info",
                       resources_loaded[0] ? resources_loaded : "resources.conf", "");
         outs = (Check *)calloc((size_t)n, sizeof(Check));
         failed = (int *)calloc((size_t)n, sizeof(int));
@@ -5277,7 +7186,7 @@ int main(int argc, char **argv) {
             ctx.outs = outs;
             ctx.failed = failed;
             ctx.slow_ms = slow_ms;
-            run_parallel(n, opt_jobs, sig_job, &ctx, "значимые");
+            run_parallel(n, opt_jobs, sig_job, &ctx, "зарубежные");
             for (i = 0; i < n; i++) {
                 if (g_sig[i].expected_block &&
                     (strcmp(outs[i].status, "fail") == 0 || strcmp(outs[i].status, "warn") == 0)) {
@@ -5295,7 +7204,7 @@ int main(int argc, char **argv) {
         } else {
             for (i = 0; i < n; i++) {
                 stage_item(g_sig[i].name, i + 1, n);
-                check_ru("Значимые ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1, 0,
+                check_ru("Зарубежные ресурсы", g_sig[i].name, g_sig[i].url, g_sig[i].note, 1, 0,
                          sig_fail, &nsig_fail, sig_slow, &nsig_slow);
             }
         }
@@ -5307,16 +7216,235 @@ int main(int argc, char **argv) {
                 if (i) strcat(names, ", ");
                 strcat(names, sig_fail[i]);
             }
-            snprintf(detail, sizeof detail, "Недоступны значимые ресурсы (%d)", nsig_fail);
+            snprintf(detail, sizeof detail, "Недоступны зарубежные ресурсы (%d)", nsig_fail);
             snprintf(tx, sizeof tx,
                      "Не отвечают (кроме ожидаемо ограниченных в РФ): %s.", names);
             add_finding("warning", detail, tx);
         }
     }
 
-    /* Облака: Selectel / AWS / Azure — TCP + рабочие HTTPS (AWS/S3) */
+    /* RU banks / services */
+    if (stage_begin("Банки и сервисы РФ", "Доступность популярных банков и порталов")) {
+        int n = g_nbanks;
+        Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
+        int *failed = (int *)calloc((size_t)n, sizeof(int));
+        int *slow_ms = (int *)calloc((size_t)n, sizeof(int));
+        if (g_resources_from_file)
+            add_check("Банки и сервисы РФ", "Список", "info",
+                      resources_loaded[0] ? resources_loaded : "resources.conf", "");
+        if (outs && failed && slow_ms && n > 0) {
+            BankJobCtx bctx;
+            bctx.outs = outs; bctx.failed = failed; bctx.slow_ms = slow_ms;
+            run_parallel(n, opt_jobs, bank_job, &bctx, "банки");
+            for (i = 0; i < n; i++) {
+                add_check_from(&outs[i]);
+                if (failed[i] && nfail < 40)
+                    snprintf(fail_names[nfail++], 64, "%s", g_banks[i].name);
+                if (slow_ms[i] && nslow < 40)
+                    snprintf(slow_names[nslow++], 80, "%s %dms", g_banks[i].name, slow_ms[i]);
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                stage_item(g_banks[i].name, i + 1, n);
+                check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0, 0,
+                         fail_names, &nfail, slow_names, &nslow);
+            }
+        }
+        free(outs); free(failed); free(slow_ms);
+        stage_done();
+    }
+
+    /* Почта: веб-интерфейсы + SMTP/IMAP/POP3 (баннер или TLS) */
+    if (stage_begin("Почта",
+                    "Веб-почта и протоколы SMTP/IMAP/POP3 (баннер 220/+OK или TLS ServerHello)")) {
+        struct { const char *name, *url; } web[] = {
+            {"Яндекс Почта", "https://mail.yandex.ru/"},
+            {"Mail.ru Почта", "https://e.mail.ru/"},
+            {"Gmail", "https://mail.google.com/"},
+            {"Outlook", "https://outlook.live.com/"},
+            {"iCloud Mail", "https://www.icloud.com/"},
+            {"Rambler Почта", "https://mail.rambler.ru/"},
+            {"Proton Mail", "https://mail.proton.me/"},
+        };
+        struct {
+            const char *name, *host, *kind;
+            int port, use_tls, crit;
+        } proto[] = {
+            /* Яндекс */
+            {"Яндекс SMTP :587", "smtp.yandex.ru", "smtp", 587, 0, 1},
+            {"Яндекс SMTPS :465", "smtp.yandex.ru", "tls", 465, 1, 1},
+            {"Яндекс SMTP :25", "smtp.yandex.ru", "smtp", 25, 0, 0},
+            {"Яндекс IMAPS :993", "imap.yandex.ru", "tls", 993, 1, 1},
+            {"Яндекс POP3S :995", "pop.yandex.ru", "tls", 995, 1, 0},
+            /* Mail.ru */
+            {"Mail.ru SMTP :587", "smtp.mail.ru", "smtp", 587, 0, 1},
+            {"Mail.ru SMTPS :465", "smtp.mail.ru", "tls", 465, 1, 1},
+            {"Mail.ru IMAPS :993", "imap.mail.ru", "tls", 993, 1, 1},
+            {"Mail.ru POP3S :995", "pop.mail.ru", "tls", 995, 1, 0},
+            /* Gmail */
+            {"Gmail SMTP :587", "smtp.gmail.com", "smtp", 587, 0, 1},
+            {"Gmail SMTPS :465", "smtp.gmail.com", "tls", 465, 1, 1},
+            {"Gmail IMAPS :993", "imap.gmail.com", "tls", 993, 1, 1},
+            {"Gmail POP3S :995", "pop.gmail.com", "tls", 995, 1, 0},
+            /* Microsoft 365 / Outlook */
+            {"Outlook SMTP :587", "smtp.office365.com", "smtp", 587, 0, 1},
+            {"Outlook IMAPS :993", "outlook.office365.com", "tls", 993, 1, 1},
+            /* iCloud */
+            {"iCloud SMTP :587", "smtp.mail.me.com", "smtp", 587, 0, 0},
+            {"iCloud IMAPS :993", "imap.mail.me.com", "tls", 993, 1, 0},
+            /* Rambler */
+            {"Rambler SMTP :587", "smtp.rambler.ru", "smtp", 587, 0, 0},
+            {"Rambler IMAPS :993", "imap.rambler.ru", "tls", 993, 1, 0},
+        };
+        int nw = (int)(sizeof web / sizeof web[0]);
+        int np = (int)(sizeof proto / sizeof proto[0]);
+        int mail_fail = 0, i;
+        char detail[STR], banner[192], ip[64];
+
+        for (i = 0; i < nw; i++) {
+            Check c;
+            int failed = 0, slow_ms = 0;
+            stage_progress(web[i].name, i + 1, nw + np);
+            check_ru_fill(&c, "Почта", web[i].name, web[i].url,
+                          "веб-интерфейс", 0, 0, &failed, &slow_ms);
+            add_check_from(&c);
+            if (failed) mail_fail++;
+        }
+        for (i = 0; i < np; i++) {
+            int ms = 0, rc;
+            char urlbuf[160];
+            stage_progress(proto[i].name, nw + i + 1, nw + np);
+            ip[0] = 0;
+            dns_resolve(proto[i].host, ip, sizeof ip);
+            rc = mail_proto_probe(proto[i].host, proto[i].port, proto[i].kind,
+                                  proto[i].use_tls, 5000, &ms, banner, sizeof banner);
+            /* https://host/ — чтобы SNI/host_from_url не ломались на smtp:// / tls:// */
+            snprintf(urlbuf, sizeof urlbuf, "https://%s/", proto[i].host);
+            if (rc == 2) {
+                snprintf(detail, sizeof detail, "%s, %d ms",
+                         banner[0] ? banner : (proto[i].use_tls ? "TLS OK" : "баннер OK"), ms);
+                add_check_ex("Почта", proto[i].name, "ok", detail, "",
+                             ip[0] ? ip : NULL, urlbuf, 0);
+            } else if (rc == 1) {
+                snprintf(detail, sizeof detail, "TCP открыт, баннер/TLS нет, %d ms", ms);
+                add_check_ex("Почта", proto[i].name,
+                             proto[i].crit ? "fail" : "warn", detail,
+                             proto[i].use_tls
+                                 ? "Порт открыт, TLS handshake не прошёл — клиент почты не подключится."
+                                 : "Порт открыт, но нет SMTP/IMAP/POP3-баннера — возможна подмена/фильтр.",
+                             ip[0] ? ip : NULL, urlbuf, 0);
+                if (proto[i].crit) mail_fail++;
+            } else {
+                snprintf(detail, sizeof detail, "закрыт/таймаут, %d ms", ms);
+                add_check_ex("Почта", proto[i].name,
+                             proto[i].crit ? "fail" : "warn", detail,
+                             proto[i].port == 25
+                                 ? "TCP/25 часто режет провайдер — для клиентов важнее :587/:465."
+                                 : "Клиент почты (Outlook/Thunderbird/телефон) не достучится до сервера.",
+                             ip[0] ? ip : NULL, urlbuf, 0);
+                if (proto[i].crit) mail_fail++;
+            }
+        }
+        if (mail_fail >= 3)
+            add_finding("warning", "Проблемы с почтой",
+                        "Несколько веб/SMTP/IMAP проверок не прошли. "
+                        "Проверьте DPI на :465/:587/:993 и доступ к mail.*. "
+                        "Порт 25 у многих ISP закрыт исходящий — это норма.");
+        stage_done();
+    }
+
+    /* Video hosts: homepage + video path (full «первое видео» — probe-video) */
+    if (!opt_skip_video && stage_begin("Видео",
+                    "Яндекс Видео, VK Видео, IVI, Okko, Кинопоиск, Rutube — сайт и видео-путь")) {
+        int nv = g_nvideo;
+        int vfail = 0;
+        Check *outs = (Check *)calloc((size_t)nv, sizeof(Check));
+        VideoJobCtx vctx;
+        if (outs && nv > 0) {
+            vctx.outs = outs;
+            run_parallel(nv, opt_jobs, video_job, &vctx, "видео");
+            for (i = 0; i < nv; i++) {
+                add_check_from(&outs[i]);
+                if (strcmp(outs[i].status, "fail") == 0) vfail++;
+            }
+        }
+        free(outs);
+        if (vfail >= 3)
+            add_finding("warning", "Видеохостинги недоступны",
+                        "Яндекс/VK/IVI/Okko/Кинопоиск/Rutube — проверьте DPI/DNS. "
+                        "Детальный прогон: ./probe-video");
+        stage_done();
+    } else if (opt_skip_video) {
+        add_check("Видео", "Этап", "info", "пропущен (--skip-video)", "");
+    }
+
+    /* Gaming platforms: Blizzard / Battle.net, Steam, Epic, Riot, … */
+    if (stage_begin("Игры", "Battle.net / Blizzard, Steam и популярные игровые платформы")) {
+        char game_fail[64][64];
+        int ngame = 0;
+        int n = g_ngame_tcp;
+        Check *touts = NULL, *houts = NULL;
+        int *critf = NULL;
+        if (n > 0) {
+            TcpResJobCtx tctx;
+            touts = (Check *)calloc((size_t)n, sizeof(Check));
+            critf = (int *)calloc((size_t)n, sizeof(int));
+            if (touts && critf) {
+                tctx.outs = touts; tctx.critf = critf; tctx.items = g_game_tcp;
+                tctx.cat = "Игры"; tctx.spoiler = 0; tctx.timeout_ms = 4000;
+                run_parallel(n, opt_jobs, tcp_res_job, &tctx, "игры TCP");
+                for (i = 0; i < n; i++) {
+                    add_check_from(&touts[i]);
+                    if (critf[i] && ngame < 64)
+                        snprintf(game_fail[ngame++], 64, "%s", g_game_tcp[i].name);
+                }
+            }
+            free(touts); free(critf);
+        }
+        stage_item("Steam CM", n + 1, n + 2);
+        check_steam_cm(&ngame, game_fail, 64);
+        stage_item("Steam SDR", n + 2, n + 2);
+        check_steam_sdr(&ngame, game_fail, 64);
+        stage_item_clear();
+
+        {
+            int nh = g_ngame_https;
+            HttpsResJobCtx hctx;
+            houts = (Check *)calloc((size_t)nh, sizeof(Check));
+            if (houts && nh > 0) {
+                hctx.outs = houts; hctx.items = g_game_https; hctx.cat = "Игры";
+                hctx.multi_ua = 1; hctx.timeout_sec = 5; hctx.ok_403 = 0;
+                run_parallel(nh, opt_jobs, https_res_job, &hctx, "игры HTTPS");
+                for (i = 0; i < nh; i++) {
+                    add_check_from(&houts[i]);
+                    if (strcmp(houts[i].status, "fail") == 0 && ngame < 64)
+                        snprintf(game_fail[ngame++], 64, "%s", g_game_https[i].name);
+                }
+            }
+            free(houts);
+        }
+
+        if (ngame > 0) {
+            char names[LONGSTR] = "", tx[LONGSTR];
+            for (i = 0; i < ngame; i++) {
+                if (i) strcat(names, ", ");
+                strcat(names, game_fail[i]);
+            }
+            snprintf(detail, sizeof detail, "Недоступны игровые сервисы (%d)", ngame);
+            snprintf(tx, sizeof tx,
+                     "Не отвечают: %s. Браузер может работать, а лаунчер/игра — нет. "
+                     "Проверьте DNS, DPI и Battle.net (HTTPS + login :1119 на *.actual.battle.net) и Steam.", names);
+            add_finding(ngame >= 3 ? "critical" : "warning", detail, tx);
+        }
+        stage_done();
+    } else if (!g_sys_dns_broken) {
+        add_check("Игры", "Этап", "info", "пропущен пользователем", "");
+    }
+
+    /* Облака + канарейки ASN (CF/Hetzner/DO/OVH/GitHub) */
     if ((g_ninfra_tcp > 0 || g_ninfra_https > 0) &&
-        stage_begin("Облако", "Selectel, AWS/S3, Azure — TCP и HTTPS")) {
+        stage_begin("Облако",
+                    "Selectel / AWS / Azure + канарейки Cloudflare, Hetzner, DO, OVH, GitHub")) {
         char fail[64][64];
         int nfail = 0;
         int n = g_ninfra_tcp;
@@ -5367,64 +7495,32 @@ int main(int argc, char **argv) {
         stage_done();
     }
 
-    /* Gaming platforms: Blizzard / Battle.net, Steam, Epic, Riot, … */
-    if (stage_begin("Игры", "Battle.net / Blizzard, Steam и популярные игровые платформы")) {
-        char game_fail[64][64];
-        int ngame = 0;
-        int n = g_ngame_tcp;
-        Check *touts = NULL, *houts = NULL;
-        int *critf = NULL;
-        if (n > 0) {
-            TcpResJobCtx tctx;
-            touts = (Check *)calloc((size_t)n, sizeof(Check));
-            critf = (int *)calloc((size_t)n, sizeof(int));
-            if (touts && critf) {
-                tctx.outs = touts; tctx.critf = critf; tctx.items = g_game_tcp;
-                tctx.cat = "Игры"; tctx.spoiler = 0; tctx.timeout_ms = 4000;
-                run_parallel(n, opt_jobs, tcp_res_job, &tctx, "игры TCP");
-                for (i = 0; i < n; i++) {
-                    add_check_from(&touts[i]);
-                    if (critf[i] && ngame < 64)
-                        snprintf(game_fail[ngame++], 64, "%s", g_game_tcp[i].name);
-                }
-            }
-            free(touts); free(critf);
-        }
-        stage_item("Steam CM", n + 1, n + 1);
-        check_steam_cm(&ngame, game_fail, 64);
-
-        {
-            int nh = g_ngame_https;
+    /* Гео / IX — как CheckHost, но с этой сети к точкам стран и peering IX */
+    if (g_ngeo > 0 &&
+        stage_begin("Гео / IX",
+                    "Канарейки по странам + известные IX (DE-CIX, AMS-IX, LINX, DATAIX…) "
+                    "и Cloudflare 100KB throttle")) {
+        int nh = g_ngeo;
+        int nfail = 0;
+        Check *houts = (Check *)calloc((size_t)nh, sizeof(Check));
+        stage_item("Cloudflare 100KB", 1, nh + 1);
+        check_cloudflare_throttle();
+        if (houts && nh > 0) {
             HttpsResJobCtx hctx;
-            houts = (Check *)calloc((size_t)nh, sizeof(Check));
-            if (houts && nh > 0) {
-                hctx.outs = houts; hctx.items = g_game_https; hctx.cat = "Игры";
-                hctx.multi_ua = 1; hctx.timeout_sec = 5; hctx.ok_403 = 0;
-                run_parallel(nh, opt_jobs, https_res_job, &hctx, "игры HTTPS");
-                for (i = 0; i < nh; i++) {
-                    add_check_from(&houts[i]);
-                    if (strcmp(houts[i].status, "fail") == 0 && ngame < 64)
-                        snprintf(game_fail[ngame++], 64, "%s", g_game_https[i].name);
-                }
+            hctx.outs = houts; hctx.items = g_geo; hctx.cat = "Гео / IX";
+            hctx.multi_ua = 0; hctx.timeout_sec = 12; hctx.ok_403 = 1;
+            run_parallel(nh, opt_jobs, https_res_job, &hctx, "гео/IX");
+            for (i = 0; i < nh; i++) {
+                add_check_from(&houts[i]);
+                if (strcmp(houts[i].status, "fail") == 0) nfail++;
             }
-            free(houts);
         }
-
-        if (ngame > 0) {
-            char names[LONGSTR] = "", tx[LONGSTR];
-            for (i = 0; i < ngame; i++) {
-                if (i) strcat(names, ", ");
-                strcat(names, game_fail[i]);
-            }
-            snprintf(detail, sizeof detail, "Недоступны игровые сервисы (%d)", ngame);
-            snprintf(tx, sizeof tx,
-                     "Не отвечают: %s. Браузер может работать, а лаунчер/игра — нет. "
-                     "Проверьте DNS, DPI и Battle.net (HTTPS + login :1119 на *.actual.battle.net) и Steam.", names);
-            add_finding(ngame >= 3 ? "critical" : "warning", detail, tx);
-        }
+        free(houts);
+        if (nfail >= 4)
+            add_finding("warning", "Много сбоев гео/IX",
+                        "Недоступны сразу несколько зарубежных точек/IX — "
+                        "похож фильтр по foreign AS или проблема международного пиринга.");
         stage_done();
-    } else if (!g_sys_dns_broken) {
-        add_check("Игры", "Этап", "info", "пропущен пользователем", "");
     }
 
     /* AI / LLM: TCP :443 (HTTPS часто «умный» таймаут при живом connect) */
@@ -5468,31 +7564,6 @@ int main(int argc, char **argv) {
         stage_done();
     } else if (!g_sys_dns_broken) {
         add_check("AI / LLM", "Этап", "info", "пропущен пользователем", "");
-    }
-
-    /* Video hosts: homepage + video path (full «первое видео» — probe-video) */
-    if (!opt_skip_video && stage_begin("Видео",
-                    "Яндекс Видео, VK Видео, IVI, Okko, Кинопоиск, Rutube — сайт и видео-путь")) {
-        int nv = g_nvideo;
-        int vfail = 0;
-        Check *outs = (Check *)calloc((size_t)nv, sizeof(Check));
-        VideoJobCtx vctx;
-        if (outs && nv > 0) {
-            vctx.outs = outs;
-            run_parallel(nv, opt_jobs, video_job, &vctx, "видео");
-            for (i = 0; i < nv; i++) {
-                add_check_from(&outs[i]);
-                if (strcmp(outs[i].status, "fail") == 0) vfail++;
-            }
-        }
-        free(outs);
-        if (vfail >= 3)
-            add_finding("warning", "Видеохостинги недоступны",
-                        "Яндекс/VK/IVI/Okko/Кинопоиск/Rutube — проверьте DPI/DNS. "
-                        "Детальный прогон: ./probe-video");
-        stage_done();
-    } else if (opt_skip_video) {
-        add_check("Видео", "Этап", "info", "пропущен (--skip-video)", "");
     }
 
     /* Speed: РФ (Москва/Selectel) + Европа (OVH), плюс краткий Яндекс IP */
@@ -5609,6 +7680,7 @@ int main(int argc, char **argv) {
             {"Cloudflare", "1.1.1.1"},
             {"Google", "8.8.8.8"},
             {"Quad9", "9.9.9.9"},
+            {"AdGuard DNS", "94.140.14.14"},
         };
         int nr = (int)(sizeof resolvers / sizeof resolvers[0]);
         int limit = opt_dns_limit;
@@ -5690,37 +7762,6 @@ int main(int argc, char **argv) {
         add_check("DNS-прогон", "Этап", "info", "пропущен (Enter не нажат)", "");
     }
 
-    /* RU banks / services */
-    if (stage_begin("Банки и сервисы РФ", "Доступность популярных банков и порталов")) {
-        int n = g_nbanks;
-        Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
-        int *failed = (int *)calloc((size_t)n, sizeof(int));
-        int *slow_ms = (int *)calloc((size_t)n, sizeof(int));
-        if (g_resources_from_file)
-            add_check("Банки и сервисы РФ", "Список", "info",
-                      resources_loaded[0] ? resources_loaded : "resources.conf", "");
-        if (outs && failed && slow_ms && n > 0) {
-            BankJobCtx bctx;
-            bctx.outs = outs; bctx.failed = failed; bctx.slow_ms = slow_ms;
-            run_parallel(n, opt_jobs, bank_job, &bctx, "банки");
-            for (i = 0; i < n; i++) {
-                add_check_from(&outs[i]);
-                if (failed[i] && nfail < 40)
-                    snprintf(fail_names[nfail++], 64, "%s", g_banks[i].name);
-                if (slow_ms[i] && nslow < 40)
-                    snprintf(slow_names[nslow++], 80, "%s %dms", g_banks[i].name, slow_ms[i]);
-            }
-        } else {
-            for (i = 0; i < n; i++) {
-                stage_item(g_banks[i].name, i + 1, n);
-                check_ru(g_banks[i].cat, g_banks[i].name, g_banks[i].url, "", 0, 0,
-                         fail_names, &nfail, slow_names, &nslow);
-            }
-        }
-        free(outs); free(failed); free(slow_ms);
-        stage_done();
-    }
-
     if (nfail > 0) {
         char names[LONGSTR] = "", tx[LONGSTR];
         for (i = 0; i < nfail; i++) {
@@ -5749,6 +7790,7 @@ int main(int argc, char **argv) {
                     "и проверьте DFS-канал на AP.");
     }
 
+    flush_cdn_findings();
     enrich_fail_netdiag();
     write_html();
     printf("\nОтчёт: %s\n", report_path);
