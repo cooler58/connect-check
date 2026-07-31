@@ -4848,10 +4848,10 @@ static void write_html(void) {
         "function downloadProblemsTxt(){\n"
         "const rows=window.CC_PROBLEMS||[];\n"
         "const stamp=window.CC_STAMP||'report';\n"
-        "let t='# connect-check problem nodes (fail + warn)\\n';\n"
+        "let t='# connect-check problem nodes (fail only)\\n';\n"
         "t+='# generated: '+stamp+' · connect-check '+((window.CC_VER)||'')+'\\n';\n"
         "t+='# NAME | CHECKED | STATUS | IP | PORT | PROTO | SNI | URL\\n\\n';\n"
-        "if(!rows.length){t+='(нет проблемных узлов)\\n';}\n"
+        "if(!rows.length){t+='(нет сбоев)\\n';}\n"
         "for(const r of rows){\n"
         "  t+=r.name+'\\n';\n"
         "  t+='  checked: '+r.cat+'\\n';\n"
@@ -4900,8 +4900,8 @@ static void write_html(void) {
         int nprob = 0, first = 1;
         fputs("<div class=\"toolbar\">"
               "<button type=\"button\" class=\"btn-dl\" onclick=\"downloadProblemsTxt()\">"
-              "Скачать TXT проблемных узлов</button>"
-              "<span class=\"muted\">fail + warn · имя, что проверяли, IP : PORT PROTO SNI URL</span>"
+              "Скачать TXT сбоев</button>"
+              "<span class=\"muted\">только fail · имя, что проверяли, IP : PORT PROTO SNI URL</span>"
               "</div>\n", f);
         fputs("<script>\nwindow.CC_STAMP=\"", f);
         json_esc(f, stamp);
@@ -4911,7 +4911,7 @@ static void write_html(void) {
         for (i = 0; i < nchecks; i++) {
             Check *c = &checks[i];
             char ip[64], port[16], proto[32], sni[128], url[256];
-            if (strcmp(c->status, "fail") != 0 && strcmp(c->status, "warn") != 0)
+            if (strcmp(c->status, "fail") != 0)
                 continue;
             check_endpoint_fields(c, ip, sizeof ip, port, sizeof port,
                                   proto, sizeof proto, sni, sizeof sni, url, sizeof url);
@@ -5125,7 +5125,7 @@ static void write_html(void) {
         "<div class=\"howto\"><h2>Как читать отчёт</h2><ul>"
         "<li><strong>Шапка</strong> — крупно только <em>Сбои</em>; <em>Внимание</em> свёрнуто "
         "(карточки и warning-выводы по клику). Critical-выводы открыты. "
-        "Кнопка TXT проблемных узлов (имя, IP, PORT, PROTO, SNI, URL), затем таблицы проверок.</li>"
+        "Кнопка TXT сбоев (только fail; имя, IP, PORT, PROTO, SNI, URL), затем таблицы проверок.</li>"
         "<li><strong>SNI / IP / URL / сеть</strong> — в спойлере у проверки: хост, IP, URL; "
         "для сбоев (fail) дополнительно ping и traceroute с кнопками копирования.</li>"
         "<li><strong>Captive / OS</strong> — URL, по которым телефон/ПК решают «есть ли интернет». "
