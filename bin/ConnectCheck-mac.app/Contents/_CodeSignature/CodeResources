@@ -15,10 +15,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			6x95k7RvWAF1JWl5mOaUFaxJpNQ=
+			qLNZRBU5ipayfmHZd21rlOtSLyA=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"eb1f7993b46f58017525697998e69415ac49a4d4"</string>
+			<string>cdhash H"a8b3594415398a96b27e61d9776d6b94eb522f20"</string>
 		</dict>
 		<key>MacOS/libglfw.3.dylib</key>
 		<dict>

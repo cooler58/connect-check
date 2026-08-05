@@ -6161,7 +6161,7 @@ static int diagnose_core(void) {
     if (opt_yes) engine_log("Режим -y: без вопросов; DNS-прогон пропускается (нужен --dns-bulk).");
     engine_logf("Параллельность: %d jobs", opt_jobs);
 
-    printf("\n▶ Сеть и Wi‑Fi\n");
+    if (stage_begin("Сеть и Wi‑Fi", "Локальный IP, шлюз, DNS, Wi‑Fi, ping")) {
     stage_progress("локальная сеть", 1, 6);
     detect_network();
     stage_progress("Wi‑Fi", 2, 6);
@@ -6336,14 +6336,9 @@ static int diagnose_core(void) {
     stage_progress("резолв имён", 6, 6);
     assess_system_dns();
     stage_done();
+    } /* stage Сеть и Wi‑Fi */
 
-    if (g_sys_dns_broken) {
-        printf("\n▶ Captive / OS — пропущено (DNS)\n");
-        add_check("Captive / OS", "Этап", "info",
-                  "пропущен — DNS не резолвит имена",
-                  "Без резолва captive-проверки дают ложный «нет интернета».");
-    } else {
-    printf("\n▶ Captive / OS (мобильные + ПК)\n");
+    if (stage_begin("Captive / OS", "Мобильные и ПК connectivity-check / generate_204")) {
     {
         /* Mobile OEMs + desktop OS connectivity probes — «нет интернета» без HTTP сюда */
         struct { const char *name, *url; int expect; int critical; } caps[] = {
@@ -6448,7 +6443,7 @@ static int diagnose_core(void) {
         }
     }
     stage_done();
-    } /* !g_sys_dns_broken captive */
+    } /* stage Captive / OS */
 
 #ifdef _WIN32
     add_check("IPv6", "Глобальный адрес", "info",
@@ -6551,12 +6546,7 @@ static int diagnose_core(void) {
     } /* !g_sys_dns_broken external IP */
 
     /* NTP — IoT TLS depends on correct clock */
-    if (g_sys_dns_broken) {
-        printf("\n▶ NTP — пропущено (DNS)\n");
-        add_check("NTP / время", "Этап", "info",
-                  "пропущен — DNS не резолвит имена",
-                  "Без резолва NTP-хостов нельзя отличить фильтр UDP/123 от DNS.");
-    } else {
+    if (stage_begin("NTP", "UDP/123 — время для TLS на IoT")) {
         const char *ntp_hosts[] = {
             "time.google.com", "time.cloudflare.com", "pool.ntp.org"
         };
@@ -6564,7 +6554,6 @@ static int diagnose_core(void) {
         int ntp_n = (int)(sizeof ntp_hosts / sizeof ntp_hosts[0]);
         Check *nout = (Check *)calloc((size_t)ntp_n, sizeof(Check));
         int *nok = (int *)calloc((size_t)ntp_n, sizeof(int));
-        printf("\n▶ NTP\n");
         if (nout && nok) {
             NtpCtx nctx;
             nctx.outs = nout; nctx.ok = nok; nctx.hosts = ntp_hosts;
@@ -7855,6 +7844,47 @@ static int diagnose_core(void) {
 
 }
 
+
+int cc_engine_stages(const CcOpts *opts, char titles[][CC_STAGE_TITLE_LEN],
+                     int *skipped, int max) {
+    static const char *const all[] = {
+        "Сеть и Wi‑Fi",
+        "Captive / OS",
+        "NTP",
+        "Умный дом / IoT",
+        "DPI",
+        "CDN / счётчики",
+        "Значимые ресурсы (Белые списки МЦ)",
+        "Зарубежные ресурсы",
+        "Банки и сервисы РФ",
+        "Почта",
+        "Видео",
+        "Игры",
+        "Облако",
+        "Репозитории / обновления",
+        "Гео / IX",
+        "AI / LLM",
+        "Скорость",
+        "DNS-прогон",
+    };
+    int nall = (int)(sizeof all / sizeof all[0]);
+    int skip_video = opts && opts->skip_video;
+    int skip_speed = opts && opts->skip_speed;
+    int skip_dns = opts && opts->skip_dns_bulk && !opts->force_dns_bulk;
+    int i, n = 0;
+
+    if (!titles || max <= 0) return 0;
+    for (i = 0; i < nall && n < max; i++) {
+        int sk = 0;
+        if (strcmp(all[i], "Видео") == 0) sk = skip_video;
+        else if (strcmp(all[i], "Скорость") == 0) sk = skip_speed;
+        else if (strcmp(all[i], "DNS-прогон") == 0) sk = skip_dns;
+        snprintf(titles[n], CC_STAGE_TITLE_LEN, "%s", all[i]);
+        if (skipped) skipped[n] = sk ? 1 : 0;
+        n++;
+    }
+    return n;
+}
 
 int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb) {
     g_engine_cb = cb;

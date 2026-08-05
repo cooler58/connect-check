@@ -35,6 +35,16 @@ typedef struct {
 /* Полный прогон диагностики. 0 = без fail, 1 = были fail, <0 = ошибка/отмена. */
 int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb);
 
+/*
+ * Каталог этапов в порядке прогона (для GUI-чеклиста).
+ * titles[i] — заголовок (как в on_stage); skipped[i]=1 если opts отключают этап
+ * (видео/скорость/DNS-прогон). skipped может быть NULL.
+ * Возвращает число этапов (≤ max).
+ */
+#define CC_STAGE_TITLE_LEN 96
+int cc_engine_stages(const CcOpts *opts, char titles[][CC_STAGE_TITLE_LEN],
+                     int *skipped, int max);
+
 /* Запросить остановку (из UI-потока). */
 void cc_engine_request_cancel(void);
 

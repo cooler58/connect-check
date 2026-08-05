@@ -61,12 +61,28 @@
 #define MAX_EVQ     512
 #define MAX_STAGES  40
 #define MAX_PROBE_W 6
+#define STAGE_PANEL_H_DEFAULT 168
+#define STAGE_PANEL_H_MIN     90
+#define LOG_H_FLOOR           220
+#define LOG_H_FLOOR_MIN       180
 
 typedef struct {
     char lines[MAX_LOG][LOG_LINE];
     int n;
     int scroll_bottom;
 } LogBuf;
+
+typedef enum {
+    ST_PENDING = 0,
+    ST_RUNNING,
+    ST_DONE,
+    ST_SKIPPED
+} StageState;
+
+typedef struct {
+    char title[CC_STAGE_TITLE_LEN];
+    StageState state;
+} StageItem;
 
 typedef enum {
     EV_LOG = 0,
@@ -116,14 +132,14 @@ static char g_update_err[256];
 static char g_update_banner[192];
 
 /* engine UI state */
-static char g_stage_cur[160];
-static char g_stages[MAX_STAGES][96];
+static StageItem g_stages[MAX_STAGES];
 static int g_stage_n;
 static int g_ui_ok, g_ui_warn, g_ui_fail;
 static char g_report_path[PATH_MAX_G];
 static volatile int g_diag_busy;
 static volatile int g_probe_busy[MAX_PROBE_W];
 static volatile int g_probe_cancel[MAX_PROBE_W];
+static int g_stage_panel_h = STAGE_PANEL_H_DEFAULT;
 
 static Ev g_evq[MAX_EVQ];
 static int g_ev_head, g_ev_tail, g_ev_count;
@@ -569,6 +585,55 @@ static void cb_on_done(void *ud, const char *report_path, int ok_n, int warn_n, 
     ev_push(&e);
 }
 
+static void stages_rebuild_plan(void) {
+    CcOpts opts;
+    char titles[MAX_STAGES][CC_STAGE_TITLE_LEN];
+    int skipped[MAX_STAGES];
+    int n, i;
+    memset(&opts, 0, sizeof opts);
+    opts.skip_dns_bulk = opt_skip_dns && !opt_dns_bulk;
+    opts.force_dns_bulk = opt_dns_bulk;
+    opts.skip_video = opt_skip_video;
+    opts.skip_speed = opt_skip_speed;
+    n = cc_engine_stages(&opts, titles, skipped, MAX_STAGES);
+    g_stage_n = 0;
+    for (i = 0; i < n; i++) {
+        snprintf(g_stages[i].title, sizeof g_stages[i].title, "%s", titles[i]);
+        g_stages[i].state = skipped[i] ? ST_SKIPPED : ST_PENDING;
+        g_stage_n++;
+    }
+}
+
+static void stages_on_begin(const char *title) {
+    int i, found = -1;
+    if (!title || !title[0]) return;
+    for (i = 0; i < g_stage_n; i++) {
+        if (g_stages[i].state == ST_RUNNING)
+            g_stages[i].state = ST_DONE;
+        if (found < 0 && strcmp(g_stages[i].title, title) == 0)
+            found = i;
+    }
+    if (found >= 0) {
+        g_stages[found].state = ST_RUNNING;
+        return;
+    }
+    if (g_stage_n < MAX_STAGES) {
+        snprintf(g_stages[g_stage_n].title, sizeof g_stages[0].title, "%s", title);
+        g_stages[g_stage_n].state = ST_RUNNING;
+        g_stage_n++;
+    }
+}
+
+static void stages_on_done(void) {
+    int i;
+    for (i = 0; i < g_stage_n; i++) {
+        if (g_stages[i].state == ST_RUNNING)
+            g_stages[i].state = ST_DONE;
+        else if (g_stages[i].state == ST_PENDING)
+            g_stages[i].state = ST_SKIPPED;
+    }
+}
+
 static void drain_events(void) {
     Ev e;
     while (ev_pop(&e)) {
@@ -583,14 +648,7 @@ static void drain_events(void) {
                 log_progress("engine", "");
             break;
         case EV_STAGE:
-            snprintf(g_stage_cur, sizeof g_stage_cur, "%s", e.a);
-            if (e.a[0] && g_stage_n < MAX_STAGES) {
-                int dup = 0, i;
-                for (i = 0; i < g_stage_n; i++)
-                    if (strcmp(g_stages[i], e.a) == 0) { dup = 1; break; }
-                if (!dup)
-                    snprintf(g_stages[g_stage_n++], sizeof g_stages[0], "%s", e.a);
-            }
+            stages_on_begin(e.a);
             {
                 char msg[LOG_LINE];
                 if (e.b[0])
@@ -627,7 +685,7 @@ static void drain_events(void) {
             g_ui_ok = e.i1;
             g_ui_warn = e.i2;
             g_ui_fail = e.i3;
-            g_stage_cur[0] = 0;
+            stages_on_done();
             {
                 char msg[LOG_LINE];
                 snprintf(msg, sizeof msg, "готово: ok=%d warn=%d fail=%d", e.i1, e.i2, e.i3);
@@ -740,10 +798,9 @@ static void run_diagnose(void) {
     if (g_workdir[0])
         snprintf(opts->workdir, sizeof opts->workdir, "%s", g_workdir);
 
-    g_stage_n = 0;
-    g_stage_cur[0] = 0;
     g_ui_ok = g_ui_warn = g_ui_fail = 0;
     g_report_path[0] = 0;
+    stages_rebuild_plan();
     cc_engine_clear_cancel();
     g_diag_busy = 1;
     snprintf(g_status, sizeof g_status, "Диагностика…");
@@ -979,6 +1036,8 @@ static void do_self_update(void) {
 static void ui_tab_diagnose(struct nk_context *ctx) {
     int i;
     char sum[160];
+    static int prev_skip_dns = -1, prev_skip_video = -1, prev_dns_bulk = -1, prev_skip_speed = -1;
+
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, "Параметры диагностики", NK_TEXT_LEFT);
     nk_layout_row_dynamic(ctx, 24, 1);
@@ -995,32 +1054,44 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, opt_outdir, sizeof opt_outdir, nk_filter_default);
     nk_layout_row_end(ctx);
 
+    if (!g_diag_busy &&
+        (prev_skip_dns != opt_skip_dns || prev_skip_video != opt_skip_video ||
+         prev_dns_bulk != opt_dns_bulk || prev_skip_speed != opt_skip_speed ||
+         g_stage_n == 0)) {
+        stages_rebuild_plan();
+        prev_skip_dns = opt_skip_dns;
+        prev_skip_video = opt_skip_video;
+        prev_dns_bulk = opt_dns_bulk;
+        prev_skip_speed = opt_skip_speed;
+    }
+
     snprintf(sum, sizeof sum, "Сбои: %d   Внимание: %d   OK: %d", g_ui_fail, g_ui_warn, g_ui_ok);
     nk_layout_row_dynamic(ctx, 24, 1);
     nk_label_colored(ctx, sum, NK_TEXT_LEFT,
                      g_ui_fail > 0 ? nk_rgb(200, 90, 80) : nk_rgb(40, 140, 60));
-    if (g_stage_cur[0]) {
-        char cur[192];
-        snprintf(cur, sizeof cur, "Сейчас: %s", g_stage_cur);
-        nk_label(ctx, cur, NK_TEXT_LEFT);
-    }
-    if (g_stage_n > 0) {
+
+    nk_layout_row_dynamic(ctx, (float)g_stage_panel_h, 1);
+    if (nk_group_begin(ctx, "stages", NK_WINDOW_BORDER)) {
+        nk_layout_row_dynamic(ctx, 18, 1);
         nk_label(ctx, "Этапы:", NK_TEXT_LEFT);
-        for (i = 0; i < g_stage_n && i < 12; i++) {
-            char lab[128];
-            int active = (g_stage_cur[0] && strcmp(g_stages[i], g_stage_cur) == 0);
-            snprintf(lab, sizeof lab, "%s %s", active ? "→" : "•", g_stages[i]);
-            nk_layout_row_dynamic(ctx, 18, 1);
-            if (active)
-                nk_label_colored(ctx, lab, NK_TEXT_LEFT, nk_rgb(80, 160, 220));
-            else
-                nk_label(ctx, lab, NK_TEXT_LEFT);
+        for (i = 0; i < g_stage_n; i++) {
+            char lab[140];
+            const char *mark = "○";
+            struct nk_color col = nk_rgb(120, 120, 130);
+            if (g_stages[i].state == ST_RUNNING) {
+                mark = "→";
+                col = nk_rgb(80, 160, 220);
+            } else if (g_stages[i].state == ST_DONE) {
+                mark = "✓";
+                col = nk_rgb(40, 140, 60);
+            } else if (g_stages[i].state == ST_SKIPPED) {
+                mark = "⏭";
+                col = nk_rgb(150, 150, 155);
+            }
+            snprintf(lab, sizeof lab, "%s %s", mark, g_stages[i].title);
+            nk_label_colored(ctx, lab, NK_TEXT_LEFT, col);
         }
-        if (g_stage_n > 12) {
-            char more[48];
-            snprintf(more, sizeof more, "… ещё %d", g_stage_n - 12);
-            nk_label(ctx, more, NK_TEXT_LEFT);
-        }
+        nk_group_end(ctx);
     }
 
     nk_layout_row_dynamic(ctx, 34, 3);
@@ -1088,6 +1159,8 @@ static void ui_tab_url(struct nk_context *ctx) {
 static void ui_frame(struct nk_context *ctx, int width, int height) {
     char hdr[PATH_MAX_G + 64];
     int log_h;
+    /* Панель этапов: фиксированная высота; на низком окне — компактнее */
+    g_stage_panel_h = (height < 720) ? STAGE_PANEL_H_MIN : STAGE_PANEL_H_DEFAULT;
     if (nk_begin(ctx, "Connect Check", nk_rect(0, 0, (float)width, (float)height),
                  NK_WINDOW_NO_SCROLLBAR)) {
         if (g_resources[0])
@@ -1125,7 +1198,10 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         }
 
         log_h = height - (int)ctx->current->layout->at_y - 40;
-        if (log_h < 120) log_h = 120;
+        {
+            int floor = (height < 720) ? LOG_H_FLOOR_MIN : LOG_H_FLOOR;
+            if (log_h < floor) log_h = floor;
+        }
         nk_layout_row_dynamic(ctx, (float)log_h, 1);
         if (nk_group_begin(ctx, "log", NK_WINDOW_BORDER)) {
             int i;
@@ -1157,6 +1233,7 @@ static void gui_init_common(void) {
     g_ev_lock_ok = 1;
 #endif
     resolve_pkg();
+    stages_rebuild_plan();
     log_add("", "Connect Check GUI " CONNECT_CHECK_VERSION " — движок встроен");
     if (g_workdir[0]) log_add("pkg", g_workdir);
     if (g_resources[0]) log_add("resources", g_resources);
