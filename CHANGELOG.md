@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-08-05
+
+### Changed
+- **GUI-only релиз**: диагностика и пробы выполняются **внутри приложения** (in-process движок `cc_engine` / `cc_probe_*`). Отдельные `connect-check` и `probe-*` больше не входят в пакет и архивы Release.
+- GUI: worker-thread + callbacks — этапы, счётчики сбоев/внимания, кнопка «Открыть отчёт»; баннер «Движок встроен» вместо пути к CLI.
+- Self-update и `dist/`: раскладка только GUI + `resources.conf` + `VERSION` (+ шрифты/лаунчеры).
+- Документация: `docs/VERSIONING.md`, `docs/UPDATE.md`, `bin/README.md`.
+
+### Notes
+- Клиенты **&lt; 1.3.0**, ожидающие CLI в `mac|linux|win/`, не обновляются «частично» — скачайте полный пакет с Releases.
+
 ## [1.2.7] — 2026-07-31
 
 ### Changed

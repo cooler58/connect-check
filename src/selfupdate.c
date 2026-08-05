@@ -580,15 +580,18 @@ int update_detect_install_root(const char *argv0_or_bindir, char *out, size_t n)
 #endif
     }
 
-    /* If base is .../mac|linux|win, parent may be package root */
-    if (strcmp(path_basename(base), sub) == 0) {
+    (void)sub;
+
+    /* If base is .../mac|linux|win (legacy), parent may be package root */
+    if (strcmp(path_basename(base), "mac") == 0 ||
+        strcmp(path_basename(base), "linux") == 0 ||
+        strcmp(path_basename(base), "win") == 0) {
         path_dirname(base, parent, sizeof parent);
         path_join2(marker, sizeof marker, parent, gui);
         if (file_exists(marker) || is_dir(marker)) {
             snprintf(out, n, "%s", parent);
             return 0;
         }
-        /* also: parent/bin layout already is package if VERSION sits next to subdir */
         {
             char ver[PATH_MAX];
             path_join2(ver, sizeof ver, parent, "VERSION");
@@ -597,30 +600,36 @@ int update_detect_install_root(const char *argv0_or_bindir, char *out, size_t n)
                 return 0;
             }
         }
-        /* CLI-only */
         snprintf(out, n, "%s", base);
         return 0;
     }
 
-    /* base itself may be package root (has OS subdir + GUI) */
+    /* GUI-only package: GUI marker and/or VERSION + resources.conf */
     {
-        char subdir[PATH_MAX];
-        path_join2(subdir, sizeof subdir, base, sub);
+        char ver[PATH_MAX], res[PATH_MAX];
         path_join2(marker, sizeof marker, base, gui);
-        if (is_dir(subdir) && (file_exists(marker) || is_dir(marker))) {
+        path_join2(ver, sizeof ver, base, "VERSION");
+        path_join2(res, sizeof res, base, "resources.conf");
+        if (file_exists(marker) || is_dir(marker) || file_exists(ver) || file_exists(res)) {
             snprintf(out, n, "%s", base);
             return 0;
         }
-        if (is_dir(subdir)) {
-            /* package-like without GUI */
-            char ver[PATH_MAX];
-            path_join2(ver, sizeof ver, base, "VERSION");
-            if (file_exists(ver)) {
-                snprintf(out, n, "%s", base);
+    }
+
+#ifdef __APPLE__
+    /* …/ConnectCheck-mac.app/Contents/MacOS → package root (родитель .app) */
+    {
+        size_t len = strlen(base);
+        if (len > 15 && strcmp(base + len - 15, "/Contents/MacOS") == 0) {
+            char up[PATH_MAX], real[PATH_MAX];
+            snprintf(up, sizeof up, "%s/../../..", base);
+            if (realpath(up, real)) {
+                snprintf(out, n, "%s", real);
                 return 0;
             }
         }
     }
+#endif
 
     snprintf(out, n, "%s", base);
     return 0;
@@ -744,57 +753,28 @@ static int extract_archive(const char *archive, const char *dest, char *err, siz
 
 static int verify_staging_layout(const char *staging, int package_root, char *err, size_t errlen) {
     char p[PATH_MAX];
-    const char *sub = os_cli_subdir();
-    if (package_root) {
-        path_join2(p, sizeof p, staging, "VERSION");
-        if (!file_exists(p)) {
-            /* VERSION may be optional in older packs — check CLI */
-        }
-        path_join2(p, sizeof p, staging, sub);
-        if (!is_dir(p)) {
-            set_err(err, errlen, "в архиве нет каталога CLI для этой ОС");
-            return -1;
-        }
-#ifdef _WIN32
-        path_join2(p, sizeof p, staging, "win\\connect-check.exe");
-#else
-        {
-            char cli[PATH_MAX];
-            path_join2(cli, sizeof cli, staging, sub);
-            path_join2(p, sizeof p, cli, "connect-check");
-        }
-#endif
-        if (!file_exists(p)) {
-            set_err(err, errlen, "в архиве нет connect-check");
-            return -1;
-        }
-    } else {
-        /* CLI-only staging may still have subdir layout from archive */
-        char a[PATH_MAX], b[PATH_MAX];
-        path_join2(a, sizeof a, staging, sub);
-#ifdef _WIN32
-        path_join2(b, sizeof b, a, "connect-check.exe");
-        path_join2(p, sizeof p, staging, "connect-check.exe");
-#else
-        path_join2(b, sizeof b, a, "connect-check");
-        path_join2(p, sizeof p, staging, "connect-check");
-#endif
-        if (!file_exists(b) && !file_exists(p)) {
-            set_err(err, errlen, "после распаковки нет connect-check");
-            return -1;
-        }
+    const char *gui = gui_marker_name();
+    (void)package_root;
+    path_join2(p, sizeof p, staging, gui);
+    if (!file_exists(p) && !is_dir(p)) {
+        /* legacy archive: GUI + mac|linux|win/ */
+        char sub[PATH_MAX];
+        path_join2(sub, sizeof sub, staging, os_cli_subdir());
+        if (is_dir(sub) && (file_exists(p) || is_dir(p)))
+            return 0;
+        set_err(err, errlen, "в архиве нет GUI для этой ОС");
+        return -1;
     }
     return 0;
 }
 
 static int is_package_root(const char *root) {
-    char sub[PATH_MAX], marker[PATH_MAX], ver[PATH_MAX];
-    path_join2(sub, sizeof sub, root, os_cli_subdir());
+    char marker[PATH_MAX], ver[PATH_MAX], res[PATH_MAX];
     path_join2(marker, sizeof marker, root, gui_marker_name());
     path_join2(ver, sizeof ver, root, "VERSION");
-    if (!is_dir(sub)) return 0;
+    path_join2(res, sizeof res, root, "resources.conf");
     if (file_exists(marker) || is_dir(marker)) return 1;
-    if (file_exists(ver)) return 1;
+    if (file_exists(ver) && file_exists(res)) return 1;
     return 0;
 }
 

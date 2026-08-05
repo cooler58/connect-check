@@ -1,8 +1,8 @@
-# Connect Check GUI — Nuklear + GLFW
+# Connect Check GUI — Nuklear + in-process engine (без CLI/probe-*)
 #
 # Раскладка bin/:
 #   GUI → корень bin/  (ConnectCheck-mac.app, connect-check-gui-linux, connect-check-gui-win.exe)
-#   CLI → bin/{mac,linux,win}/  (connect-check, probe-*)
+#   + VERSION, resources.conf, шрифты
 #
 #   make -f Makefile.gui              — GUI текущей ОС → корень bin/
 #   make -f Makefile.gui package-all  — mac + win + linux
@@ -11,11 +11,13 @@
 UNAME_S := $(shell uname -s)
 ROOT    := $(CURDIR)
 TP      := $(ROOT)/third_party
-SRC     := gui/connect-check-gui.c src/selfupdate.c
+ENGINE  := src/connect-check.c src/cc_probes.c src/selfupdate.c
+SRC     := gui/connect-check-gui.c $(ENGINE)
 FONT    := $(TP)/fonts/DejaVuSans.ttf
 GLFW_WIN ?= $(TP)/win
 VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
-VER_CFLAG := -DCONNECT_CHECK_VERSION=\"$(VERSION)\"
+VER_CFLAG := -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY
+EMBED_H := build/top_domains_embed.h
 STAGING := build/gui
 
 .PHONY: all package run clean deps-hint \
@@ -38,9 +40,9 @@ else
 endif
 
 # --- macOS: только ConnectCheck-mac.app в корне bin/ ---
-MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src \
+MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src -I$(ROOT)/build \
                -I/opt/homebrew/include -I/usr/local/include $(VER_CFLAG)
-MAC_LDFLAGS := -L/opt/homebrew/lib -L/usr/local/lib -lglfw \
+MAC_LDFLAGS := -L/opt/homebrew/lib -L/usr/local/lib -lglfw -pthread \
                -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
 MAC_STAGED  := $(STAGING)/mac/connect-check-gui
 
@@ -63,16 +65,21 @@ ifeq ($(UNAME_S),Darwin)
 	@cp -f $(MAC_STAGED) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 	@cp -f $(STAGING)/mac/libglfw.3.dylib bin/ConnectCheck-mac.app/Contents/MacOS/ 2>/dev/null || true
 	@cp -f $(FONT) bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf 2>/dev/null || true
-	@# убрать GUI-артефакты из bin/mac (там только CLI)
+	@cp -f resources.conf bin/resources.conf
+	@cp -f VERSION bin/VERSION
+	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf 2>/dev/null || true
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
 	@rm -f bin/connect-check-gui-mac
-	@echo "→ bin/ConnectCheck-mac.app"
+	@echo "→ bin/ConnectCheck-mac.app (engine in-process)"
 	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 else
 	@echo "package-mac только на Darwin"; exit 1
 endif
 
-$(MAC_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(EMBED_H):
+	$(MAKE) -f Makefile.diagnose embed
+
+$(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Darwin)
 	mkdir -p $(STAGING)/mac
 	$(CC) $(MAC_CFLAGS) -o $@ $(SRC) $(MAC_LDFLAGS)
@@ -90,9 +97,10 @@ endif
 WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
 WIN_CC  := x86_64-w64-mingw32-gcc
 # Windows GUI: GDI+ (без OpenGL/GLFW — portable на Win10 без GPU ICD)
-WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src $(VER_CFLAG) \
+WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(ROOT)/build $(VER_CFLAG) \
                -mcrtdll=msvcrt-os -static-libgcc
-WIN_LDFLAGS := -mwindows -lgdiplus -lshlwapi -lole32 -luuid -lgdi32 -luser32 -lshell32 -lwinmm -lwininet
+WIN_LDFLAGS := -mwindows -lgdiplus -lshlwapi -lole32 -luuid -lgdi32 -luser32 -lshell32 -lwinmm \
+               -lwininet -lws2_32 -liphlpapi
 
 fetch-glfw-win:
 	@if [ -f "$(GLFW_WIN)/lib/libglfw3.a" ]; then \
@@ -111,19 +119,22 @@ package-win: $(WIN_STAGED)
 	@cp -f $(WIN_STAGED) bin/connect-check-gui-win.exe
 	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd 2>/dev/null || true
+	@cp -f resources.conf bin/resources.conf
+	@cp -f VERSION bin/VERSION
 	@rm -f bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
+	@rm -rf bin/win
 	@ls -lh bin/connect-check-gui-win.exe
 	@file bin/connect-check-gui-win.exe | sed 's|^|  |'
 	@x86_64-w64-mingw32-objdump -p bin/connect-check-gui-win.exe 2>/dev/null | \
 	  awk '/DLL Name/{print "  " $$3}' | head -20
 
-$(WIN_STAGED): $(SRC) src/version.h src/selfupdate.h VERSION $(TP)/nuklear.h $(TP)/nuklear_gdip.h
+$(WIN_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION $(TP)/nuklear.h $(TP)/nuklear_gdip.h
 	mkdir -p $(STAGING)/win
 	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_LDFLAGS)
 
 # --- Linux: GUI + libglfw + font в корне bin/ ---
 LINUX_STAGED := $(STAGING)/linux/connect-check-gui
-LINUX_CFLAGS  := -O2 -Wall -I$(TP) -I$(ROOT)/src $(VER_CFLAG) $(shell pkg-config --cflags glfw3 2>/dev/null)
+LINUX_CFLAGS  := -O2 -Wall -I$(TP) -I$(ROOT)/src -I$(ROOT)/build $(VER_CFLAG) $(shell pkg-config --cflags glfw3 2>/dev/null)
 LINUX_LDFLAGS := $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw) -lGL -lm -ldl -lpthread -Wl,-rpath,'$$ORIGIN'
 
 package-linux-native: $(LINUX_STAGED)
@@ -132,10 +143,13 @@ package-linux-native: $(LINUX_STAGED)
 	@SO=$$(ldd $(LINUX_STAGED) 2>/dev/null | awk '/libglfw/{print $$3; exit}'); \
 	  if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" bin/; fi
 	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
+	@cp -f resources.conf bin/resources.conf
+	@cp -f VERSION bin/VERSION
 	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
+	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 
-$(LINUX_STAGED): $(SRC) src/version.h src/selfupdate.h $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(LINUX_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Linux)
 	mkdir -p $(STAGING)/linux
 	$(CC) $(LINUX_CFLAGS) -o $@ $(SRC) $(LINUX_LDFLAGS)
@@ -158,8 +172,11 @@ else
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
 	      gcc pkg-config libglfw3-dev libgl1-mesa-dev >/dev/null; \
 	    mkdir -p build/gui/linux; \
-	    gcc -O2 -Wall -Ithird_party -Isrc -DCONNECT_CHECK_VERSION=\"$(VERSION)\" $$(pkg-config --cflags glfw3) \
+	    python3 scripts/embed_domains.py wordlists/top_domains.txt build/top_domains_embed.h; \
+	    gcc -O2 -Wall -Ithird_party -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY \
+	      $$(pkg-config --cflags glfw3) \
 	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c src/selfupdate.c \
+	      src/connect-check.c src/cc_probes.c \
 	      $$(pkg-config --libs glfw3) -lGL -lm -ldl -lpthread -Wl,-rpath,\$$ORIGIN; \
 	    SO=$$(ldd build/gui/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
 	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then \
@@ -178,7 +195,10 @@ else
 	@chmod +x bin/connect-check-gui-linux
 	@cp -f $(STAGING)/linux/libglfw.so* bin/ 2>/dev/null || true
 	@cp -f $(STAGING)/linux/DejaVuSans.ttf bin/DejaVuSans.ttf 2>/dev/null || true
+	@cp -f resources.conf bin/resources.conf
+	@cp -f VERSION bin/VERSION
 	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
+	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 endif
 

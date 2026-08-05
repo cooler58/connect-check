@@ -1,10 +1,9 @@
 /*
- * connect-check-gui.c — GUI для connect-check / probe-*.
- *   Windows: Nuklear + GDI+ (без OpenGL/GLFW — нет ошибки 65542)
+ * connect-check-gui.c — GUI с in-process движком (без spawn CLI/probe-*).
+ *   Windows: Nuklear + GDI+
  *   macOS/Linux: Nuklear + GLFW/OpenGL2
  *
  *   make -f Makefile.gui
- *   make -f Makefile.gui package
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -19,14 +18,13 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <process.h>
+#  include <shellapi.h>
 #  include <direct.h>
 #  define getcwd _getcwd
 #else
 #  include <unistd.h>
-#  include <fcntl.h>
+#  include <pthread.h>
 #  include <signal.h>
-#  include <sys/wait.h>
-#  include <libgen.h>
 #  include <limits.h>
 #  ifdef __APPLE__
 #    include <mach-o/dyld.h>
@@ -55,13 +53,14 @@
 #endif
 #include "version.h"
 #include "selfupdate.h"
+#include "cc_engine.h"
 
 #define LOG_LINE    768
 #define PATH_MAX_G  1024
-#define ARG_MAX_N   24
-#define MAX_PROCS   12
 #define MAX_LOG     400
-#define PIPE_ACC    2048  /* хвост незавершённой строки из pipe */
+#define MAX_EVQ     512
+#define MAX_STAGES  40
+#define MAX_PROBE_W 6
 
 typedef struct {
     char lines[MAX_LOG][LOG_LINE];
@@ -69,70 +68,85 @@ typedef struct {
     int scroll_bottom;
 } LogBuf;
 
-typedef struct {
-    char key[48];
-    int alive;
-    char acc[PIPE_ACC]; /* незавершённая строка между read() */
-    int acc_n;
-#ifdef _WIN32
-    HANDLE proc;
-    HANDLE rd;
-#else
-    pid_t pid;
-    int fd;
-#endif
-} Child;
+typedef enum {
+    EV_LOG = 0,
+    EV_PROGRESS,
+    EV_STAGE,
+    EV_CHECK,
+    EV_FINDING,
+    EV_DONE,
+    EV_STATUS
+} EvKind;
 
-static char g_bindir[PATH_MAX_G];
+typedef struct {
+    EvKind kind;
+    char a[160];
+    char b[256];
+    char c[512];
+    int i1, i2, i3;
+} Ev;
+
 static char g_workdir[PATH_MAX_G];
+static char g_resources[PATH_MAX_G];
 static LogBuf g_log;
-static int g_log_prog_idx = -1; /* индекс перезаписываемой progress-строки (\r), или -1 */
-static Child g_kids[MAX_PROCS];
-static int g_nkids;
+static int g_log_prog_idx = -1;
 static char g_status[128] = "Готово";
 
-/* diagnose options */
 static int opt_yes = 1, opt_skip_dns = 1, opt_skip_video, opt_dns_bulk;
 static int opt_skip_speed, opt_no_open;
 static char opt_outdir[256] = "reports";
 
-/* probes */
-static int probe_on[5] = {1, 0, 0, 0, 0}; /* captive default */
-static const char *probe_ids[] = {
-    "probe-captive", "probe-quic", "probe-battlenet", "probe-mqtt", "probe-video"
-};
+static int probe_on[5] = {1, 0, 0, 0, 0};
 static const char *probe_labels[] = {
     "Captive / DNS / DoT / DoH", "QUIC / UDP 443", "Battle.net", "MQTT / MQTTS", "Видео РФ"
 };
+static const CcProbeKind probe_kinds[] = {
+    CC_PROBE_CAPTIVE, CC_PROBE_QUIC, CC_PROBE_BATTLENET, CC_PROBE_MQTT, CC_PROBE_VIDEO
+};
 static int probe_interval = 120, probe_rounds;
 
-/* url */
 static char url_buf[512] = "https://ya.ru/";
 static int url_interval = 5, url_rounds, url_follow;
 
 static int g_tab; /* 0 diagnose, 1 probes, 2 url */
 
-/* self-update */
 static int g_update_ready;
 static UpdateInfo g_update;
 static char g_update_err[256];
 static char g_update_banner[192];
 
+/* engine UI state */
+static char g_stage_cur[160];
+static char g_stages[MAX_STAGES][96];
+static int g_stage_n;
+static int g_ui_ok, g_ui_warn, g_ui_fail;
+static char g_report_path[PATH_MAX_G];
+static volatile int g_diag_busy;
+static volatile int g_probe_busy[MAX_PROBE_W];
+static volatile int g_probe_cancel[MAX_PROBE_W];
+
+static Ev g_evq[MAX_EVQ];
+static int g_ev_head, g_ev_tail, g_ev_count;
+#ifdef _WIN32
+static CRITICAL_SECTION g_ev_lock;
+static int g_ev_lock_ok;
+#else
+static pthread_mutex_t g_ev_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 /* ---------- utils ---------- */
 
-/* Обрезать битый хвост UTF-8 (после snprintf / разрыва pipe). */
 static void utf8_trim(char *s) {
     size_t n, i;
     if (!s || !*s) return;
     n = strlen(s);
     while (n > 0) {
         unsigned char c = (unsigned char)s[n - 1];
-        if ((c & 0x80) == 0) break;           /* ASCII */
-        if ((c & 0xC0) == 0xC0) {             /* стартовый байт — неполный */
+        if ((c & 0x80) == 0) break;
+        if ((c & 0xC0) == 0xC0) {
             s[--n] = 0;
             break;
         }
-        /* continuation 10xxxxxx — ищем старт */
         i = n;
         while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) i--;
         if (i == 0) { s[0] = 0; return; }
@@ -141,17 +155,16 @@ static void utf8_trim(char *s) {
             int need = (lead & 0xE0) == 0xC0 ? 2
                      : (lead & 0xF0) == 0xE0 ? 3
                      : (lead & 0xF8) == 0xF0 ? 4 : 0;
-            if (need && (int)(n - (i - 1)) == need) break; /* полная последовательность */
+            if (need && (int)(n - (i - 1)) == need) break;
             s[i - 1] = 0;
             n = i - 1;
         }
     }
 }
 
-/* Убрать CSI/ANSI (например \033[K из stage_progress) и лишние пробелы по краям. */
 static void sanitize_log_text(char *s) {
     char *r, *w;
-    int esc = 0; /* 0 normal, 1 ESC, 2 ESC[ */
+    int esc = 0;
     if (!s) return;
     for (r = w = s; *r; r++) {
         unsigned char c = (unsigned char)*r;
@@ -167,11 +180,10 @@ static void sanitize_log_text(char *s) {
         }
         if (c == 0x1B) { esc = 1; continue; }
         if (c == '\t') { *w++ = ' '; continue; }
-        if (c < 0x20 && c != 0x09) continue; /* прочие control */
+        if (c < 0x20 && c != 0x09) continue;
         *w++ = (char)c;
     }
     *w = 0;
-    /* trim edges */
     r = s;
     while (*r == ' ') r++;
     if (r != s) memmove(s, r, strlen(r) + 1);
@@ -197,7 +209,6 @@ static void log_format_line(char *out, size_t n, const char *prefix, const char 
     utf8_trim(out);
 }
 
-/* Финальная строка лога (обычный вывод с \n). */
 static void log_add(const char *prefix, const char *msg) {
     char line[LOG_LINE];
     g_log_prog_idx = -1;
@@ -211,10 +222,6 @@ static void log_add(const char *prefix, const char *msg) {
     g_log.scroll_bottom = 1;
 }
 
-/*
- * Progress из CLI (\r / \033[K): одна перезаписываемая строка, без спама.
- * Пустой msg — убрать progress-строку (stage_done).
- */
 static void log_progress(const char *prefix, const char *msg) {
     char line[LOG_LINE];
     if (!msg || !msg[0]) {
@@ -239,66 +246,6 @@ static void log_progress(const char *prefix, const char *msg) {
     g_log.scroll_bottom = 1;
 }
 
-/* Дописать кусок pipe: \r = перезапись progress, \n = финальная строка, ANSI выкидываем. */
-static void kid_feed(Child *c, const char *chunk, size_t len) {
-    size_t i;
-    int esc = 0; /* 0 normal, 1 ESC, 2 CSI */
-    for (i = 0; i < len; i++) {
-        unsigned char uch = (unsigned char)chunk[i];
-        char ch = chunk[i];
-
-        if (esc == 1) {
-            if (uch == '[') { esc = 2; continue; }
-            esc = 0;
-            continue;
-        }
-        if (esc == 2) {
-            if ((uch >= 'A' && uch <= 'Z') || (uch >= 'a' && uch <= 'z'))
-                esc = 0;
-            continue;
-        }
-        if (uch == 0x1B) { esc = 1; continue; }
-
-        if (ch == '\r') {
-            c->acc[c->acc_n] = 0;
-            sanitize_log_text(c->acc);
-            log_progress(c->key, c->acc);
-            c->acc_n = 0;
-            continue;
-        }
-        if (ch == '\n') {
-            c->acc[c->acc_n] = 0;
-            sanitize_log_text(c->acc);
-            if (c->acc_n > 0)
-                log_add(c->key, c->acc);
-            else
-                log_progress(c->key, ""); /* пустой \n после clear — снять progress */
-            c->acc_n = 0;
-            continue;
-        }
-        if (uch < 0x20) continue; /* прочий control */
-
-        if (c->acc_n + 1 < PIPE_ACC)
-            c->acc[c->acc_n++] = ch;
-        else {
-            c->acc[c->acc_n] = 0;
-            sanitize_log_text(c->acc);
-            log_add(c->key, c->acc);
-            c->acc_n = 0;
-            c->acc[c->acc_n++] = ch;
-        }
-    }
-}
-
-static void kid_flush_acc(Child *c) {
-    if (c->acc_n > 0) {
-        c->acc[c->acc_n] = 0;
-        sanitize_log_text(c->acc);
-        if (c->acc[0])
-            log_add(c->key, c->acc);
-        c->acc_n = 0;
-    }
-}
 static void path_join(char *out, size_t n, const char *a, const char *b) {
 #ifdef _WIN32
     snprintf(out, n, "%s\\%s", a, b);
@@ -312,27 +259,21 @@ static int file_exists(const char *p) {
     DWORD a = GetFileAttributesA(p);
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 #else
-    return access(p, X_OK) == 0 || access(p, R_OK) == 0;
+    return access(p, R_OK) == 0;
 #endif
 }
 
-static void tool_name(char *out, size_t n, const char *base) {
+static int path_is_dir(const char *p) {
 #ifdef _WIN32
-    snprintf(out, n, "%s.exe", base);
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 #else
-    snprintf(out, n, "%s", base);
+    return access(p, R_OK) == 0; /* enough for .app bundle check via exists path */
 #endif
 }
 
-#if defined(_WIN32)
-#  define OS_CLI_SUBDIR "win"
-#elif defined(__APPLE__)
-#  define OS_CLI_SUBDIR "mac"
-#else
-#  define OS_CLI_SUBDIR "linux"
-#endif
+/* ---------- paths ---------- */
 
-/* Каталог GUI-бинарника (…/MacOS или папка с .exe). */
 static int gui_exe_dir(char *out, size_t n) {
 #ifdef _WIN32
     DWORD len = GetModuleFileNameA(NULL, out, (DWORD)n);
@@ -365,13 +306,11 @@ static int gui_exe_dir(char *out, size_t n) {
 #endif
 }
 
-/* Корень пакета рядом с GUI: …/ConnectCheck-mac.app/Contents/MacOS → …/ */
 static int package_root_from_gui(char *out, size_t n) {
     char exedir[PATH_MAX_G], up[PATH_MAX_G], real[PATH_MAX_G];
     if (!gui_exe_dir(exedir, sizeof exedir)) return 0;
 
 #ifdef __APPLE__
-    /* …/ConnectCheck-mac.app/Contents/MacOS → каталог, где лежит .app и mac/ */
     {
         size_t len = strlen(exedir);
         if (len > 15 && strcmp(exedir + len - 15, "/Contents/MacOS") == 0) {
@@ -387,50 +326,34 @@ static int package_root_from_gui(char *out, size_t n) {
     return 1;
 }
 
-static int bindir_has_tool(const char *dir, const char *tool) {
-    char try[PATH_MAX_G];
-    if (!dir || !dir[0]) return 0;
-    path_join(try, sizeof try, dir, tool);
-    return file_exists(try);
+static void resolve_resources(void) {
+    char try[PATH_MAX_G], exedir[PATH_MAX_G];
+    g_resources[0] = 0;
+    if (g_workdir[0]) {
+        path_join(try, sizeof try, g_workdir, "resources.conf");
+        if (file_exists(try)) {
+            snprintf(g_resources, sizeof g_resources, "%s", try);
+            return;
+        }
+    }
+    if (gui_exe_dir(exedir, sizeof exedir)) {
+        path_join(try, sizeof try, exedir, "resources.conf");
+        if (file_exists(try)) {
+            snprintf(g_resources, sizeof g_resources, "%s", try);
+            return;
+        }
+    }
 }
 
-/*
- * CLI/probes рядом с GUI (раскладка архива), без env и без cwd:
- *   <pkg>/mac|linux|win/connect-check  или  <pkg>/connect-check
- */
-static int resolve_bindir(void) {
-    char pkg[PATH_MAX_G], sub[PATH_MAX_G], tool[64];
-
-    tool_name(tool, sizeof tool, "connect-check");
-    g_bindir[0] = 0;
+static int resolve_pkg(void) {
     g_workdir[0] = 0;
-
-    if (!package_root_from_gui(pkg, sizeof pkg))
+    g_resources[0] = 0;
+    if (!package_root_from_gui(g_workdir, sizeof g_workdir))
         return 0;
-
-    snprintf(g_workdir, sizeof g_workdir, "%s", pkg);
-
-    path_join(sub, sizeof sub, pkg, OS_CLI_SUBDIR);
-    if (bindir_has_tool(sub, tool)) {
-        snprintf(g_bindir, sizeof g_bindir, "%s", sub);
-        return 1;
-    }
-    if (bindir_has_tool(pkg, tool)) {
-        snprintf(g_bindir, sizeof g_bindir, "%s", pkg);
-        return 1;
-    }
-    return 0;
+    resolve_resources();
+    return 1;
 }
 
-static int tool_path(const char *base, char *out, size_t n) {
-    char name[64];
-    tool_name(name, sizeof name, base);
-    if (!g_bindir[0]) return 0;
-    path_join(out, n, g_bindir, name);
-    return file_exists(out);
-}
-
-/* Шрифт: рядом с GUI/пакетом → системные моноширинные TTF. */
 static int find_font(char *out, size_t n) {
     char pkg[PATH_MAX_G], try[PATH_MAX_G], windir[PATH_MAX_G];
     size_t i;
@@ -471,7 +394,6 @@ static int find_font(char *out, size_t n) {
             }
         }
 #ifdef __APPLE__
-        /* шрифт внутри .app/Contents/MacOS */
         if (gui_exe_dir(try, sizeof try)) {
             char f[PATH_MAX_G];
             for (i = 0; bundled[i]; i++) {
@@ -516,346 +438,462 @@ static int find_font(char *out, size_t n) {
     return 0;
 }
 
-/* ---------- process ---------- */
+/* ---------- event queue (worker → UI) ---------- */
 
-static Child *kid_slot(const char *key) {
-    int i;
-    for (i = 0; i < g_nkids; i++)
-        if (strcmp(g_kids[i].key, key) == 0) return &g_kids[i];
-    if (g_nkids >= MAX_PROCS) return NULL;
-    memset(&g_kids[g_nkids], 0, sizeof g_kids[0]);
-    snprintf(g_kids[g_nkids].key, sizeof g_kids[0].key, "%s", key);
-    return &g_kids[g_nkids++];
-}
-
-static Child *kid_find(const char *key) {
-    int i;
-    for (i = 0; i < g_nkids; i++)
-        if (strcmp(g_kids[i].key, key) == 0) return &g_kids[i];
-    return NULL;
-}
-
-static void kid_reap_slot(Child *c) {
-    if (!c) return;
+static void ev_lock(void) {
 #ifdef _WIN32
-    if (c->rd && c->rd != INVALID_HANDLE_VALUE) {
-        CloseHandle(c->rd);
-        c->rd = NULL;
-    }
-    if (c->proc) {
-        CloseHandle(c->proc);
-        c->proc = NULL;
-    }
+    if (g_ev_lock_ok) EnterCriticalSection(&g_ev_lock);
 #else
-    if (c->fd >= 0) {
-        close(c->fd);
-        c->fd = -1;
-    }
-    c->pid = 0;
+    pthread_mutex_lock(&g_ev_lock);
 #endif
-    c->alive = 0;
 }
 
+static void ev_unlock(void) {
 #ifdef _WIN32
-static int start_child(const char *key, const char *exe, char *cmdline) {
-    Child *c = kid_find(key);
-    SECURITY_ATTRIBUTES sa;
-    HANDLE rd = NULL, wr = NULL;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-
-    if (c && c->alive) {
-        log_add(key, "уже запущен");
-        return 0;
-    }
-    c = kid_slot(key);
-    if (!c) {
-        log_add(key, "нет слотов");
-        return 0;
-    }
-
-    sa.nLength = sizeof sa;
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = wr;
-    si.hStdError = wr;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    memset(&pi, 0, sizeof pi);
-
-    if (!CreateProcessA(exe, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, g_workdir, &si, &pi)) {
-        CloseHandle(rd);
-        CloseHandle(wr);
-        log_add(key, "CreateProcess failed");
-        return 0;
-    }
-    CloseHandle(wr);
-    CloseHandle(pi.hThread);
-    c->proc = pi.hProcess;
-    c->rd = rd;
-    c->alive = 1;
-    {
-        char msg[LOG_LINE];
-        snprintf(msg, sizeof msg, "▶ %s", cmdline);
-        log_add(key, msg);
-    }
-    snprintf(g_status, sizeof g_status, "Запущено: %s", key);
-    return 1;
-}
+    if (g_ev_lock_ok) LeaveCriticalSection(&g_ev_lock);
 #else
-static int start_child(const char *key, char *const argv[]) {
-    Child *c = kid_find(key);
-    int pfd[2];
-    pid_t pid;
-    char cmdline[LOG_LINE];
-    int i, o = 0;
-
-    if (c && c->alive) {
-        log_add(key, "уже запущен");
-        return 0;
-    }
-    c = kid_slot(key);
-    if (!c) {
-        log_add(key, "нет слотов");
-        return 0;
-    }
-
-    cmdline[0] = 0;
-    for (i = 0; argv[i]; i++) {
-        int n = snprintf(cmdline + o, sizeof cmdline - (size_t)o, "%s%s", i ? " " : "", argv[i]);
-        if (n > 0) o += n;
-    }
-
-    if (pipe(pfd) != 0) return 0;
-    pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return 0;
-    }
-    if (pid == 0) {
-        close(pfd[0]);
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[1]);
-        if (g_workdir[0]) chdir(g_workdir);
-        execv(argv[0], argv);
-        _exit(127);
-    }
-    close(pfd[1]);
-    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
-    c->pid = pid;
-    c->fd = pfd[0];
-    c->alive = 1;
-    {
-        char msg[LOG_LINE];
-        snprintf(msg, sizeof msg, "▶ %s", cmdline);
-        log_add(key, msg);
-    }
-    snprintf(g_status, sizeof g_status, "Запущено: %s", key);
-    return 1;
-}
+    pthread_mutex_unlock(&g_ev_lock);
 #endif
-
-static void stop_child(const char *key) {
-    Child *c = kid_find(key);
-    if (!c || !c->alive) return;
-#ifdef _WIN32
-    TerminateProcess(c->proc, 1);
-#else
-    kill(c->pid, SIGTERM);
-#endif
-    log_add(key, "остановлено пользователем");
-    kid_reap_slot(c);
 }
 
-static void stop_all(void) {
-    int i;
-    for (i = 0; i < g_nkids; i++)
-        if (g_kids[i].alive) stop_child(g_kids[i].key);
+static void ev_push(const Ev *e) {
+    ev_lock();
+    if (g_ev_count >= MAX_EVQ) {
+        /* drop oldest */
+        g_ev_head = (g_ev_head + 1) % MAX_EVQ;
+        g_ev_count--;
+    }
+    g_evq[g_ev_tail] = *e;
+    g_ev_tail = (g_ev_tail + 1) % MAX_EVQ;
+    g_ev_count++;
+    ev_unlock();
 }
 
-static void poll_children(void) {
-    int i;
-    char buf[1024];
-    for (i = 0; i < g_nkids; i++) {
-        Child *c = &g_kids[i];
-        if (!c->alive) continue;
-#ifdef _WIN32
-        {
-            DWORD avail = 0, got = 0;
-            if (PeekNamedPipe(c->rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-                if (avail > sizeof buf) avail = (DWORD)sizeof buf;
-                if (ReadFile(c->rd, buf, avail, &got, NULL) && got)
-                    kid_feed(c, buf, (size_t)got);
+static int ev_pop(Ev *out) {
+    int ok = 0;
+    ev_lock();
+    if (g_ev_count > 0) {
+        *out = g_evq[g_ev_head];
+        g_ev_head = (g_ev_head + 1) % MAX_EVQ;
+        g_ev_count--;
+        ok = 1;
+    }
+    ev_unlock();
+    return ok;
+}
+
+static void ev_log(const char *prefix, const char *msg) {
+    Ev e;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_LOG;
+    snprintf(e.a, sizeof e.a, "%s", prefix ? prefix : "");
+    snprintf(e.b, sizeof e.b, "%s", msg ? msg : "");
+    ev_push(&e);
+}
+
+static void ev_status(const char *msg) {
+    Ev e;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_STATUS;
+    snprintf(e.a, sizeof e.a, "%s", msg ? msg : "");
+    ev_push(&e);
+}
+
+/* ---------- engine callbacks ---------- */
+
+static void cb_on_log(void *ud, const char *line) {
+    char buf[LOG_LINE];
+    (void)ud;
+    snprintf(buf, sizeof buf, "%s", line ? line : "");
+    sanitize_log_text(buf);
+    if (buf[0]) ev_log("engine", buf);
+}
+
+static void cb_on_progress(void *ud, const char *msg, int cur, int total) {
+    Ev e;
+    (void)ud;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_PROGRESS;
+    if (msg && msg[0]) {
+        if (total > 0)
+            snprintf(e.a, sizeof e.a, "%s (%d/%d)", msg, cur, total);
+        else
+            snprintf(e.a, sizeof e.a, "%s", msg);
+    }
+    e.i1 = cur;
+    e.i2 = total;
+    ev_push(&e);
+}
+
+static void cb_on_stage(void *ud, const char *title, const char *desc) {
+    Ev e;
+    (void)ud;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_STAGE;
+    snprintf(e.a, sizeof e.a, "%s", title ? title : "");
+    snprintf(e.b, sizeof e.b, "%s", desc ? desc : "");
+    ev_push(&e);
+}
+
+static void cb_on_check(void *ud, const char *cat, const char *name,
+                        const char *status, const char *detail) {
+    Ev e;
+    (void)ud;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_CHECK;
+    snprintf(e.a, sizeof e.a, "%s", cat ? cat : "");
+    snprintf(e.b, sizeof e.b, "%s", name ? name : "");
+    snprintf(e.c, sizeof e.c, "%s%s%s",
+             status ? status : "",
+             (detail && detail[0]) ? " — " : "",
+             detail ? detail : "");
+    if (status && (strcmp(status, "fail") == 0 || strcmp(status, "FAIL") == 0))
+        e.i1 = 2;
+    else if (status && (strcmp(status, "warn") == 0 || strcmp(status, "WARN") == 0 ||
+                        strcmp(status, "attention") == 0))
+        e.i1 = 1;
+    else
+        e.i1 = 0;
+    ev_push(&e);
+}
+
+static void cb_on_finding(void *ud, const char *level, const char *title, const char *text) {
+    Ev e;
+    (void)ud;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_FINDING;
+    snprintf(e.a, sizeof e.a, "%s", level ? level : "");
+    snprintf(e.b, sizeof e.b, "%s", title ? title : "");
+    snprintf(e.c, sizeof e.c, "%s", text ? text : "");
+    ev_push(&e);
+}
+
+static void cb_on_done(void *ud, const char *report_path, int ok_n, int warn_n, int fail_n) {
+    Ev e;
+    (void)ud;
+    memset(&e, 0, sizeof e);
+    e.kind = EV_DONE;
+    snprintf(e.a, sizeof e.a, "%s", report_path ? report_path : "");
+    e.i1 = ok_n;
+    e.i2 = warn_n;
+    e.i3 = fail_n;
+    ev_push(&e);
+}
+
+static void drain_events(void) {
+    Ev e;
+    while (ev_pop(&e)) {
+        switch (e.kind) {
+        case EV_LOG:
+            log_add(e.a, e.b);
+            break;
+        case EV_PROGRESS:
+            if (e.a[0])
+                log_progress("engine", e.a);
+            else
+                log_progress("engine", "");
+            break;
+        case EV_STAGE:
+            snprintf(g_stage_cur, sizeof g_stage_cur, "%s", e.a);
+            if (e.a[0] && g_stage_n < MAX_STAGES) {
+                int dup = 0, i;
+                for (i = 0; i < g_stage_n; i++)
+                    if (strcmp(g_stages[i], e.a) == 0) { dup = 1; break; }
+                if (!dup)
+                    snprintf(g_stages[g_stage_n++], sizeof g_stages[0], "%s", e.a);
             }
-            if (WaitForSingleObject(c->proc, 0) == WAIT_OBJECT_0) {
-                DWORD code = 0;
-                while (PeekNamedPipe(c->rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-                    if (avail > sizeof buf) avail = (DWORD)sizeof buf;
-                    if (!ReadFile(c->rd, buf, avail, &got, NULL) || !got) break;
-                    kid_feed(c, buf, (size_t)got);
-                }
-                kid_flush_acc(c);
-                GetExitCodeProcess(c->proc, &code);
-                {
-                    char msg[64];
-                    snprintf(msg, sizeof msg, "■ завершено, код %lu", (unsigned long)code);
-                    log_add(c->key, msg);
-                }
-                kid_reap_slot(c);
-            }
-        }
-#else
-        {
-            ssize_t n;
-            while ((n = read(c->fd, buf, sizeof buf)) > 0)
-                kid_feed(c, buf, (size_t)n);
             {
-                int st = 0;
-                pid_t r = waitpid(c->pid, &st, WNOHANG);
-                if (r == c->pid) {
-                    char msg[64];
-                    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-                    kid_flush_acc(c);
-                    snprintf(msg, sizeof msg, "■ завершено, код %d", code);
-                    log_add(c->key, msg);
-                    kid_reap_slot(c);
-                }
+                char msg[LOG_LINE];
+                if (e.b[0])
+                    snprintf(msg, sizeof msg, "▶ %s — %s", e.a, e.b);
+                else
+                    snprintf(msg, sizeof msg, "▶ %s", e.a);
+                log_add("stage", msg);
             }
+            snprintf(g_status, sizeof g_status, "Этап: %s", e.a[0] ? e.a : "…");
+            break;
+        case EV_CHECK:
+            if (e.i1 == 2) {
+                g_ui_fail++;
+                {
+                    char msg[LOG_LINE];
+                    snprintf(msg, sizeof msg, "FAIL %s / %s — %s", e.a, e.b, e.c);
+                    log_add("check", msg);
+                }
+            } else if (e.i1 == 1) {
+                g_ui_warn++;
+            } else {
+                g_ui_ok++;
+            }
+            break;
+        case EV_FINDING:
+            {
+                char msg[LOG_LINE];
+                snprintf(msg, sizeof msg, "[%s] %s: %s", e.a, e.b, e.c);
+                log_add("finding", msg);
+            }
+            break;
+        case EV_DONE:
+            snprintf(g_report_path, sizeof g_report_path, "%s", e.a);
+            g_ui_ok = e.i1;
+            g_ui_warn = e.i2;
+            g_ui_fail = e.i3;
+            g_stage_cur[0] = 0;
+            {
+                char msg[LOG_LINE];
+                snprintf(msg, sizeof msg, "готово: ok=%d warn=%d fail=%d", e.i1, e.i2, e.i3);
+                log_add("engine", msg);
+                if (e.a[0]) log_add("report", e.a);
+            }
+            snprintf(g_status, sizeof g_status, "Готово — сбоев: %d", e.i3);
+            break;
+        case EV_STATUS:
+            snprintf(g_status, sizeof g_status, "%s", e.a);
+            break;
         }
-#endif
-    }
-    {
-        int any = 0, j;
-        for (j = 0; j < g_nkids; j++)
-            if (g_kids[j].alive) any = 1;
-        if (!any) snprintf(g_status, sizeof g_status, "Готово");
     }
 }
 
-/* ---------- actions ---------- */
+static int any_busy(void) {
+    int i;
+    if (g_diag_busy) return 1;
+    for (i = 0; i < MAX_PROBE_W; i++)
+        if (g_probe_busy[i]) return 1;
+    return 0;
+}
+
+/* ---------- workers ---------- */
+
+#ifdef _WIN32
+static unsigned __stdcall diag_thread(void *arg) {
+#else
+static void *diag_thread(void *arg) {
+#endif
+    CcOpts *opts = (CcOpts *)arg;
+    CcCallbacks cb;
+    int rc;
+    memset(&cb, 0, sizeof cb);
+    cb.on_log = cb_on_log;
+    cb.on_progress = cb_on_progress;
+    cb.on_stage = cb_on_stage;
+    cb.on_check = cb_on_check;
+    cb.on_finding = cb_on_finding;
+    cb.on_done = cb_on_done;
+    rc = cc_engine_run(opts, &cb);
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "диагностика завершена (код %d)", rc);
+        ev_log("engine", msg);
+    }
+    g_diag_busy = 0;
+    ev_status("Готово");
+    free(opts);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+typedef struct {
+    CcProbeKind kind;
+    CcProbeOpts opts;
+    int slot;
+    char prefix[48];
+} ProbeJob;
+
+static void probe_log_line(void *ud, const char *line) {
+    ProbeJob *job = (ProbeJob *)ud;
+    char buf[LOG_LINE];
+    snprintf(buf, sizeof buf, "%s", line ? line : "");
+    sanitize_log_text(buf);
+    if (buf[0]) ev_log(job->prefix, buf);
+}
+
+#ifdef _WIN32
+static unsigned __stdcall probe_thread(void *arg) {
+#else
+static void *probe_thread(void *arg) {
+#endif
+    ProbeJob *job = (ProbeJob *)arg;
+    int rc = cc_probe_run(job->kind, &job->opts, probe_log_line, job, &g_probe_cancel[job->slot]);
+    {
+        char msg[80];
+        snprintf(msg, sizeof msg, "проба остановлена (код %d)", rc);
+        ev_log(job->prefix, msg);
+    }
+    g_probe_busy[job->slot] = 0;
+    free(job);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
 
 static void run_diagnose(void) {
-    char exe[PATH_MAX_G];
+    CcOpts *opts;
+    if (g_diag_busy) {
+        log_add("engine", "диагностика уже идёт");
+        return;
+    }
+    opts = (CcOpts *)calloc(1, sizeof *opts);
+    if (!opts) return;
+    opts->yes = opt_yes;
+    opts->skip_dns_bulk = opt_skip_dns && !opt_dns_bulk;
+    opts->force_dns_bulk = opt_dns_bulk;
+    opts->skip_video = opt_skip_video;
+    opts->skip_speed = opt_skip_speed;
+    opts->no_open = opt_no_open;
+    snprintf(opts->outdir, sizeof opts->outdir, "%s", opt_outdir);
+    if (g_resources[0])
+        snprintf(opts->resources, sizeof opts->resources, "%s", g_resources);
+    if (g_workdir[0])
+        snprintf(opts->workdir, sizeof opts->workdir, "%s", g_workdir);
+
+    g_stage_n = 0;
+    g_stage_cur[0] = 0;
+    g_ui_ok = g_ui_warn = g_ui_fail = 0;
+    g_report_path[0] = 0;
+    cc_engine_clear_cancel();
+    g_diag_busy = 1;
+    snprintf(g_status, sizeof g_status, "Диагностика…");
+    log_add("engine", "старт диагностики (in-process)");
 #ifdef _WIN32
-    char cmd[2048];
-    int o = 0;
-    if (!tool_path("connect-check", exe, sizeof exe)) {
-        log_add("connect-check", "не найден");
-        return;
+    {
+        uintptr_t h = _beginthreadex(NULL, 0, diag_thread, opts, 0, NULL);
+        if (!h) {
+            g_diag_busy = 0;
+            free(opts);
+            log_add("engine", "не удалось запустить поток");
+        } else {
+            CloseHandle((HANDLE)h);
+        }
     }
-    o = snprintf(cmd, sizeof cmd, "\"%s\"", exe);
-    if (opt_yes) o += snprintf(cmd + o, sizeof cmd - o, " -y");
-    if (opt_skip_dns) o += snprintf(cmd + o, sizeof cmd - o, " --skip-dns-bulk");
-    if (opt_skip_video) o += snprintf(cmd + o, sizeof cmd - o, " --skip-video");
-    if (opt_dns_bulk) o += snprintf(cmd + o, sizeof cmd - o, " --dns-bulk");
-    if (opt_skip_speed) o += snprintf(cmd + o, sizeof cmd - o, " --skip-speed");
-    if (opt_no_open) o += snprintf(cmd + o, sizeof cmd - o, " --no-open");
-    if (opt_outdir[0])
-        o += snprintf(cmd + o, sizeof cmd - o, " -o \"%s\"", opt_outdir);
-    (void)o;
-    start_child("connect-check", exe, cmd);
 #else
-    char *argv[ARG_MAX_N];
-    int n = 0;
-    if (!tool_path("connect-check", exe, sizeof exe)) {
-        log_add("connect-check", "не найден — make -f Makefile.package");
+    {
+        pthread_t th;
+        if (pthread_create(&th, NULL, diag_thread, opts) != 0) {
+            g_diag_busy = 0;
+            free(opts);
+            log_add("engine", "не удалось запустить поток");
+        } else {
+            pthread_detach(th);
+        }
+    }
+#endif
+}
+
+static void stop_diagnose(void) {
+    if (!g_diag_busy) return;
+    cc_engine_request_cancel();
+    log_add("engine", "запрошена остановка…");
+}
+
+static void run_probe_slot(int slot, CcProbeKind kind, const CcProbeOpts *popts, const char *prefix) {
+    ProbeJob *job;
+    if (slot < 0 || slot >= MAX_PROBE_W) return;
+    if (g_probe_busy[slot]) {
+        log_add(prefix, "уже запущена");
         return;
     }
-    argv[n++] = exe;
-    if (opt_yes) argv[n++] = "-y";
-    if (opt_skip_dns) argv[n++] = "--skip-dns-bulk";
-    if (opt_skip_video) argv[n++] = "--skip-video";
-    if (opt_dns_bulk) argv[n++] = "--dns-bulk";
-    if (opt_skip_speed) argv[n++] = "--skip-speed";
-    if (opt_no_open) argv[n++] = "--no-open";
-    if (opt_outdir[0]) {
-        argv[n++] = "-o";
-        argv[n++] = opt_outdir;
+    job = (ProbeJob *)calloc(1, sizeof *job);
+    if (!job) return;
+    job->kind = kind;
+    job->opts = *popts;
+    job->slot = slot;
+    snprintf(job->prefix, sizeof job->prefix, "%s", prefix);
+    g_probe_cancel[slot] = 0;
+    g_probe_busy[slot] = 1;
+    log_add(prefix, "старт (in-process)");
+    snprintf(g_status, sizeof g_status, "Проба: %s", prefix);
+#ifdef _WIN32
+    {
+        uintptr_t h = _beginthreadex(NULL, 0, probe_thread, job, 0, NULL);
+        if (!h) {
+            g_probe_busy[slot] = 0;
+            free(job);
+            log_add(prefix, "не удалось запустить поток");
+        } else {
+            CloseHandle((HANDLE)h);
+        }
     }
-    argv[n] = NULL;
-    start_child("connect-check", argv);
+#else
+    {
+        pthread_t th;
+        if (pthread_create(&th, NULL, probe_thread, job) != 0) {
+            g_probe_busy[slot] = 0;
+            free(job);
+            log_add(prefix, "не удалось запустить поток");
+        } else {
+            pthread_detach(th);
+        }
+    }
 #endif
 }
 
 static void run_probes(void) {
     int i, started = 0;
-    char iv[16], rn[16];
-    snprintf(iv, sizeof iv, "%d", probe_interval);
-    snprintf(rn, sizeof rn, "%d", probe_rounds);
+    CcProbeOpts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.interval_sec = probe_interval > 0 ? probe_interval : 1;
+    opts.rounds = probe_rounds;
     for (i = 0; i < 5; i++) {
-        char exe[PATH_MAX_G];
         if (!probe_on[i]) continue;
-        if (!tool_path(probe_ids[i], exe, sizeof exe)) {
-            log_add(probe_ids[i], "не найден");
-            continue;
-        }
-#ifdef _WIN32
-        {
-            char cmd[1024];
-            snprintf(cmd, sizeof cmd, "\"%s\" -i %s -n %s", exe, iv, rn);
-            if (start_child(probe_ids[i], exe, cmd)) started++;
-        }
-#else
-        {
-            char *argv[8];
-            argv[0] = exe;
-            argv[1] = "-i";
-            argv[2] = iv;
-            argv[3] = "-n";
-            argv[4] = rn;
-            argv[5] = NULL;
-            if (start_child(probe_ids[i], argv)) started++;
-        }
-#endif
+        run_probe_slot(i, probe_kinds[i], &opts, cc_probe_kind_name(probe_kinds[i]));
+        started++;
     }
     if (!started) log_add("probes", "ничего не запущено — отметьте пробы");
 }
 
 static void run_url(void) {
-    char exe[PATH_MAX_G];
-    char iv[16], rn[16];
+    CcProbeOpts opts;
     if (!url_buf[0]) {
-        log_add("probe-url", "укажите URL");
+        log_add("url", "укажите URL");
         return;
     }
-    if (!tool_path("probe-url", exe, sizeof exe)) {
-        log_add("probe-url", "не найден");
-        return;
+    memset(&opts, 0, sizeof opts);
+    opts.interval_sec = url_interval > 0 ? url_interval : 1;
+    opts.rounds = url_rounds;
+    opts.follow = url_follow;
+    snprintf(opts.url, sizeof opts.url, "%s", url_buf);
+    run_probe_slot(5, CC_PROBE_URL, &opts, "url");
+}
+
+static void stop_probes(void) {
+    int i;
+    for (i = 0; i < MAX_PROBE_W; i++) {
+        if (g_probe_busy[i])
+            g_probe_cancel[i] = 1;
     }
-    snprintf(iv, sizeof iv, "%d", url_interval);
-    snprintf(rn, sizeof rn, "%d", url_rounds);
+    log_add("probes", "запрошена остановка…");
+}
+
+static void stop_all(void) {
+    stop_diagnose();
+    stop_probes();
+}
+
+static void open_path(const char *path) {
+    if (!path || !path[0]) return;
 #ifdef _WIN32
+    ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
     {
-        char cmd[1536];
-        if (url_follow)
-            snprintf(cmd, sizeof cmd, "\"%s\" -i %s -n %s -f \"%s\"", exe, iv, rn, url_buf);
-        else
-            snprintf(cmd, sizeof cmd, "\"%s\" -i %s -n %s \"%s\"", exe, iv, rn, url_buf);
-        start_child("probe-url", exe, cmd);
+        char cmd[PATH_MAX_G + 32];
+        snprintf(cmd, sizeof cmd, "open '%s'", path);
+        system(cmd);
     }
 #else
     {
-        char *argv[10];
-        int n = 0;
-        argv[n++] = exe;
-        argv[n++] = "-i";
-        argv[n++] = iv;
-        argv[n++] = "-n";
-        argv[n++] = rn;
-        if (url_follow) argv[n++] = "-f";
-        argv[n++] = url_buf;
-        argv[n] = NULL;
-        start_child("probe-url", argv);
+        char cmd[PATH_MAX_G + 32];
+        snprintf(cmd, sizeof cmd, "xdg-open '%s' >/dev/null 2>&1 &", path);
+        system(cmd);
     }
 #endif
 }
+
+/* ---------- self-update ---------- */
 
 static void update_check_startup(void) {
     char err[256];
@@ -887,7 +925,7 @@ static void do_self_update(void) {
     int n = 0;
 
     if (!g_update_ready) return;
-    update_detect_install_root(g_bindir[0] ? g_bindir : NULL, root, sizeof root);
+    update_detect_install_root(g_workdir[0] ? g_workdir : NULL, root, sizeof root);
     log_add("update", root);
     snprintf(g_status, sizeof g_status, "Обновление до %s…", g_update.tag);
 
@@ -895,7 +933,7 @@ static void do_self_update(void) {
     {
         char app[PATH_MAX_G];
         path_join(app, sizeof app, root, "ConnectCheck-mac.app");
-        if (access(app, F_OK) == 0) {
+        if (path_is_dir(app) || file_exists(app)) {
             snprintf(relaunch, sizeof relaunch, "/usr/bin/open");
             rargv[n++] = relaunch;
             rargv[n++] = app;
@@ -944,34 +982,67 @@ static void do_self_update(void) {
 
 static void ui_tab_diagnose(struct nk_context *ctx) {
     int i;
+    char sum[160];
     nk_layout_row_dynamic(ctx, 22, 1);
-    nk_label(ctx, "Параметры connect-check", NK_TEXT_LEFT);
+    nk_label(ctx, "Параметры диагностики", NK_TEXT_LEFT);
     nk_layout_row_dynamic(ctx, 24, 1);
-    nk_checkbox_label(ctx, "Без вопросов (-y)", &opt_yes);
+    nk_checkbox_label(ctx, "Без вопросов", &opt_yes);
     nk_checkbox_label(ctx, "Пропустить DNS-прогон", &opt_skip_dns);
     nk_checkbox_label(ctx, "Пропустить видео", &opt_skip_video);
-    nk_checkbox_label(ctx, "DNS-прогон (--dns-bulk)", &opt_dns_bulk);
+    nk_checkbox_label(ctx, "DNS-прогон (полный)", &opt_dns_bulk);
     nk_checkbox_label(ctx, "Пропустить скорость", &opt_skip_speed);
     nk_checkbox_label(ctx, "Не открывать HTML", &opt_no_open);
     nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
     nk_layout_row_push(ctx, 140);
-    nk_label(ctx, "Каталог (-o):", NK_TEXT_LEFT);
+    nk_label(ctx, "Каталог отчётов:", NK_TEXT_LEFT);
     nk_layout_row_push(ctx, 280);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, opt_outdir, sizeof opt_outdir, nk_filter_default);
     nk_layout_row_end(ctx);
+
+    snprintf(sum, sizeof sum, "Сбои: %d   Внимание: %d   OK: %d", g_ui_fail, g_ui_warn, g_ui_ok);
+    nk_layout_row_dynamic(ctx, 24, 1);
+    nk_label_colored(ctx, sum, NK_TEXT_LEFT,
+                     g_ui_fail > 0 ? nk_rgb(200, 90, 80) : nk_rgb(40, 140, 60));
+    if (g_stage_cur[0]) {
+        char cur[192];
+        snprintf(cur, sizeof cur, "Сейчас: %s", g_stage_cur);
+        nk_label(ctx, cur, NK_TEXT_LEFT);
+    }
+    if (g_stage_n > 0) {
+        nk_label(ctx, "Этапы:", NK_TEXT_LEFT);
+        for (i = 0; i < g_stage_n && i < 12; i++) {
+            char lab[128];
+            int active = (g_stage_cur[0] && strcmp(g_stages[i], g_stage_cur) == 0);
+            snprintf(lab, sizeof lab, "%s %s", active ? "→" : "•", g_stages[i]);
+            nk_layout_row_dynamic(ctx, 18, 1);
+            if (active)
+                nk_label_colored(ctx, lab, NK_TEXT_LEFT, nk_rgb(80, 160, 220));
+            else
+                nk_label(ctx, lab, NK_TEXT_LEFT);
+        }
+        if (g_stage_n > 12) {
+            char more[48];
+            snprintf(more, sizeof more, "… ещё %d", g_stage_n - 12);
+            nk_label(ctx, more, NK_TEXT_LEFT);
+        }
+    }
+
     nk_layout_row_dynamic(ctx, 34, 3);
-    if (nk_button_label(ctx, "Запустить диагностику")) run_diagnose();
-    if (nk_button_label(ctx, "Остановить")) stop_child("connect-check");
-    (void)i;
+    if (nk_button_label(ctx, g_diag_busy ? "Идёт…" : "Запустить диагностику")) {
+        if (!g_diag_busy) run_diagnose();
+    }
+    if (nk_button_label(ctx, "Остановить")) stop_diagnose();
+    if (nk_button_label(ctx, "Открыть отчёт")) open_path(g_report_path);
 }
 
 static void ui_tab_probes(struct nk_context *ctx) {
     int i;
     nk_layout_row_dynamic(ctx, 22, 1);
-    nk_label(ctx, "Циклические пробы (параллельно)", NK_TEXT_LEFT);
+    nk_label(ctx, "Циклические пробы (в процессе приложения)", NK_TEXT_LEFT);
     for (i = 0; i < 5; i++) {
-        char lab[96];
-        snprintf(lab, sizeof lab, "%s  (%s)", probe_labels[i], probe_ids[i]);
+        char lab[128];
+        const char *st = g_probe_busy[i] ? " — идёт" : "";
+        snprintf(lab, sizeof lab, "%s%s", probe_labels[i], st);
         nk_layout_row_dynamic(ctx, 24, 1);
         nk_checkbox_label(ctx, lab, &probe_on[i]);
     }
@@ -987,14 +1058,12 @@ static void ui_tab_probes(struct nk_context *ctx) {
     nk_layout_row_end(ctx);
     nk_layout_row_dynamic(ctx, 34, 2);
     if (nk_button_label(ctx, "Старт выбранных")) run_probes();
-    if (nk_button_label(ctx, "Остановить пробы")) {
-        for (i = 0; i < 5; i++) stop_child(probe_ids[i]);
-    }
+    if (nk_button_label(ctx, "Остановить пробы")) stop_probes();
 }
 
 static void ui_tab_url(struct nk_context *ctx) {
     nk_layout_row_dynamic(ctx, 22, 1);
-    nk_label(ctx, "probe-url", NK_TEXT_LEFT);
+    nk_label(ctx, g_probe_busy[5] ? "Проверка URL — идёт" : "Проверка URL", NK_TEXT_LEFT);
     nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
     nk_layout_row_push(ctx, 50);
     nk_label(ctx, "URL:", NK_TEXT_LEFT);
@@ -1012,10 +1081,12 @@ static void ui_tab_url(struct nk_context *ctx) {
     nk_property_int(ctx, "#ur", 0, &url_rounds, 99999, 1, 1);
     nk_layout_row_end(ctx);
     nk_layout_row_dynamic(ctx, 24, 1);
-    nk_checkbox_label(ctx, "Следовать редиректам (-f)", &url_follow);
+    nk_checkbox_label(ctx, "Следовать редиректам", &url_follow);
     nk_layout_row_dynamic(ctx, 34, 2);
-    if (nk_button_label(ctx, "Старт probe-url")) run_url();
-    if (nk_button_label(ctx, "Остановить")) stop_child("probe-url");
+    if (nk_button_label(ctx, "Старт")) run_url();
+    if (nk_button_label(ctx, "Остановить")) {
+        if (g_probe_busy[5]) g_probe_cancel[5] = 1;
+    }
 }
 
 static void ui_frame(struct nk_context *ctx, int width, int height) {
@@ -1023,15 +1094,13 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
     int log_h;
     if (nk_begin(ctx, "Connect Check", nk_rect(0, 0, (float)width, (float)height),
                  NK_WINDOW_NO_SCROLLBAR)) {
-        if (g_bindir[0])
-            snprintf(hdr, sizeof hdr, "Утилиты: %s", g_bindir);
+        if (g_resources[0])
+            snprintf(hdr, sizeof hdr, "Движок встроен · %s", g_resources);
         else
-            snprintf(hdr, sizeof hdr,
-                     "connect-check не найден рядом с GUI (ожидается папка %s/)",
-                     OS_CLI_SUBDIR);
+            snprintf(hdr, sizeof hdr, "Движок встроен · resources.conf не найден рядом с пакетом");
         nk_layout_row_dynamic(ctx, 22, 1);
         nk_label_colored(ctx, hdr, NK_TEXT_LEFT,
-                         g_bindir[0] ? nk_rgb(40, 140, 60) : nk_rgb(180, 40, 40));
+                         g_resources[0] ? nk_rgb(40, 140, 60) : nk_rgb(180, 120, 40));
 
         if (g_update_ready) {
             nk_layout_row_begin(ctx, NK_STATIC, 30, 2);
@@ -1046,7 +1115,7 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         nk_layout_row_dynamic(ctx, 28, 3);
         if (nk_button_label(ctx, g_tab == 0 ? "[ Диагностика ]" : "Диагностика")) g_tab = 0;
         if (nk_button_label(ctx, g_tab == 1 ? "[ Пробы ]" : "Пробы")) g_tab = 1;
-        if (nk_button_label(ctx, g_tab == 2 ? "[ probe-url ]" : "probe-url")) g_tab = 2;
+        if (nk_button_label(ctx, g_tab == 2 ? "[ URL ]" : "URL")) g_tab = 2;
 
         if (g_tab == 0) ui_tab_diagnose(ctx);
         else if (g_tab == 1) ui_tab_probes(ctx);
@@ -1067,11 +1136,10 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
             nk_layout_row_dynamic(ctx, 18, 1);
             for (i = 0; i < g_log.n; i++) {
                 const char *ln = g_log.lines[i];
-                /* progress (\r) — приглушённый; ошибки — краснее */
                 if (i == g_log_prog_idx || strstr(ln, " … "))
                     nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(140, 150, 160));
-                else if (strstr(ln, "fail") || strstr(ln, "ошиб") || strstr(ln, "Error") ||
-                         strstr(ln, "не найден"))
+                else if (strstr(ln, "fail") || strstr(ln, "FAIL") || strstr(ln, "ошиб") ||
+                         strstr(ln, "Error"))
                     nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(200, 90, 80));
                 else
                     nk_label(ctx, ln, NK_TEXT_LEFT);
@@ -1085,6 +1153,18 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         nk_label(ctx, g_status, NK_TEXT_LEFT);
     }
     nk_end(ctx);
+}
+
+static void gui_init_common(void) {
+#ifdef _WIN32
+    InitializeCriticalSection(&g_ev_lock);
+    g_ev_lock_ok = 1;
+#endif
+    resolve_pkg();
+    log_add("", "Connect Check GUI " CONNECT_CHECK_VERSION " — движок встроен");
+    if (g_workdir[0]) log_add("pkg", g_workdir);
+    if (g_resources[0]) log_add("resources", g_resources);
+    else log_add("resources", "resources.conf не найден — будут встроенные списки");
 }
 
 #ifdef _WIN32
@@ -1167,11 +1247,7 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     win_dpi_aware();
-    resolve_bindir();
-    log_add("", "Connect Check GUI (GDI+) " CONNECT_CHECK_VERSION);
-    if (g_workdir[0]) log_add("pkg", g_workdir);
-    if (g_bindir[0]) log_add("bin", g_bindir);
-    else log_add("", "нет CLI рядом с GUI — положите папку " OS_CLI_SUBDIR "/ рядом с приложением");
+    gui_init_common();
 
     memset(&wc, 0, sizeof wc);
     wc.style = CS_DBLCLKS;
@@ -1231,14 +1307,20 @@ int main(int argc, char **argv) {
                 if (height < 240) height = 240;
             }
         }
-        poll_children();
+        drain_events();
+        if (any_busy()) needs_refresh = 1;
         ui_frame(ctx, width, height);
         nk_gdip_render(NK_ANTI_ALIASING_ON, nk_rgb(30, 30, 36));
     }
 
     stop_all();
+    while (any_busy()) {
+        drain_events();
+        Sleep(50);
+    }
     if (font) nk_gdipfont_del(font);
     nk_gdip_shutdown();
+    if (g_ev_lock_ok) DeleteCriticalSection(&g_ev_lock);
     return 0;
 }
 
@@ -1257,11 +1339,7 @@ int main(int argc, char **argv) {
     (void)argv;
     signal(SIGPIPE, SIG_IGN);
 
-    resolve_bindir();
-    log_add("", "Connect Check GUI (Nuklear) " CONNECT_CHECK_VERSION);
-    if (g_workdir[0]) log_add("pkg", g_workdir);
-    if (g_bindir[0]) log_add("bin", g_bindir);
-    else log_add("", "нет CLI рядом с GUI — положите папку " OS_CLI_SUBDIR "/ рядом с приложением");
+    gui_init_common();
 
     glfwSetErrorCallback(error_callback);
     if (!glfwInit()) {
@@ -1320,7 +1398,7 @@ int main(int argc, char **argv) {
     }
 
     while (!glfwWindowShouldClose(win)) {
-        poll_children();
+        drain_events();
         glfwPollEvents();
         nk_glfw3_new_frame();
         glfwGetWindowSize(win, &width, &height);
@@ -1333,8 +1411,19 @@ int main(int argc, char **argv) {
     }
 
     stop_all();
+    {
+        int n = 0;
+        while (any_busy() && n++ < 100) {
+            drain_events();
+#ifdef _WIN32
+            Sleep(50);
+#else
+            usleep(50000);
+#endif
+        }
+    }
     nk_glfw3_shutdown();
     glfwTerminate();
     return 0;
 }
-#endif /* !_WIN32 */
+#endif

@@ -7,6 +7,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -15,6 +16,7 @@
 
 #include "version.h"
 #include "selfupdate.h"
+#include "cc_engine.h"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -125,6 +127,31 @@ static char generated[64];
 static char exe_dir[STR];
 static int g_resources_from_file; /* 1 = resources.conf (или --resources) */
 
+/* ---- engine callbacks (GUI / library) ---- */
+static const CcCallbacks *g_engine_cb;
+static volatile int g_engine_cancel;
+static int g_engine_lib_mode; /* 1 = quiet console, prefer callbacks */
+
+void cc_engine_request_cancel(void) { g_engine_cancel = 1; }
+void cc_engine_clear_cancel(void) { g_engine_cancel = 0; }
+int cc_engine_cancel_requested(void) { return g_engine_cancel ? 1 : 0; }
+
+static void engine_log(const char *line) {
+    if (g_engine_cb && g_engine_cb->on_log)
+        g_engine_cb->on_log(g_engine_cb->userdata, line ? line : "");
+    else if (!g_engine_lib_mode && line)
+        printf("%s\n", line);
+}
+
+static void engine_logf(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    engine_log(buf);
+}
+
 /* прогресс этапа (в т.ч. подшаги UA) */
 static char g_prog_item[48];
 static int g_prog_cur;
@@ -190,6 +217,8 @@ static void add_check_ex(const char *cat, const char *name, const char *st,
     if (strcmp(st, "ok") == 0) ok_n++;
     else if (strcmp(st, "warn") == 0) warn_n++;
     else if (strcmp(st, "fail") == 0) fail_n++;
+    if (g_engine_cb && g_engine_cb->on_check)
+        g_engine_cb->on_check(g_engine_cb->userdata, cat, name, st, detail ? detail : "");
 }
 
 static void add_check(const char *cat, const char *name, const char *st,
@@ -204,6 +233,9 @@ static void add_finding(const char *level, const char *title, const char *text) 
     snprintf(f->level, sizeof f->level, "%s", level);
     snprintf(f->title, sizeof f->title, "%s", title);
     snprintf(f->text, sizeof f->text, "%s", text);
+    if (g_engine_cb && g_engine_cb->on_finding)
+        g_engine_cb->on_finding(g_engine_cb->userdata, level ? level : "", title ? title : "",
+                                text ? text : "");
 }
 
 /* ---------- parallel jobs ---------- */
@@ -352,6 +384,8 @@ static void add_check_from(const Check *src) {
     if (strcmp(c->status, "ok") == 0) ok_n++;
     else if (strcmp(c->status, "warn") == 0) warn_n++;
     else if (strcmp(c->status, "fail") == 0) fail_n++;
+    if (g_engine_cb && g_engine_cb->on_check)
+        g_engine_cb->on_check(g_engine_cb->userdata, c->category, c->name, c->status, c->detail);
 }
 
 static int run_capture(const char *cmd, char *buf, size_t buflen) {
@@ -2873,19 +2907,31 @@ static int stage_begin_ex(const char *title, const char *desc, int default_run) 
     int interactive = 0;
     long long until;
 
+    if (g_engine_cancel) return 0;
+
+    if (g_engine_cb && g_engine_cb->on_stage)
+        g_engine_cb->on_stage(g_engine_cb->userdata, title ? title : "", desc ? desc : "");
+    engine_logf("▶ %s", title ? title : "");
+    if (desc && desc[0]) engine_logf("  %s", desc);
+
     if (g_sys_dns_broken && default_run) {
+        engine_log("  ⏭ пропущено: системный DNS не резолвит имена");
+        if (!g_engine_lib_mode) {
         printf("\n▶ %s\n  ⏭ пропущено: системный DNS не резолвит имена\n", title);
         fflush(stdout);
+        }
         add_check(title, "Этап", "info",
                   "пропущен — DNS не резолвит имена",
                   "Без резолва проверки по hostname дают ложные сбои недоступности.");
         return 0;
     }
 
-    printf("\n▶ %s\n  %s\n", title, desc ? desc : "");
-    fflush(stdout);
+    if (!g_engine_lib_mode) {
+        printf("\n▶ %s\n  %s\n", title, desc ? desc : "");
+        fflush(stdout);
+    }
 
-    if (opt_yes) return default_run ? 1 : 0;
+    if (opt_yes || g_engine_lib_mode) return default_run ? 1 : 0;
 
 #ifdef _WIN32
     interactive = _isatty(_fileno(stdin));
@@ -2943,6 +2989,12 @@ static void stage_progress(const char *msg, int cur, int total) {
         snprintf(line, sizeof line, "  … %s [%d/%d]", name, cur, total);
     else
         snprintf(line, sizeof line, "  … %s", name);
+    if (g_engine_cb && g_engine_cb->on_progress)
+        g_engine_cb->on_progress(g_engine_cb->userdata, msg ? msg : "", cur, total);
+    if (g_engine_lib_mode) {
+        engine_log(line);
+        return;
+    }
 #ifdef _WIN32
     printf("\r%s          ", line);
 #else
@@ -5944,6 +5996,7 @@ static void speed_job(int idx, void *v) {
     }
 }
 
+#ifndef CC_ENGINE_LIBRARY
 static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [options]\n"
@@ -5964,12 +6017,13 @@ static void usage(const char *argv0) {
         "Клавиши на этапах: Enter — далее/запустить, Space — пропустить (без эха).\n",
         argv0, CONNECT_CHECK_VERSION, DEFAULT_JOBS);
 }
+#endif
 
-int main(int argc, char **argv) {
+
+static int diagnose_core(void) {
     int i;
     time_t now;
     struct tm *tm;
-    /* публичные резолверы: ping + latency + (часть) DoT; системные DNS подмешиваются отдельно */
     static const struct { const char *name; const char *ip; } dns_pub[] = {
         {"Cloudflare", "1.1.1.1"},
         {"Google", "8.8.8.8"},
@@ -5992,140 +6046,6 @@ int main(int argc, char **argv) {
     char mt[256];
     int mt_n = 0;
     int flaky_ok = 0, flaky_fail = 0, flaky_sum = 0;
-    int opt_check_update = 0, opt_self_update = 0;
-
-    setvbuf(stdout, NULL, _IONBF, 0);
-
-    {
-        const char *ej = getenv("CONNECT_CHECK_JOBS");
-        if (ej && ej[0]) {
-            int j = atoi(ej);
-            if (j >= 1 && j <= 256) opt_jobs = j;
-        }
-    }
-
-#ifdef _WIN32
-    WSADATA wsa;
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
-    }
-#endif
-    atexit(term_restore);
-
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-open") == 0) no_open = 1;
-        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("connect-check %s\n", CONNECT_CHECK_VERSION);
-            return 0;
-        }
-        else if (strcmp(argv[i], "--check-update") == 0) opt_check_update = 1;
-        else if (strcmp(argv[i], "--self-update") == 0) opt_self_update = 1;
-        else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) opt_yes = 1;
-        else if (strcmp(argv[i], "--dns-bulk") == 0) opt_force_dns_bulk = 1;
-        else if (strcmp(argv[i], "--skip-dns-bulk") == 0) opt_skip_dns_bulk = 1;
-        else if (strcmp(argv[i], "--skip-speed") == 0) opt_skip_speed = 1;
-        else if (strcmp(argv[i], "--skip-video") == 0) opt_skip_video = 1;
-        else if ((strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
-            opt_jobs = atoi(argv[++i]);
-            if (opt_jobs < 1) opt_jobs = 1;
-            if (opt_jobs > 256) opt_jobs = 256;
-        } else if ((strcmp(argv[i], "--dns-limit") == 0) && i + 1 < argc) {
-            opt_dns_limit = atoi(argv[++i]);
-            if (opt_dns_limit < 1) opt_dns_limit = 1;
-            if (opt_dns_limit > MAX_DOMAINS) opt_dns_limit = MAX_DOMAINS;
-        } else if ((strcmp(argv[i], "--domains") == 0) && i + 1 < argc)
-            snprintf(domains_path, sizeof domains_path, "%s", argv[++i]);
-        else if ((strcmp(argv[i], "--resources") == 0) && i + 1 < argc)
-            snprintf(resources_path, sizeof resources_path, "%s", argv[++i]);
-        else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0) && i + 1 < argc)
-            snprintf(output_dir, sizeof output_dir, "%s", argv[++i]);
-        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else {
-            fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            usage(argv[0]);
-            return 2;
-        }
-    }
-
-    if (opt_check_update || opt_self_update) {
-        UpdateInfo ui;
-        char err[256];
-        char root[STR];
-        char relaunch[STR];
-        if (update_check(&ui, err, sizeof err) != 0) {
-            fprintf(stderr, "check-update: %s\n", err);
-            return 1;
-        }
-        printf("Локально: %s\n", CONNECT_CHECK_VERSION);
-        printf("GitHub latest: %s (%s)\n", ui.tag, ui.html_url);
-        if (ui.asset_name[0])
-            printf("Ассет: %s\n", ui.asset_name);
-        if (!update_semver_gt(ui.version, CONNECT_CHECK_VERSION)) {
-            printf("Уже актуальная версия.\n");
-            return 0;
-        }
-        printf("Доступно обновление: %s → %s\n", CONNECT_CHECK_VERSION, ui.version);
-        if (opt_check_update && !opt_self_update)
-            return 2;
-        /* --self-update */
-        update_detect_install_root(argv[0], root, sizeof root);
-        printf("Корень установки: %s\n", root);
-#ifdef _WIN32
-        if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
-            snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
-#else
-        {
-            char real[STR];
-            if (realpath(argv[0], real))
-                snprintf(relaunch, sizeof relaunch, "%s", real);
-            else
-                snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
-        }
-#endif
-        {
-            char *rargv[2];
-            rargv[0] = relaunch;
-            rargv[1] = NULL;
-            printf("Скачиваю и применяю обновление...\n");
-            if (update_apply(&ui, root, relaunch, rargv, err, sizeof err) != 0) {
-                fprintf(stderr, "self-update: %s\n", err);
-                return 1;
-            }
-        }
-        return 0; /* helper exits parent */
-    }
-
-#ifdef _WIN32
-    {
-        char exe[MAX_PATH];
-        char *slash;
-        GetModuleFileNameA(NULL, exe, MAX_PATH);
-        slash = strrchr(exe, '\\');
-        if (slash) *slash = 0;
-        snprintf(exe_dir, sizeof exe_dir, "%s", exe);
-        if (!output_dir[0])
-            snprintf(output_dir, sizeof output_dir, "%s\\reports", exe);
-    }
-#else
-    {
-        char *slash = strrchr(argv[0], '/');
-        if (slash) {
-            size_t n = (size_t)(slash - argv[0]);
-            if (n >= sizeof exe_dir) n = sizeof exe_dir - 1;
-            memcpy(exe_dir, argv[0], n);
-            exe_dir[n] = 0;
-        } else {
-            snprintf(exe_dir, sizeof exe_dir, ".");
-        }
-        if (!output_dir[0])
-            snprintf(output_dir, sizeof output_dir, "reports");
-    }
-#endif
 
     resources_init();
 
@@ -6149,10 +6069,11 @@ int main(int argc, char **argv) {
     snprintf(report_path, sizeof report_path, "%s/net_diag_%s.html", output_dir, stamp);
 #endif
 
-    printf("Диагностика интернета (connect-check %s) — сбор данных...\n", CONNECT_CHECK_VERSION);
-    printf("Клавиши: Enter — далее, Space — пропустить (DNS: Enter — запустить, иначе пропуск).\n");
-    if (opt_yes) printf("Режим -y: без вопросов; DNS-прогон пропускается (нужен --dns-bulk).\n");
-    printf("Параллельность: %d jobs (--jobs / CONNECT_CHECK_JOBS)\n", opt_jobs);
+    engine_logf("Диагностика интернета (connect-check %s) — сбор данных...", CONNECT_CHECK_VERSION);
+    if (!g_engine_lib_mode)
+        printf("Клавиши: Enter — далее, Space — пропустить (DNS: Enter — запустить, иначе пропуск).\n");
+    if (opt_yes) engine_log("Режим -y: без вопросов; DNS-прогон пропускается (нужен --dns-bulk).");
+    engine_logf("Параллельность: %d jobs", opt_jobs);
 
     printf("\n▶ Сеть и Wi‑Fi\n");
     stage_progress("локальная сеть", 1, 6);
@@ -7793,8 +7714,10 @@ int main(int argc, char **argv) {
     flush_cdn_findings();
     enrich_fail_netdiag();
     write_html();
-    printf("\nОтчёт: %s\n", report_path);
-    printf("Итого: OK=%d WARN=%d FAIL=%d\n", ok_n, warn_n, fail_n);
+    engine_logf("Отчёт: %s", report_path);
+    engine_logf("Итого: OK=%d WARN=%d FAIL=%d", ok_n, warn_n, fail_n);
+    if (g_engine_cb && g_engine_cb->on_done)
+        g_engine_cb->on_done(g_engine_cb->userdata, report_path, ok_n, warn_n, fail_n);
 
     if (!no_open) {
 #ifdef _WIN32
@@ -7813,4 +7736,264 @@ int main(int argc, char **argv) {
     WSACleanup();
 #endif
     return fail_n > 0 ? 1 : 0;
+
 }
+
+
+int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb) {
+    g_engine_cb = cb;
+    g_engine_lib_mode = 1;
+    g_engine_cancel = 0;
+
+    nchecks = 0;
+    nfindings = 0;
+    ok_n = warn_n = fail_n = 0;
+    g_cdn_nhosts = 0;
+    g_cdn_nfail_sites = 0;
+    g_cdn_nwarn_sites = 0;
+    g_cdn_canary_fail = 0;
+    g_sys_dns_broken = 0;
+    report_path[0] = 0;
+    nchecks = 0;
+
+    no_open = 1;
+    opt_yes = 1;
+    opt_skip_dns_bulk = 1;
+    opt_force_dns_bulk = 0;
+    opt_skip_speed = 0;
+    opt_skip_video = 0;
+    opt_jobs = DEFAULT_JOBS;
+    opt_dns_limit = 1000;
+    domains_path[0] = 0;
+    resources_path[0] = 0;
+    output_dir[0] = 0;
+    exe_dir[0] = 0;
+
+    if (opts) {
+        if (opts->yes) opt_yes = 1;
+        opt_skip_dns_bulk = opts->skip_dns_bulk ? 1 : 0;
+        opt_force_dns_bulk = opts->force_dns_bulk ? 1 : 0;
+        opt_skip_video = opts->skip_video ? 1 : 0;
+        opt_skip_speed = opts->skip_speed ? 1 : 0;
+        no_open = opts->no_open ? 1 : 0;
+        if (opts->jobs >= 1 && opts->jobs <= 256) opt_jobs = opts->jobs;
+        if (opts->outdir[0])
+            snprintf(output_dir, sizeof output_dir, "%s", opts->outdir);
+        if (opts->resources[0])
+            snprintf(resources_path, sizeof resources_path, "%s", opts->resources);
+        if (opts->workdir[0]) {
+            snprintf(exe_dir, sizeof exe_dir, "%s", opts->workdir);
+#ifdef _WIN32
+            SetCurrentDirectoryA(opts->workdir);
+#else
+            chdir(opts->workdir);
+#endif
+        }
+    }
+    opt_yes = 1; /* library: always non-interactive */
+
+#ifdef _WIN32
+    {
+        WSADATA wsa;
+        static int wsa_once;
+        if (!wsa_once) {
+            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
+            wsa_once = 1;
+        }
+    }
+#endif
+
+    if (!exe_dir[0]) {
+#ifdef _WIN32
+        char exe[MAX_PATH];
+        char *slash;
+        GetModuleFileNameA(NULL, exe, MAX_PATH);
+        slash = strrchr(exe, '\\');
+        if (slash) *slash = 0;
+        snprintf(exe_dir, sizeof exe_dir, "%s", exe);
+#else
+        if (!getcwd(exe_dir, sizeof exe_dir))
+            snprintf(exe_dir, sizeof exe_dir, ".");
+#endif
+    }
+    if (!output_dir[0]) {
+#ifdef _WIN32
+        snprintf(output_dir, sizeof output_dir, "%s\\reports", exe_dir);
+#else
+        snprintf(output_dir, sizeof output_dir, "%s/reports", exe_dir);
+#endif
+    }
+
+    /* stamp/report_path set inside diagnose_core after resources_init — need them before.
+       diagnose_core currently starts at resources_init and sets stamp — OK. */
+
+    /* Pre-create paths that diagnose_core expects already set: stamp/report set IN core after resources_init.
+       Looking at core - stamp set AFTER resources_init. Good. But exe_dir/output_dir must be set - done. */
+
+    {
+        const char *ej = getenv("CONNECT_CHECK_JOBS");
+        if (ej && ej[0] && !(opts && opts->jobs >= 1)) {
+            int j = atoi(ej);
+            if (j >= 1 && j <= 256) opt_jobs = j;
+        }
+    }
+
+    return diagnose_core();
+}
+
+
+
+#ifndef CC_ENGINE_LIBRARY
+int main(int argc, char **argv) {
+    int i;
+    int opt_check_update = 0, opt_self_update = 0;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    {
+        const char *ej = getenv("CONNECT_CHECK_JOBS");
+        if (ej && ej[0]) {
+            int j = atoi(ej);
+            if (j >= 1 && j <= 256) opt_jobs = j;
+        }
+    }
+
+#ifdef _WIN32
+    WSADATA wsa;
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#endif
+    atexit(term_restore);
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-open") == 0) no_open = 1;
+        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("connect-check %s\n", CONNECT_CHECK_VERSION);
+            return 0;
+        }
+        else if (strcmp(argv[i], "--check-update") == 0) opt_check_update = 1;
+        else if (strcmp(argv[i], "--self-update") == 0) opt_self_update = 1;
+        else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) opt_yes = 1;
+        else if (strcmp(argv[i], "--dns-bulk") == 0) opt_force_dns_bulk = 1;
+        else if (strcmp(argv[i], "--skip-dns-bulk") == 0) opt_skip_dns_bulk = 1;
+        else if (strcmp(argv[i], "--skip-speed") == 0) opt_skip_speed = 1;
+        else if (strcmp(argv[i], "--skip-video") == 0) opt_skip_video = 1;
+        else if ((strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
+            opt_jobs = atoi(argv[++i]);
+            if (opt_jobs < 1) opt_jobs = 1;
+            if (opt_jobs > 256) opt_jobs = 256;
+        } else if ((strcmp(argv[i], "--dns-limit") == 0) && i + 1 < argc) {
+            opt_dns_limit = atoi(argv[++i]);
+            if (opt_dns_limit < 1) opt_dns_limit = 1;
+            if (opt_dns_limit > MAX_DOMAINS) opt_dns_limit = MAX_DOMAINS;
+        } else if ((strcmp(argv[i], "--domains") == 0) && i + 1 < argc)
+            snprintf(domains_path, sizeof domains_path, "%s", argv[++i]);
+        else if ((strcmp(argv[i], "--resources") == 0) && i + 1 < argc)
+            snprintf(resources_path, sizeof resources_path, "%s", argv[++i]);
+        else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0) && i + 1 < argc)
+            snprintf(output_dir, sizeof output_dir, "%s", argv[++i]);
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown arg: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    if (opt_check_update || opt_self_update) {
+        UpdateInfo ui;
+        char err[256];
+        char root[STR];
+        char relaunch[STR];
+        if (update_check(&ui, err, sizeof err) != 0) {
+            fprintf(stderr, "check-update: %s\n", err);
+            return 1;
+        }
+        printf("Локально: %s\n", CONNECT_CHECK_VERSION);
+        printf("GitHub latest: %s (%s)\n", ui.tag, ui.html_url);
+        if (ui.asset_name[0])
+            printf("Ассет: %s\n", ui.asset_name);
+        if (!update_semver_gt(ui.version, CONNECT_CHECK_VERSION)) {
+            printf("Уже актуальная версия.\n");
+            return 0;
+        }
+        printf("Доступно обновление: %s → %s\n", CONNECT_CHECK_VERSION, ui.version);
+        if (opt_check_update && !opt_self_update)
+            return 2;
+        /* --self-update */
+        update_detect_install_root(argv[0], root, sizeof root);
+        printf("Корень установки: %s\n", root);
+#ifdef _WIN32
+        if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
+            snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
+#else
+        {
+            char real[STR];
+            if (realpath(argv[0], real))
+                snprintf(relaunch, sizeof relaunch, "%s", real);
+            else
+                snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
+        }
+#endif
+        {
+            char *rargv[2];
+            rargv[0] = relaunch;
+            rargv[1] = NULL;
+            printf("Скачиваю и применяю обновление...\n");
+            if (update_apply(&ui, root, relaunch, rargv, err, sizeof err) != 0) {
+                fprintf(stderr, "self-update: %s\n", err);
+                return 1;
+            }
+        }
+        return 0; /* helper exits parent */
+    }
+
+#ifdef _WIN32
+    {
+        char exe[MAX_PATH];
+        char *slash;
+        GetModuleFileNameA(NULL, exe, MAX_PATH);
+        slash = strrchr(exe, '\\');
+        if (slash) *slash = 0;
+        snprintf(exe_dir, sizeof exe_dir, "%s", exe);
+        if (!output_dir[0])
+            snprintf(output_dir, sizeof output_dir, "%s\\reports", exe);
+    }
+#else
+    {
+        char *slash = strrchr(argv[0], '/');
+        if (slash) {
+            size_t n = (size_t)(slash - argv[0]);
+            if (n >= sizeof exe_dir) n = sizeof exe_dir - 1;
+            memcpy(exe_dir, argv[0], n);
+            exe_dir[n] = 0;
+        } else {
+            snprintf(exe_dir, sizeof exe_dir, ".");
+        }
+        if (!output_dir[0])
+            snprintf(output_dir, sizeof output_dir, "reports");
+    }
+#endif
+
+
+    g_engine_cb = NULL;
+    g_engine_lib_mode = 0;
+    g_engine_cancel = 0;
+    nchecks = 0;
+    nfindings = 0;
+    ok_n = warn_n = fail_n = 0;
+    g_cdn_nhosts = 0;
+    g_cdn_nfail_sites = 0;
+    g_cdn_nwarn_sites = 0;
+    g_cdn_canary_fail = 0;
+    return diagnose_core();
+}
+
+#endif /* CC_ENGINE_LIBRARY */
+
