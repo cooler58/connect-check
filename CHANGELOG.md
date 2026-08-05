@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-08-05
+
+### Fixed
+- macOS: после скачивания с GitHub Gatekeeper писал «приложение повреждено» — ad-hoc `codesign` при сборке + `ConnectCheck-mac.command` снимает quarantine (`xattr`).
+
 ## [1.4.0] — 2026-08-05
 
 ### Added

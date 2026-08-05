@@ -69,8 +69,16 @@ ifeq ($(UNAME_S),Darwin)
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf bin/DejaVuSans.ttf
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
 	@rm -f bin/connect-check-gui-mac
-	@echo "→ bin/ConnectCheck-mac.app (engine in-process, system fonts)"
+	@# ad-hoc подпись + сброс quarantine — иначе «приложение повреждено» после скачивания с GitHub
+	@if [ -f bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib ]; then \
+	  codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib 2>/dev/null || true; \
+	fi
+	@codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui 2>/dev/null || true
+	@codesign --force --deep --sign - bin/ConnectCheck-mac.app 2>/dev/null || true
+	@xattr -cr bin/ConnectCheck-mac.app 2>/dev/null || true
+	@echo "→ bin/ConnectCheck-mac.app (engine in-process, system fonts, ad-hoc codesign)"
 	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@codesign -dv bin/ConnectCheck-mac.app 2>&1 | head -5 || true
 else
 	@echo "package-mac только на Darwin"; exit 1
 endif

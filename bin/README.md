@@ -18,10 +18,17 @@
 Диагностика, циклические пробы и проверка URL выполняются **внутри приложения** (worker-thread). Нужен `resources.conf` рядом с пакетом (или внутри `.app/Contents/MacOS`).
 
 ```bash
-open bin/ConnectCheck-mac.app
+# macOS: лучше через лаунчер (снимает quarantine Gatekeeper)
+./ConnectCheck-mac.command
+# или один раз после распаковки:
+#   xattr -dr com.apple.quarantine ConnectCheck-mac.app && open ConnectCheck-mac.app
+
 ./bin/connect-check-gui-linux
 # Windows: connect-check-gui-win.exe
 ```
+
+Если macOS пишет «приложение повреждено» — это quarantine после скачивания, не битый бинарь:
+`xattr -dr com.apple.quarantine ConnectCheck-mac.app` и снова открыть.
 
 Шрифт: системный (macOS Arial Unicode / Windows Segoe UI / Linux DejaVu или Noto из ОС).
 
