@@ -1091,6 +1091,33 @@ static void do_self_update(void) {
 
 /* ---------- UI ---------- */
 
+/* Целое в поле ввода без кнопок ± (nk_property_* на узкой строке наползают). */
+static void ui_int_field(struct nk_context *ctx, char *buf, int bufsz,
+                         int *val, int minv, int maxv) {
+    nk_flags f;
+    int v;
+    f = nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD | NK_EDIT_SIG_ENTER,
+                                       buf, bufsz, nk_filter_decimal);
+    if (f & (NK_EDIT_DEACTIVATED | NK_EDIT_COMMITED | NK_EDIT_ACTIVE)) {
+        v = atoi(buf);
+        if (v < minv) v = minv;
+        if (v > maxv) v = maxv;
+        *val = v;
+    }
+    if (!(f & NK_EDIT_ACTIVE))
+        snprintf(buf, (size_t)bufsz, "%d", *val);
+}
+
+static void ui_labeled_int_row(struct nk_context *ctx, const char *label,
+                               char *buf, int bufsz, int *val, int minv, int maxv) {
+    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
+    nk_layout_row_push(ctx, 160);
+    nk_label(ctx, label, NK_TEXT_LEFT);
+    nk_layout_row_push(ctx, 90);
+    ui_int_field(ctx, buf, bufsz, val, minv, maxv);
+    nk_layout_row_end(ctx);
+}
+
 static void ui_tab_diagnose(struct nk_context *ctx) {
     int i;
     char sum[160];
@@ -1162,6 +1189,9 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
 
 static void ui_tab_probes(struct nk_context *ctx) {
     int i;
+    static char interval_buf[16] = "120";
+    static char rounds_buf[16] = "0";
+
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, "Циклические пробы (в процессе приложения)", NK_TEXT_LEFT);
     for (i = 0; i < 5; i++) {
@@ -1171,22 +1201,19 @@ static void ui_tab_probes(struct nk_context *ctx) {
         nk_layout_row_dynamic(ctx, 24, 1);
         nk_checkbox_label(ctx, lab, &probe_on[i]);
     }
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 4);
-    nk_layout_row_push(ctx, 100);
-    nk_label(ctx, "Интервал:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 80);
-    nk_property_int(ctx, "#sec", 1, &probe_interval, 120, 1, 1);
-    nk_layout_row_push(ctx, 100);
-    nk_label(ctx, "Раунды 0=∞:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 80);
-    nk_property_int(ctx, "#n", 0, &probe_rounds, 99999, 1, 1);
-    nk_layout_row_end(ctx);
+    ui_labeled_int_row(ctx, "Интервал, сек:", interval_buf, (int)sizeof interval_buf,
+                       &probe_interval, 1, 120);
+    ui_labeled_int_row(ctx, "Раунды (0 = ∞):", rounds_buf, (int)sizeof rounds_buf,
+                       &probe_rounds, 0, 99999);
     nk_layout_row_dynamic(ctx, 34, 2);
     if (nk_button_label(ctx, "Старт выбранных")) run_probes();
     if (nk_button_label(ctx, "Остановить пробы")) stop_probes();
 }
 
 static void ui_tab_url(struct nk_context *ctx) {
+    static char interval_buf[16] = "5";
+    static char rounds_buf[16] = "0";
+
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, g_probe_busy[5] ? "Проверка URL — идёт" : "Проверка URL", NK_TEXT_LEFT);
     nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
@@ -1195,16 +1222,10 @@ static void ui_tab_url(struct nk_context *ctx) {
     nk_layout_row_push(ctx, 500);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, url_buf, sizeof url_buf, nk_filter_default);
     nk_layout_row_end(ctx);
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 4);
-    nk_layout_row_push(ctx, 80);
-    nk_label(ctx, "Интервал:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 70);
-    nk_property_int(ctx, "#ui", 1, &url_interval, 120, 1, 1);
-    nk_layout_row_push(ctx, 90);
-    nk_label(ctx, "Раунды:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 70);
-    nk_property_int(ctx, "#ur", 0, &url_rounds, 99999, 1, 1);
-    nk_layout_row_end(ctx);
+    ui_labeled_int_row(ctx, "Интервал, сек:", interval_buf, (int)sizeof interval_buf,
+                       &url_interval, 1, 120);
+    ui_labeled_int_row(ctx, "Раунды (0 = ∞):", rounds_buf, (int)sizeof rounds_buf,
+                       &url_rounds, 0, 99999);
     nk_layout_row_dynamic(ctx, 24, 1);
     nk_checkbox_label(ctx, "Следовать редиректам", &url_follow);
     nk_layout_row_dynamic(ctx, 34, 2);
