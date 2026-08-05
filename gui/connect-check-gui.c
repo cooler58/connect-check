@@ -750,7 +750,8 @@ static void run_diagnose(void) {
     log_add("engine", "старт диагностики (in-process)");
 #ifdef _WIN32
     {
-        uintptr_t h = _beginthreadex(NULL, 0, diag_thread, opts, 0, NULL);
+        /* 8 MiB — diagnose_core + resources parser на маленьком стеке падают SIGBUS */
+        uintptr_t h = _beginthreadex(NULL, 8u * 1024u * 1024u, diag_thread, opts, 0, NULL);
         if (!h) {
             g_diag_busy = 0;
             free(opts);
@@ -762,11 +763,17 @@ static void run_diagnose(void) {
 #else
     {
         pthread_t th;
-        if (pthread_create(&th, NULL, diag_thread, opts) != 0) {
+        pthread_attr_t attr;
+        size_t stack = 8u * 1024u * 1024u;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, stack);
+        if (pthread_create(&th, &attr, diag_thread, opts) != 0) {
+            pthread_attr_destroy(&attr);
             g_diag_busy = 0;
             free(opts);
             log_add("engine", "не удалось запустить поток");
         } else {
+            pthread_attr_destroy(&attr);
             pthread_detach(th);
         }
     }

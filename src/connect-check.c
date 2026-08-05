@@ -4465,6 +4465,7 @@ static void resources_load_defaults(void) {
 /*
  * Читает resources.conf. Непустые секции заменяют соответствующую группу.
  * Возвращает 1 если файл открылся, 0 если нет.
+ * Буферы на куче — на pthread-стеке GUI (~512KB) иначе SIGBUS (Thread stack size exceeded).
  */
 static int resources_load_file(const char *path) {
     FILE *f;
@@ -4472,21 +4473,32 @@ static int resources_load_file(const char *path) {
     char section[64] = "";
     int got_sig = 0, got_ru = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_geo = 0, got_updates = 0, got_ai = 0, got_vid = 0, got_bank = 0;
     int nsig = 0, nru = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, ngeo = 0, nupdates = 0, nai = 0, nvid = 0, nbank = 0;
-    ResSig sig[MAX_RES];
-    ResSig ru[MAX_RES];
-    ResTcp gtcp[MAX_RES];
-    ResTcp itcp[MAX_RES];
-    ResHttp ihttps[MAX_RES];
-    ResHttp ghttps[MAX_RES];
-    ResHttp geo[MAX_RES];
-    ResHttp updates[MAX_RES];
-    ResTcp ai[MAX_RES];
-    ResVideo vids[MAX_RES];
-    ResBank banks[MAX_RES];
+    ResSig *sig = NULL, *ru = NULL;
+    ResTcp *gtcp = NULL, *itcp = NULL, *ai = NULL;
+    ResHttp *ihttps = NULL, *ghttps = NULL, *geo = NULL, *updates = NULL;
+    ResVideo *vids = NULL;
+    ResBank *banks = NULL;
+    int ok = 0;
 
     if (!path || !path[0]) return 0;
     f = fopen(path, "r");
     if (!f) return 0;
+
+    sig = (ResSig *)calloc((size_t)MAX_RES, sizeof *sig);
+    ru = (ResSig *)calloc((size_t)MAX_RES, sizeof *ru);
+    gtcp = (ResTcp *)calloc((size_t)MAX_RES, sizeof *gtcp);
+    itcp = (ResTcp *)calloc((size_t)MAX_RES, sizeof *itcp);
+    ihttps = (ResHttp *)calloc((size_t)MAX_RES, sizeof *ihttps);
+    ghttps = (ResHttp *)calloc((size_t)MAX_RES, sizeof *ghttps);
+    geo = (ResHttp *)calloc((size_t)MAX_RES, sizeof *geo);
+    updates = (ResHttp *)calloc((size_t)MAX_RES, sizeof *updates);
+    ai = (ResTcp *)calloc((size_t)MAX_RES, sizeof *ai);
+    vids = (ResVideo *)calloc((size_t)MAX_RES, sizeof *vids);
+    banks = (ResBank *)calloc((size_t)MAX_RES, sizeof *banks);
+    if (!sig || !ru || !gtcp || !itcp || !ihttps || !ghttps || !geo || !updates || !ai || !vids || !banks) {
+        fclose(f);
+        goto out;
+    }
 
     while (fgets(line, sizeof line, f)) {
         char *fields[8];
@@ -4553,7 +4565,6 @@ static int resources_load_file(const char *path) {
             nupdates++;
             got_updates = 1;
         } else if (strcmp(section, "ai") == 0 && nai < MAX_RES) {
-            /* name|host|port|crit — или устаревшее name|https://…|crit */
             snprintf(ai[nai].name, sizeof ai[nai].name, "%s", fields[0]);
             if (nf >= 3 && fields[1][0] &&
                 !(starts_with(fields[1], "http://") || starts_with(fields[1], "https://"))) {
@@ -4585,6 +4596,7 @@ static int resources_load_file(const char *path) {
         }
     }
     fclose(f);
+    f = NULL;
 
     if (got_ru) {
         memcpy(g_ru, ru, (size_t)nru * sizeof ru[0]);
@@ -4630,7 +4642,14 @@ static int resources_load_file(const char *path) {
         memcpy(g_banks, banks, (size_t)nbank * sizeof banks[0]);
         g_nbanks = nbank;
     }
-    return 1;
+    ok = 1;
+
+out:
+    if (f) fclose(f);
+    free(sig); free(ru); free(gtcp); free(itcp);
+    free(ihttps); free(ghttps); free(geo); free(updates);
+    free(ai); free(vids); free(banks);
+    return ok;
 }
 
 /* Базовое имя каталога (mac / linux / win) — без пути. */

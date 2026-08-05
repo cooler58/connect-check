@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.4.4] — 2026-08-05
+
+### Fixed
+- GUI (macOS/Linux/Windows): краш при старте проверок (`Thread stack size exceeded`) — парсер `resources.conf` больше не кладёт ~750 KiB массивов на стек worker-потока; стек `diag_thread` увеличен до 8 MiB.
+
 ## [1.4.3] — 2026-08-05
 
 ### Changed
