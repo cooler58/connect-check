@@ -34,7 +34,7 @@ dist: package
 	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz \
 	  connect-check-gui-linux connect-check-gui.sh libglfw.so.3 VERSION resources.conf
 	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz \
-	  ConnectCheck-mac.app ConnectCheck-mac.command VERSION resources.conf
+	  ConnectCheck-mac.app VERSION resources.conf
 	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip \
 	  connect-check-gui-win.exe connect-check-gui.cmd VERSION resources.conf
 	@cd dist && (command -v shasum >/dev/null && shasum -a 256 connect-check-*-$(VERSION).* > SHA256SUMS) || \

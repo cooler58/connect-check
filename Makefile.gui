@@ -43,9 +43,10 @@ MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src -I$(
                -I/opt/homebrew/include -I/usr/local/include $(VER_CFLAG)
 MAC_LDFLAGS := -L/opt/homebrew/lib -L/usr/local/lib -lglfw -pthread \
                -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
-MAC_STAGED  := $(STAGING)/mac/connect-check-gui
+MAC_STAGED  := $(STAGING)/mac/connect-check-bin
+MAC_LAUNCH  := $(STAGING)/mac/connect-check-gui
 
-package-mac: $(MAC_STAGED)
+package-mac: $(MAC_STAGED) $(MAC_LAUNCH)
 ifeq ($(UNAME_S),Darwin)
 	@rm -rf bin/ConnectCheck-mac.app
 	@mkdir -p bin/ConnectCheck-mac.app/Contents/MacOS bin/ConnectCheck-mac.app/Contents/Resources
@@ -56,30 +57,37 @@ ifeq ($(UNAME_S),Darwin)
 	  '<key>CFBundleExecutable</key><string>connect-check-gui</string>' \
 	  '<key>CFBundleIdentifier</key><string>local.connectcheck.gui</string>' \
 	  '<key>CFBundleName</key><string>Connect Check</string>' \
+	  '<key>CFBundleDisplayName</key><string>Connect Check</string>' \
 	  '<key>CFBundlePackageType</key><string>APPL</string>' \
 	  '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+	  '<key>CFBundleVersion</key><string>$(VERSION)</string>' \
 	  '<key>LSMinimumSystemVersion</key><string>11.0</string>' \
 	  '<key>NSHighResolutionCapable</key><true/>' \
+	  '<key>NSPrincipalClass</key><string>NSApplication</string>' \
 	  '</dict></plist>' > bin/ConnectCheck-mac.app/Contents/Info.plist
-	@cp -f $(MAC_STAGED) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@cp -f $(MAC_LAUNCH) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@cp -f $(MAC_STAGED) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-bin
 	@cp -f $(STAGING)/mac/libglfw.3.dylib bin/ConnectCheck-mac.app/Contents/MacOS/ 2>/dev/null || true
+	@chmod +x bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui \
+	  bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-bin
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
-	@# данные только в Resources/ — файл в MacOS/ ломает codesign → «приложение повреждено»
 	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/Resources/resources.conf
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf bin/DejaVuSans.ttf
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
-	@rm -f bin/connect-check-gui-mac
+	@rm -f bin/connect-check-gui-mac bin/ConnectCheck-mac.command
+	@xattr -cr bin/ConnectCheck-mac.app 2>/dev/null || true
 	@if [ -f bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib ]; then \
 	  codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib; \
 	fi
+	@codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-bin
 	@codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 	@codesign --force --sign - bin/ConnectCheck-mac.app
 	@xattr -cr bin/ConnectCheck-mac.app 2>/dev/null || true
 	@codesign --verify --deep --strict bin/ConnectCheck-mac.app
-	@echo "→ bin/ConnectCheck-mac.app (system fonts, ad-hoc codesign OK)"
-	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@echo "→ bin/ConnectCheck-mac.app (двойной клик, лаунчер снимает quarantine)"
+	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/
 	@codesign -dv bin/ConnectCheck-mac.app 2>&1 | head -6 || true
 else
 	@echo "package-mac только на Darwin"; exit 1
@@ -87,6 +95,14 @@ endif
 
 $(EMBED_H):
 	$(MAKE) -f Makefile.diagnose embed
+
+$(MAC_LAUNCH): gui/mac_launcher.c
+ifeq ($(UNAME_S),Darwin)
+	mkdir -p $(STAGING)/mac
+	$(CC) -O2 -Wall -o $@ gui/mac_launcher.c
+else
+	@echo "mac launcher только на Darwin"; exit 1
+endif
 
 $(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
 ifeq ($(UNAME_S),Darwin)

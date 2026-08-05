@@ -6,11 +6,20 @@
 	<dict>
 		<key>Resources/resources.conf</key>
 		<data>
-		4sRBzAv00a1UN9ajylsKv1IfcMk=
+		ue9tkw3yaSE8Aub/eARfjPJXtwE=
 		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>MacOS/connect-check-bin</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			C77xoBhPEy4xoH5bo6l5OAkrR2Y=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"0bbef1a0184f132e31a07e5ba3a97938092b4766"</string>
+		</dict>
 		<key>MacOS/libglfw.3.dylib</key>
 		<dict>
 			<key>cdhash</key>
@@ -24,7 +33,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			FX2lTLoPiZDiX6Zkk96zN5tuZWneVMcD5URDrt3jaqI=
+			eOZs1Rz9EkS+tnVEwnX3ZTt545AiwGEVMWK/kowo6jw=
 			</data>
 		</dict>
 	</dict>

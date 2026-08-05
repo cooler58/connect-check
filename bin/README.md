@@ -15,35 +15,25 @@
 
 ## GUI
 
-Диагностика, циклические пробы и проверка URL выполняются **внутри приложения** (worker-thread). Нужен `resources.conf` рядом с пакетом (или внутри `.app/Contents/MacOS`).
-
 ```bash
-# macOS: после распаковки запускайте лаунчер (не двойной клик по .app из Downloads)
-./ConnectCheck-mac.command
-
-# если всё же «повреждено»:
-xattr -dr com.apple.quarantine ConnectCheck-mac.app
-./ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
-
+# Linux
 ./bin/connect-check-gui-linux
-# Windows: connect-check-gui-win.exe
+# Windows
+connect-check-gui-win.exe
 ```
 
-Шрифт: системный (macOS Arial Unicode / Windows Segoe UI / Linux DejaVu или Noto из ОС).
+### macOS — двойной клик по `ConnectCheck-mac.app`
 
-## Отладочный CLI (не в релизе)
+Приложение **не нотаризовано** Apple (нет платного Developer ID). После скачивания с GitHub система один раз показывает:
 
-```bash
-make cli   # connect-check + probe-* в корне репозитория
-```
+> Apple не удалось подтвердить, что файл не содержит вредоносного ПО…
 
-## Когда что запускать
+**Как открыть (без Terminal):**
 
-| Симптом | В GUI |
-|---------|--------|
-| «Нет интернета» / captive | Диагностика или проба Captive |
-| Игры / Battle.net | Диагностика + пробы Battle.net / QUIC |
-| Умный дом / MQTT | Диагностика + проба MQTT |
-| Видео / CDN | Диагностика + проба Видео |
-| Один URL | вкладка URL |
-| apt/dnf/pacman / Windows Update / Apple | Диагностика → этап «Репозитории / обновления» |
+1. **ПКМ** (или Control+клик) по `ConnectCheck-mac.app` → **Открыть** → в диалоге снова **Открыть**  
+   или  
+2. Двойной клик → **ОК** → **Системные настройки → Конфиденциальность и безопасность** → внизу **Всё равно открыть**
+
+После этого обычный двойной клик работает. Terminal / `xattr` / `.command` не нужны.
+
+Полностью убрать диалог можно только с **Apple Developer ID + notarize** (платная программа разработчика).

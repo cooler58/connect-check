@@ -30,9 +30,11 @@ Headless CLI **не входит** в release-архивы с 1.3.0.
 
 Ассеты: `connect-check-mac-arm64-*.tar.gz`, `connect-check-linux-x86_64-*.tar.gz`, `connect-check-win-x86_64-*.zip`. Если в релизе есть `SHA256SUMS` — хеш проверяется до распаковки.
 
-На macOS после подмены снимается quarantine (`xattr`), иначе Gatekeeper пишет «приложение повреждено».
-При первой распаковке архива удобнее запускать `ConnectCheck-mac.command` (тоже снимает quarantine), либо:
-`xattr -dr com.apple.quarantine ConnectCheck-mac.app`.
+При первой распаковке с GitHub macOS может один раз спросить разрешение (ПКМ → «Открыть» /
+Настройки → Конфиденциальность → «Всё равно открыть»). Дальше — обычный двойной клик по `.app`.
+Встроенный лаунчер снимает quarantine после первого успешного старта. Notarization (платный
+Apple Developer) не требуется для ad-hoc подписи; для полностью «тихого» старта без диалога —
+нужен Developer ID + notarize.
 
 ## Переменные окружения
 
