@@ -39,7 +39,7 @@ else
 endif
 
 # --- macOS: только ConnectCheck-mac.app в корне bin/ ---
-MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src -I$(ROOT)/build \
+MAC_CFLAGS  := -O2 -Wall -Wno-deprecated-declarations -I$(TP) -I$(ROOT)/src -I$(ROOT)/build -I$(ROOT)/gui \
                -I/opt/homebrew/include -I/usr/local/include $(VER_CFLAG)
 MAC_LDFLAGS := -L/opt/homebrew/lib -L/usr/local/lib -lglfw -pthread \
                -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
@@ -59,6 +59,7 @@ ifeq ($(UNAME_S),Darwin)
 	  '<key>CFBundleName</key><string>Connect Check</string>' \
 	  '<key>CFBundleDisplayName</key><string>Connect Check</string>' \
 	  '<key>CFBundlePackageType</key><string>APPL</string>' \
+	  '<key>CFBundleIconFile</key><string>AppIcon</string>' \
 	  '<key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
 	  '<key>CFBundleVersion</key><string>$(VERSION)</string>' \
 	  '<key>LSMinimumSystemVersion</key><string>11.0</string>' \
@@ -73,6 +74,7 @@ ifeq ($(UNAME_S),Darwin)
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
 	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/Resources/resources.conf
+	@cp -f gui/icons/AppIcon.icns bin/ConnectCheck-mac.app/Contents/Resources/AppIcon.icns
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf bin/DejaVuSans.ttf
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
@@ -87,7 +89,7 @@ ifeq ($(UNAME_S),Darwin)
 	@xattr -cr bin/ConnectCheck-mac.app 2>/dev/null || true
 	@codesign --verify --deep --strict bin/ConnectCheck-mac.app
 	@echo "→ bin/ConnectCheck-mac.app (двойной клик, лаунчер снимает quarantine)"
-	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/
+	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/ bin/ConnectCheck-mac.app/Contents/Resources/AppIcon.icns
 	@codesign -dv bin/ConnectCheck-mac.app 2>&1 | head -6 || true
 else
 	@echo "package-mac только на Darwin"; exit 1
@@ -104,7 +106,8 @@ else
 	@echo "mac launcher только на Darwin"; exit 1
 endif
 
-$(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION \
+               $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h gui/icons/icon_rgba.h gui/icons/AppIcon.icns
 ifeq ($(UNAME_S),Darwin)
 	mkdir -p $(STAGING)/mac
 	$(CC) $(MAC_CFLAGS) -o $@ $(SRC) $(MAC_LDFLAGS)
@@ -120,9 +123,11 @@ endif
 
 # --- Windows: GUI только в корне bin/ ---
 WIN_STAGED := $(STAGING)/win/connect-check-gui.exe
+WIN_ICON_O := $(STAGING)/win/win_icon.o
 WIN_CC  := x86_64-w64-mingw32-gcc
+WIN_WINDRES := x86_64-w64-mingw32-windres
 # Windows GUI: GDI+ (без OpenGL/GLFW — portable на Win10 без GPU ICD)
-WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(ROOT)/build $(VER_CFLAG) \
+WIN_CFLAGS  := -O2 -Wall -D_WIN32_WINNT=0x0601 -I$(TP) -I$(ROOT)/src -I$(ROOT)/build -I$(ROOT)/gui $(VER_CFLAG) \
                -mcrtdll=msvcrt-os -static-libgcc
 WIN_LDFLAGS := -mwindows -lgdiplus -lshlwapi -lole32 -luuid -lgdi32 -luser32 -lshell32 -lwinmm \
                -lwininet -lws2_32 -liphlpapi
@@ -152,13 +157,18 @@ package-win: $(WIN_STAGED)
 	@x86_64-w64-mingw32-objdump -p bin/connect-check-gui-win.exe 2>/dev/null | \
 	  awk '/DLL Name/{print "  " $$3}' | head -20
 
-$(WIN_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION $(TP)/nuklear.h $(TP)/nuklear_gdip.h
+$(WIN_ICON_O): gui/win_icon.rc gui/icons/connect-check.ico
 	mkdir -p $(STAGING)/win
-	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_LDFLAGS)
+	$(WIN_WINDRES) -I gui gui/win_icon.rc -O coff -o $@
+
+$(WIN_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION \
+               $(TP)/nuklear.h $(TP)/nuklear_gdip.h $(WIN_ICON_O)
+	mkdir -p $(STAGING)/win
+	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_ICON_O) $(WIN_LDFLAGS)
 
 # --- Linux: GUI + libglfw + font в корне bin/ ---
 LINUX_STAGED := $(STAGING)/linux/connect-check-gui
-LINUX_CFLAGS  := -O2 -Wall -I$(TP) -I$(ROOT)/src -I$(ROOT)/build $(VER_CFLAG) $(shell pkg-config --cflags glfw3 2>/dev/null)
+LINUX_CFLAGS  := -O2 -Wall -I$(TP) -I$(ROOT)/src -I$(ROOT)/build -I$(ROOT)/gui $(VER_CFLAG) $(shell pkg-config --cflags glfw3 2>/dev/null)
 LINUX_LDFLAGS := $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw) -lGL -lm -ldl -lpthread -Wl,-rpath,'$$ORIGIN'
 
 package-linux-native: $(LINUX_STAGED)
@@ -172,7 +182,8 @@ package-linux-native: $(LINUX_STAGED)
 	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 
-$(LINUX_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h
+$(LINUX_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h \
+                 $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h gui/icons/icon_rgba.h
 ifeq ($(UNAME_S),Linux)
 	mkdir -p $(STAGING)/linux
 	$(CC) $(LINUX_CFLAGS) -o $@ $(SRC) $(LINUX_LDFLAGS)
@@ -196,7 +207,7 @@ else
 	      gcc pkg-config libglfw3-dev libgl1-mesa-dev >/dev/null; \
 	    mkdir -p build/gui/linux; \
 	    python3 scripts/embed_domains.py wordlists/top_domains.txt build/top_domains_embed.h; \
-	    gcc -O2 -Wall -Ithird_party -Isrc -Ibuild -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY \
+	    gcc -O2 -Wall -Ithird_party -Isrc -Ibuild -Igui -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY \
 	      $$(pkg-config --cflags glfw3) \
 	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c src/selfupdate.c \
 	      src/connect-check.c src/cc_probes.c \

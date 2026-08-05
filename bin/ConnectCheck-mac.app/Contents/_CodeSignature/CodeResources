@@ -4,6 +4,10 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/AppIcon.icns</key>
+		<data>
+		cCpbIOR1eIBkoj5986/Ld3QPu10=
+		</data>
 		<key>Resources/resources.conf</key>
 		<data>
 		ue9tkw3yaSE8Aub/eARfjPJXtwE=
@@ -15,10 +19,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			0ZH1J9s+6zJb16b9+/vK3oBAIB8=
+			qSDlErsnEa1nauoVJapYAdr6KR0=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"d191f527db3eeb325bd7a6fdfbfbcade8040201f"</string>
+			<string>cdhash H"a920e512bb2711ad676aea1525aa5801dafa291d"</string>
 		</dict>
 		<key>MacOS/libglfw.3.dylib</key>
 		<dict>
@@ -28,6 +32,13 @@
 			</data>
 			<key>requirement</key>
 			<string>cdhash H"daa1f96c87c846fa174e5b17aacde1eedc5c61ed"</string>
+		</dict>
+		<key>Resources/AppIcon.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			Veyjlt86e1xHBKSTj5gzvmrvwQ7/H2kXBoEHISNqIho=
+			</data>
 		</dict>
 		<key>Resources/resources.conf</key>
 		<dict>

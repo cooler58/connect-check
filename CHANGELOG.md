@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.5.4] — 2026-08-05
+
+### Added
+- Иконка приложения: macOS `AppIcon.icns` (Dock/Finder), Windows встроенный `.ico`, окно GLFW (mac/linux).
+
 ## [1.5.3] — 2026-08-05
 
 ### Changed

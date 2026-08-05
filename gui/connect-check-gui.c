@@ -54,6 +54,13 @@
 #include "version.h"
 #include "selfupdate.h"
 #include "cc_engine.h"
+#ifndef _WIN32
+#  include "icons/icon_rgba.h"
+#endif
+
+#ifdef _WIN32
+#  define IDI_APPICON 101
+#endif
 
 #define LOG_LINE    768
 #define PATH_MAX_G  1024
@@ -1433,7 +1440,9 @@ int main(int argc, char **argv) {
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = gui_wndproc;
     wc.hInstance = GetModuleHandleW(0);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    if (!wc.hIcon)
+        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = L"ConnectCheckGui";
     RegisterClassW(&wc);
@@ -1447,6 +1456,10 @@ int main(int argc, char **argv) {
     if (!wnd) {
         MessageBoxA(NULL, "Не удалось создать окно.", "Connect Check", MB_OK | MB_ICONERROR);
         return 1;
+    }
+    if (wc.hIcon) {
+        SendMessageW(wnd, WM_SETICON, ICON_BIG, (LPARAM)wc.hIcon);
+        SendMessageW(wnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIcon);
     }
 
     ctx = nk_gdip_init(wnd, (unsigned)width, (unsigned)height);
@@ -1536,6 +1549,13 @@ int main(int argc, char **argv) {
     if (!win) {
         glfwTerminate();
         return 1;
+    }
+    {
+        GLFWimage img;
+        img.width = CC_ICON_W;
+        img.height = CC_ICON_H;
+        img.pixels = (unsigned char *)cc_icon_rgba;
+        glfwSetWindowIcon(win, 1, &img);
     }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
