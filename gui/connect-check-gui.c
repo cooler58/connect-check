@@ -61,6 +61,10 @@
 #define MAX_EVQ     512
 #define MAX_STAGES  40
 #define MAX_PROBE_W 6
+#define TAB_DIAG    0
+#define TAB_PROBES  1
+#define TAB_URL     2
+#define TAB_COUNT   3
 #define STAGE_PANEL_H_DEFAULT 168
 #define STAGE_PANEL_H_MIN     90
 #define LOG_H_FLOOR           220
@@ -104,8 +108,8 @@ typedef struct {
 
 static char g_workdir[PATH_MAX_G];
 static char g_resources[PATH_MAX_G];
-static LogBuf g_log;
-static int g_log_prog_idx = -1;
+static LogBuf g_logs[TAB_COUNT];
+static int g_log_prog_idx[TAB_COUNT] = { -1, -1, -1 };
 static char g_status[128] = "Готово";
 
 static int opt_yes = 1, opt_skip_dns = 1, opt_skip_video, opt_dns_bulk;
@@ -225,41 +229,53 @@ static void log_format_line(char *out, size_t n, const char *prefix, const char 
     utf8_trim(out);
 }
 
-static void log_add(const char *prefix, const char *msg) {
+static void log_add_tab(int tab, const char *prefix, const char *msg) {
     char line[LOG_LINE];
-    g_log_prog_idx = -1;
+    LogBuf *log;
+    if (tab < 0 || tab >= TAB_COUNT) tab = TAB_DIAG;
+    log = &g_logs[tab];
+    g_log_prog_idx[tab] = -1;
     log_format_line(line, sizeof line, prefix, msg);
-    if (g_log.n < MAX_LOG) {
-        snprintf(g_log.lines[g_log.n++], LOG_LINE, "%s", line);
+    if (log->n < MAX_LOG) {
+        snprintf(log->lines[log->n++], LOG_LINE, "%s", line);
     } else {
-        memmove(g_log.lines[0], g_log.lines[1], (MAX_LOG - 1) * LOG_LINE);
-        snprintf(g_log.lines[MAX_LOG - 1], LOG_LINE, "%s", line);
+        memmove(log->lines[0], log->lines[1], (MAX_LOG - 1) * LOG_LINE);
+        snprintf(log->lines[MAX_LOG - 1], LOG_LINE, "%s", line);
     }
-    g_log.scroll_bottom = 1;
+    log->scroll_bottom = 1;
 }
 
-static void log_progress(const char *prefix, const char *msg) {
+static void log_add(const char *prefix, const char *msg) {
+    log_add_tab(TAB_DIAG, prefix, msg);
+}
+
+static void log_progress_tab(int tab, const char *prefix, const char *msg) {
     char line[LOG_LINE];
+    LogBuf *log;
+    int *prog;
+    if (tab < 0 || tab >= TAB_COUNT) tab = TAB_DIAG;
+    log = &g_logs[tab];
+    prog = &g_log_prog_idx[tab];
     if (!msg || !msg[0]) {
-        if (g_log_prog_idx >= 0 && g_log_prog_idx == g_log.n - 1 && g_log.n > 0) {
-            g_log.n--;
-            g_log_prog_idx = -1;
-            g_log.scroll_bottom = 1;
+        if (*prog >= 0 && *prog == log->n - 1 && log->n > 0) {
+            log->n--;
+            *prog = -1;
+            log->scroll_bottom = 1;
         }
         return;
     }
     log_format_line(line, sizeof line, prefix, msg);
-    if (g_log_prog_idx >= 0 && g_log_prog_idx < g_log.n) {
-        snprintf(g_log.lines[g_log_prog_idx], LOG_LINE, "%s", line);
-    } else if (g_log.n < MAX_LOG) {
-        g_log_prog_idx = g_log.n;
-        snprintf(g_log.lines[g_log.n++], LOG_LINE, "%s", line);
+    if (*prog >= 0 && *prog < log->n) {
+        snprintf(log->lines[*prog], LOG_LINE, "%s", line);
+    } else if (log->n < MAX_LOG) {
+        *prog = log->n;
+        snprintf(log->lines[log->n++], LOG_LINE, "%s", line);
     } else {
-        memmove(g_log.lines[0], g_log.lines[1], (MAX_LOG - 1) * LOG_LINE);
-        g_log_prog_idx = MAX_LOG - 1;
-        snprintf(g_log.lines[MAX_LOG - 1], LOG_LINE, "%s", line);
+        memmove(log->lines[0], log->lines[1], (MAX_LOG - 1) * LOG_LINE);
+        *prog = MAX_LOG - 1;
+        snprintf(log->lines[MAX_LOG - 1], LOG_LINE, "%s", line);
     }
-    g_log.scroll_bottom = 1;
+    log->scroll_bottom = 1;
 }
 
 static void path_join(char *out, size_t n, const char *a, const char *b) {
@@ -503,13 +519,18 @@ static int ev_pop(Ev *out) {
     return ok;
 }
 
-static void ev_log(const char *prefix, const char *msg) {
+static void ev_log_tab(int tab, const char *prefix, const char *msg) {
     Ev e;
     memset(&e, 0, sizeof e);
     e.kind = EV_LOG;
+    e.i3 = tab;
     snprintf(e.a, sizeof e.a, "%s", prefix ? prefix : "");
     snprintf(e.b, sizeof e.b, "%s", msg ? msg : "");
     ev_push(&e);
+}
+
+static void ev_log(const char *prefix, const char *msg) {
+    ev_log_tab(TAB_DIAG, prefix, msg);
 }
 
 static void ev_status(const char *msg) {
@@ -655,13 +676,13 @@ static void drain_events(void) {
     while (ev_pop(&e)) {
         switch (e.kind) {
         case EV_LOG:
-            log_add(e.a, e.b);
+            log_add_tab(e.i3, e.a, e.b);
             break;
         case EV_PROGRESS:
             if (e.a[0])
-                log_progress("engine", e.a);
+                log_progress_tab(TAB_DIAG, "engine", e.a);
             else
-                log_progress("engine", "");
+                log_progress_tab(TAB_DIAG, "engine", "");
             break;
         case EV_STAGE:
             stages_on_begin(e.a);
@@ -768,9 +789,10 @@ typedef struct {
 static void probe_log_line(void *ud, const char *line) {
     ProbeJob *job = (ProbeJob *)ud;
     char buf[LOG_LINE];
+    int tab = (job->slot == 5) ? TAB_URL : TAB_PROBES;
     snprintf(buf, sizeof buf, "%s", line ? line : "");
     sanitize_log_text(buf);
-    if (buf[0]) ev_log(job->prefix, buf);
+    if (buf[0]) ev_log_tab(tab, job->prefix, buf);
 }
 
 #ifdef _WIN32
@@ -782,8 +804,9 @@ static void *probe_thread(void *arg) {
     int rc = cc_probe_run(job->kind, &job->opts, probe_log_line, job, &g_probe_cancel[job->slot]);
     {
         char msg[80];
+        int tab = (job->slot == 5) ? TAB_URL : TAB_PROBES;
         snprintf(msg, sizeof msg, "проба остановлена (код %d)", rc);
-        ev_log(job->prefix, msg);
+        ev_log_tab(tab, job->prefix, msg);
     }
     g_probe_busy[job->slot] = 0;
     free(job);
@@ -861,9 +884,10 @@ static void stop_diagnose(void) {
 
 static void run_probe_slot(int slot, CcProbeKind kind, const CcProbeOpts *popts, const char *prefix) {
     ProbeJob *job;
+    int tab = (slot == 5) ? TAB_URL : TAB_PROBES;
     if (slot < 0 || slot >= MAX_PROBE_W) return;
     if (g_probe_busy[slot]) {
-        log_add(prefix, "уже запущена");
+        log_add_tab(tab, prefix, "уже запущена");
         return;
     }
     job = (ProbeJob *)calloc(1, sizeof *job);
@@ -874,7 +898,7 @@ static void run_probe_slot(int slot, CcProbeKind kind, const CcProbeOpts *popts,
     snprintf(job->prefix, sizeof job->prefix, "%s", prefix);
     g_probe_cancel[slot] = 0;
     g_probe_busy[slot] = 1;
-    log_add(prefix, "старт (in-process)");
+    log_add_tab(tab, prefix, "старт (in-process)");
     snprintf(g_status, sizeof g_status, "Проба: %s", prefix);
 #ifdef _WIN32
     {
@@ -882,7 +906,7 @@ static void run_probe_slot(int slot, CcProbeKind kind, const CcProbeOpts *popts,
         if (!h) {
             g_probe_busy[slot] = 0;
             free(job);
-            log_add(prefix, "не удалось запустить поток");
+            log_add_tab(tab, prefix, "не удалось запустить поток");
         } else {
             CloseHandle((HANDLE)h);
         }
@@ -893,7 +917,7 @@ static void run_probe_slot(int slot, CcProbeKind kind, const CcProbeOpts *popts,
         if (pthread_create(&th, NULL, probe_thread, job) != 0) {
             g_probe_busy[slot] = 0;
             free(job);
-            log_add(prefix, "не удалось запустить поток");
+            log_add_tab(tab, prefix, "не удалось запустить поток");
         } else {
             pthread_detach(th);
         }
@@ -912,13 +936,13 @@ static void run_probes(void) {
         run_probe_slot(i, probe_kinds[i], &opts, cc_probe_kind_name(probe_kinds[i]));
         started++;
     }
-    if (!started) log_add("probes", "ничего не запущено — отметьте пробы");
+    if (!started) log_add_tab(TAB_PROBES, "probes", "ничего не запущено — отметьте пробы");
 }
 
 static void run_url(void) {
     CcProbeOpts opts;
     if (!url_buf[0]) {
-        log_add("url", "укажите URL");
+        log_add_tab(TAB_URL, "url", "укажите URL");
         return;
     }
     memset(&opts, 0, sizeof opts);
@@ -931,11 +955,15 @@ static void run_url(void) {
 
 static void stop_probes(void) {
     int i;
+    int any_probe = 0, any_url = 0;
     for (i = 0; i < MAX_PROBE_W; i++) {
-        if (g_probe_busy[i])
-            g_probe_cancel[i] = 1;
+        if (!g_probe_busy[i]) continue;
+        g_probe_cancel[i] = 1;
+        if (i == 5) any_url = 1;
+        else any_probe = 1;
     }
-    log_add("probes", "запрошена остановка…");
+    if (any_probe) log_add_tab(TAB_PROBES, "probes", "запрошена остановка…");
+    if (any_url) log_add_tab(TAB_URL, "url", "запрошена остановка…");
 }
 
 static void stop_all(void) {
@@ -1272,8 +1300,10 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
         nk_layout_row_dynamic(ctx, 32, 2);
         if (nk_button_label(ctx, "Остановить всё")) stop_all();
         if (nk_button_label(ctx, "Очистить лог")) {
-            g_log.n = 0;
-            g_log_prog_idx = -1;
+            int t = g_tab;
+            if (t < 0 || t >= TAB_COUNT) t = TAB_DIAG;
+            g_logs[t].n = 0;
+            g_log_prog_idx[t] = -1;
         }
 
         log_h = height - (int)ctx->current->layout->at_y - 40;
@@ -1282,22 +1312,32 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
             if (log_h < floor) log_h = floor;
         }
         nk_layout_row_dynamic(ctx, (float)log_h, 1);
-        if (nk_group_begin(ctx, "log", NK_WINDOW_BORDER)) {
-            int i;
-            nk_layout_row_dynamic(ctx, 18, 1);
-            for (i = 0; i < g_log.n; i++) {
-                const char *ln = g_log.lines[i];
-                if (i == g_log_prog_idx || strstr(ln, " … "))
-                    nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(140, 150, 160));
-                else if (strstr(ln, "fail") || strstr(ln, "FAIL") || strstr(ln, "ошиб") ||
-                         strstr(ln, "Error"))
-                    nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(200, 90, 80));
-                else
-                    nk_label(ctx, ln, NK_TEXT_LEFT);
+        {
+            char group_id[16];
+            LogBuf *log;
+            int tab = g_tab;
+            int prog;
+            if (tab < 0 || tab >= TAB_COUNT) tab = TAB_DIAG;
+            log = &g_logs[tab];
+            prog = g_log_prog_idx[tab];
+            snprintf(group_id, sizeof group_id, "log%d", tab);
+            if (nk_group_begin(ctx, group_id, NK_WINDOW_BORDER)) {
+                int i;
+                nk_layout_row_dynamic(ctx, 18, 1);
+                for (i = 0; i < log->n; i++) {
+                    const char *ln = log->lines[i];
+                    if (i == prog || strstr(ln, " … "))
+                        nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(140, 150, 160));
+                    else if (strstr(ln, "fail") || strstr(ln, "FAIL") || strstr(ln, "ошиб") ||
+                             strstr(ln, "Error"))
+                        nk_label_colored(ctx, ln, NK_TEXT_LEFT, nk_rgb(200, 90, 80));
+                    else
+                        nk_label(ctx, ln, NK_TEXT_LEFT);
+                }
+                if (log->scroll_bottom)
+                    log->scroll_bottom = 0;
+                nk_group_end(ctx);
             }
-            if (g_log.scroll_bottom)
-                g_log.scroll_bottom = 0;
-            nk_group_end(ctx);
         }
 
         nk_layout_row_dynamic(ctx, 22, 1);
@@ -1313,10 +1353,12 @@ static void gui_init_common(void) {
 #endif
     resolve_pkg();
     stages_rebuild_plan();
-    log_add("", "Connect Check GUI " CONNECT_CHECK_VERSION " — движок встроен");
-    if (g_workdir[0]) log_add("pkg", g_workdir);
-    if (g_resources[0]) log_add("resources", g_resources);
-    else log_add("resources", "resources.conf не найден — будут встроенные списки");
+    log_add_tab(TAB_DIAG, "", "Connect Check GUI " CONNECT_CHECK_VERSION " — движок встроен");
+    if (g_workdir[0]) log_add_tab(TAB_DIAG, "pkg", g_workdir);
+    if (g_resources[0]) log_add_tab(TAB_DIAG, "resources", g_resources);
+    else log_add_tab(TAB_DIAG, "resources", "resources.conf не найден — будут встроенные списки");
+    log_add_tab(TAB_PROBES, "", "Лог циклических проб");
+    log_add_tab(TAB_URL, "", "Лог проверки URL");
 }
 
 #ifdef _WIN32
