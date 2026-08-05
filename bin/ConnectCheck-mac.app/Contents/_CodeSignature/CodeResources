@@ -3,7 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>files</key>
-	<dict/>
+	<dict>
+		<key>Resources/resources.conf</key>
+		<data>
+		4sRBzAv00a1UN9ajylsKv1IfcMk=
+		</data>
+	</dict>
 	<key>files2</key>
 	<dict>
 		<key>MacOS/libglfw.3.dylib</key>
@@ -15,14 +20,12 @@
 			<key>requirement</key>
 			<string>cdhash H"daa1f96c87c846fa174e5b17aacde1eedc5c61ed"</string>
 		</dict>
-		<key>MacOS/resources.conf</key>
+		<key>Resources/resources.conf</key>
 		<dict>
-			<key>cdhash</key>
+			<key>hash2</key>
 			<data>
-			5p0cwdi1eXz7ijWQxwgExwmDOVM=
+			FX2lTLoPiZDiX6Zkk96zN5tuZWneVMcD5URDrt3jaqI=
 			</data>
-			<key>requirement</key>
-			<string>cdhash H"e69d1cc1d8b5797cfb8a3590c70804c709833953"</string>
 		</dict>
 	</dict>
 	<key>rules</key>

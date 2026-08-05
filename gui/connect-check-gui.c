@@ -327,8 +327,24 @@ static int package_root_from_gui(char *out, size_t n) {
 }
 
 static void resolve_resources(void) {
-    char try[PATH_MAX_G], exedir[PATH_MAX_G];
+    char try[PATH_MAX_G], exedir[PATH_MAX_G], real[PATH_MAX_G];
     g_resources[0] = 0;
+#ifdef __APPLE__
+    /* Правильное место данных в .app — Contents/Resources (не MacOS/: ломает codesign). */
+    if (gui_exe_dir(exedir, sizeof exedir)) {
+        size_t len = strlen(exedir);
+        if (len > 15 && strcmp(exedir + len - 15, "/Contents/MacOS") == 0) {
+            snprintf(try, sizeof try, "%.*s/Contents/Resources/resources.conf",
+                     (int)(len - 15), exedir);
+            if (realpath(try, real))
+                snprintf(try, sizeof try, "%s", real);
+            if (file_exists(try)) {
+                snprintf(g_resources, sizeof g_resources, "%s", try);
+                return;
+            }
+        }
+    }
+#endif
     if (g_workdir[0]) {
         path_join(try, sizeof try, g_workdir, "resources.conf");
         if (file_exists(try)) {

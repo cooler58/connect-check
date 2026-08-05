@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-08-05
+
+### Fixed
+- macOS: `resources.conf` перенесён в `Contents/Resources/` — файл в `MacOS/` ломал codesign, из‑за этого Gatekeeper писал «приложение повреждено».
+- `ConnectCheck-mac.command` запускает бинарь напрямую (после `xattr`), без `open`.
+
 ## [1.4.1] — 2026-08-05
 
 ### Fixed

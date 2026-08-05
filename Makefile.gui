@@ -48,7 +48,7 @@ MAC_STAGED  := $(STAGING)/mac/connect-check-gui
 package-mac: $(MAC_STAGED)
 ifeq ($(UNAME_S),Darwin)
 	@rm -rf bin/ConnectCheck-mac.app
-	@mkdir -p bin/ConnectCheck-mac.app/Contents/MacOS
+	@mkdir -p bin/ConnectCheck-mac.app/Contents/MacOS bin/ConnectCheck-mac.app/Contents/Resources
 	@printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -65,20 +65,22 @@ ifeq ($(UNAME_S),Darwin)
 	@cp -f $(STAGING)/mac/libglfw.3.dylib bin/ConnectCheck-mac.app/Contents/MacOS/ 2>/dev/null || true
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
-	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf 2>/dev/null || true
+	@# данные только в Resources/ — файл в MacOS/ ломает codesign → «приложение повреждено»
+	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/Resources/resources.conf
+	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf
 	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf bin/DejaVuSans.ttf
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
 	@rm -f bin/connect-check-gui-mac
-	@# ad-hoc подпись + сброс quarantine — иначе «приложение повреждено» после скачивания с GitHub
 	@if [ -f bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib ]; then \
-	  codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib 2>/dev/null || true; \
+	  codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/libglfw.3.dylib; \
 	fi
-	@codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui 2>/dev/null || true
-	@codesign --force --deep --sign - bin/ConnectCheck-mac.app 2>/dev/null || true
+	@codesign --force --sign - bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
+	@codesign --force --sign - bin/ConnectCheck-mac.app
 	@xattr -cr bin/ConnectCheck-mac.app 2>/dev/null || true
-	@echo "→ bin/ConnectCheck-mac.app (engine in-process, system fonts, ad-hoc codesign)"
+	@codesign --verify --deep --strict bin/ConnectCheck-mac.app
+	@echo "→ bin/ConnectCheck-mac.app (system fonts, ad-hoc codesign OK)"
 	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
-	@codesign -dv bin/ConnectCheck-mac.app 2>&1 | head -5 || true
+	@codesign -dv bin/ConnectCheck-mac.app 2>&1 | head -6 || true
 else
 	@echo "package-mac только на Darwin"; exit 1
 endif
