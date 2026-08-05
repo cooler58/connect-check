@@ -96,7 +96,7 @@ typedef enum {
 
 typedef struct {
     EvKind kind;
-    char a[160];
+    char a[PATH_MAX_G]; /* пути отчёта / длинные строки */
     char b[256];
     char c[512];
     int i1, i2, i3;
@@ -110,7 +110,7 @@ static char g_status[128] = "Готово";
 
 static int opt_yes = 1, opt_skip_dns = 1, opt_skip_video, opt_dns_bulk;
 static int opt_skip_speed, opt_no_open;
-static char opt_outdir[256] = "reports";
+static char opt_outdir[PATH_MAX_G] = "reports";
 
 static int probe_on[5] = {1, 0, 0, 0, 0};
 static const char *probe_labels[] = {
@@ -377,12 +377,28 @@ static void resolve_resources(void) {
     }
 }
 
+static int path_is_absolute(const char *p) {
+    if (!p || !p[0]) return 0;
+#ifdef _WIN32
+    if (p[0] == '\\' || p[0] == '/') return 1;
+    return (p[1] == ':' && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')));
+#else
+    return p[0] == '/';
+#endif
+}
+
 static int resolve_pkg(void) {
     g_workdir[0] = 0;
     g_resources[0] = 0;
     if (!package_root_from_gui(g_workdir, sizeof g_workdir))
         return 0;
     resolve_resources();
+    /* Абсолютный каталог отчётов по умолчанию — рядом с пакетом */
+    if (!path_is_absolute(opt_outdir) && g_workdir[0] && strcmp(opt_outdir, "reports") == 0) {
+        char abs[PATH_MAX_G];
+        path_join(abs, sizeof abs, g_workdir, "reports");
+        snprintf(opt_outdir, sizeof opt_outdir, "%s", abs);
+    }
     return 1;
 }
 
@@ -928,20 +944,62 @@ static void stop_all(void) {
 }
 
 static void open_path(const char *path) {
-    if (!path || !path[0]) return;
+    char abs[PATH_MAX_G];
+    if (!path || !path[0]) {
+        log_add("report", "нет пути к отчёту — сначала завершите диагностику");
+        snprintf(g_status, sizeof g_status, "Отчёт ещё не готов");
+        return;
+    }
+    snprintf(abs, sizeof abs, "%s", path);
+#ifndef _WIN32
+    if (abs[0] != '/' && g_workdir[0]) {
+        char joined[PATH_MAX_G];
+        path_join(joined, sizeof joined, g_workdir, abs);
+        snprintf(abs, sizeof abs, "%s", joined);
+    }
+#else
+    if (!(abs[0] && abs[1] == ':') && abs[0] != '\\' && g_workdir[0]) {
+        char joined[PATH_MAX_G];
+        path_join(joined, sizeof joined, g_workdir, abs);
+        snprintf(abs, sizeof abs, "%s", joined);
+    }
+#endif
+    if (!file_exists(abs)) {
+        char msg[LOG_LINE];
+        snprintf(msg, sizeof msg, "файл не найден: %s", abs);
+        log_add("report", msg);
+        snprintf(g_status, sizeof g_status, "Отчёт не найден на диске");
+        return;
+    }
+    snprintf(g_report_path, sizeof g_report_path, "%s", abs);
 #ifdef _WIN32
-    ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);
+    if ((int)(intptr_t)ShellExecuteA(NULL, "open", abs, NULL, NULL, SW_SHOWNORMAL) <= 32) {
+        log_add("report", "не удалось открыть в браузере");
+        snprintf(g_status, sizeof g_status, "Не удалось открыть отчёт");
+    } else {
+        snprintf(g_status, sizeof g_status, "Отчёт открыт");
+    }
 #elif defined(__APPLE__)
     {
-        char cmd[PATH_MAX_G + 32];
-        snprintf(cmd, sizeof cmd, "open '%s'", path);
-        system(cmd);
+        char cmd[PATH_MAX_G + 64];
+        snprintf(cmd, sizeof cmd, "/usr/bin/open \"%s\"", abs);
+        if (system(cmd) != 0) {
+            log_add("report", "open завершился с ошибкой");
+            snprintf(g_status, sizeof g_status, "Не удалось открыть отчёт");
+        } else {
+            snprintf(g_status, sizeof g_status, "Отчёт открыт");
+        }
     }
 #else
     {
-        char cmd[PATH_MAX_G + 32];
-        snprintf(cmd, sizeof cmd, "xdg-open '%s' >/dev/null 2>&1 &", path);
-        system(cmd);
+        char cmd[PATH_MAX_G + 64];
+        snprintf(cmd, sizeof cmd, "xdg-open \"%s\" >/dev/null 2>&1 &", abs);
+        if (system(cmd) != 0) {
+            log_add("report", "xdg-open завершился с ошибкой");
+            snprintf(g_status, sizeof g_status, "Не удалось открыть отчёт");
+        } else {
+            snprintf(g_status, sizeof g_status, "Отчёт открыт");
+        }
     }
 #endif
 }

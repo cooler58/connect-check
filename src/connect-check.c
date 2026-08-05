@@ -4878,8 +4878,36 @@ static void write_html(void) {
 
     f = fopen(report_path, "wb");
     if (!f) {
-        fprintf(stderr, "Не удалось записать %s\n", report_path);
-        return;
+        /* Read-only том (DMG) или нет прав — пишем в домашний каталог */
+        char alt[STR];
+        const char *home = NULL;
+#ifdef _WIN32
+        home = getenv("USERPROFILE");
+        if (home && home[0]) {
+            snprintf(alt, sizeof alt, "%s\\Documents\\ConnectCheck", home);
+            CreateDirectoryA(alt, NULL);
+            snprintf(alt, sizeof alt, "%s\\Documents\\ConnectCheck\\net_diag_%s.html", home, stamp);
+        } else
+            alt[0] = 0;
+#else
+        home = getenv("HOME");
+        if (home && home[0]) {
+            char cmd[STR];
+            snprintf(cmd, sizeof cmd, "mkdir -p '%s/Documents/ConnectCheck'", home);
+            system(cmd);
+            snprintf(alt, sizeof alt, "%s/Documents/ConnectCheck/net_diag_%s.html", home, stamp);
+        } else
+            alt[0] = 0;
+#endif
+        if (alt[0])
+            f = fopen(alt, "wb");
+        if (f) {
+            snprintf(report_path, sizeof report_path, "%s", alt);
+            engine_logf("Каталог отчёта недоступен — записано в %s", report_path);
+        } else {
+            engine_logf("Не удалось записать отчёт: %s", report_path);
+            return;
+        }
     }
     /* UTF-8 BOM for Windows Notepad */
     fputs("\xEF\xBB\xBF", f);
@@ -7968,6 +7996,24 @@ int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb) {
 #else
         snprintf(output_dir, sizeof output_dir, "%s/reports", exe_dir);
 #endif
+    } else {
+        /* Относительный -o → абсолютный от workdir/exe_dir */
+        int abs = 0;
+#ifdef _WIN32
+        abs = (output_dir[0] == '\\' || output_dir[0] == '/' ||
+               (output_dir[0] && output_dir[1] == ':'));
+#else
+        abs = (output_dir[0] == '/');
+#endif
+        if (!abs && exe_dir[0]) {
+            char joined[STR];
+#ifdef _WIN32
+            snprintf(joined, sizeof joined, "%s\\%s", exe_dir, output_dir);
+#else
+            snprintf(joined, sizeof joined, "%s/%s", exe_dir, output_dir);
+#endif
+            snprintf(output_dir, sizeof output_dir, "%s", joined);
+        }
     }
 
     /* stamp/report_path set inside diagnose_core after resources_init — need them before.
