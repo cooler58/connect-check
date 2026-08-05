@@ -2,7 +2,7 @@
 #
 # Раскладка bin/:
 #   GUI → корень bin/  (ConnectCheck-mac.app, connect-check-gui-linux, connect-check-gui-win.exe)
-#   + VERSION, resources.conf, шрифты
+#   + VERSION, resources.conf (шрифты — системные ОС)
 #
 #   make -f Makefile.gui              — GUI текущей ОС → корень bin/
 #   make -f Makefile.gui package-all  — mac + win + linux
@@ -13,7 +13,6 @@ ROOT    := $(CURDIR)
 TP      := $(ROOT)/third_party
 ENGINE  := src/connect-check.c src/cc_probes.c src/selfupdate.c
 SRC     := gui/connect-check-gui.c $(ENGINE)
-FONT    := $(TP)/fonts/DejaVuSans.ttf
 GLFW_WIN ?= $(TP)/win
 VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
 VER_CFLAG := -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY
@@ -64,13 +63,13 @@ ifeq ($(UNAME_S),Darwin)
 	  '</dict></plist>' > bin/ConnectCheck-mac.app/Contents/Info.plist
 	@cp -f $(MAC_STAGED) bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 	@cp -f $(STAGING)/mac/libglfw.3.dylib bin/ConnectCheck-mac.app/Contents/MacOS/ 2>/dev/null || true
-	@cp -f $(FONT) bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
 	@cp -f resources.conf bin/ConnectCheck-mac.app/Contents/MacOS/resources.conf 2>/dev/null || true
+	@rm -f bin/ConnectCheck-mac.app/Contents/MacOS/DejaVuSans.ttf bin/DejaVuSans.ttf
 	@rm -rf bin/mac/ConnectCheck.app bin/mac/connect-check-gui bin/mac/libglfw.3.dylib bin/mac/DejaVuSans.ttf
 	@rm -f bin/connect-check-gui-mac
-	@echo "→ bin/ConnectCheck-mac.app (engine in-process)"
+	@echo "→ bin/ConnectCheck-mac.app (engine in-process, system fonts)"
 	@ls -lh bin/ConnectCheck-mac.app/Contents/MacOS/connect-check-gui
 else
 	@echo "package-mac только на Darwin"; exit 1
@@ -117,11 +116,10 @@ fetch-glfw-win:
 
 package-win: $(WIN_STAGED)
 	@cp -f $(WIN_STAGED) bin/connect-check-gui-win.exe
-	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd 2>/dev/null || true
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
-	@rm -f bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
+	@rm -f bin/DejaVuSans.ttf bin/win/connect-check-gui.exe bin/win/DejaVuSans.ttf
 	@rm -rf bin/win
 	@ls -lh bin/connect-check-gui-win.exe
 	@file bin/connect-check-gui-win.exe | sed 's|^|  |'
@@ -142,10 +140,9 @@ package-linux-native: $(LINUX_STAGED)
 	@chmod +x bin/connect-check-gui-linux
 	@SO=$$(ldd $(LINUX_STAGED) 2>/dev/null | awk '/libglfw/{print $$3; exit}'); \
 	  if [ -n "$$SO" ] && [ -f "$$SO" ]; then cp -f "$$SO" bin/; fi
-	@cp -f $(FONT) bin/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
-	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
+	@rm -f bin/DejaVuSans.ttf bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
 	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 
@@ -189,15 +186,13 @@ else
 	      fi; \
 	      if [ ! -e "$$dest" ]; then cp -f "$$SO" "$$dest" || true; fi; \
 	    fi; \
-	    cp -f third_party/fonts/DejaVuSans.ttf build/gui/linux/; \
-	    ls -lh build/gui/linux/connect-check-gui build/gui/linux/libglfw* build/gui/linux/DejaVuSans.ttf'
+	    ls -lh build/gui/linux/connect-check-gui build/gui/linux/libglfw*'
 	@cp -f $(STAGING)/linux/connect-check-gui bin/connect-check-gui-linux
 	@chmod +x bin/connect-check-gui-linux
 	@cp -f $(STAGING)/linux/libglfw.so* bin/ 2>/dev/null || true
-	@cp -f $(STAGING)/linux/DejaVuSans.ttf bin/DejaVuSans.ttf 2>/dev/null || true
 	@cp -f resources.conf bin/resources.conf
 	@cp -f VERSION bin/VERSION
-	@rm -f bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
+	@rm -f bin/DejaVuSans.ttf bin/linux/connect-check-gui bin/linux/libglfw.so* bin/linux/DejaVuSans.ttf
 	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 endif
@@ -206,7 +201,7 @@ package-all: package-mac package-win package-linux
 	@echo ""
 	@echo "GUI в корне bin/:"
 	@ls -ld bin/ConnectCheck-mac.app 2>/dev/null || true
-	@ls -lh bin/connect-check-gui-linux bin/connect-check-gui-win.exe bin/DejaVuSans.ttf bin/libglfw.so* 2>/dev/null || true
+	@ls -lh bin/connect-check-gui-linux bin/connect-check-gui-win.exe bin/libglfw.so* 2>/dev/null || true
 
 run: package
 ifeq ($(UNAME_S),Darwin)

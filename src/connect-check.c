@@ -3920,6 +3920,8 @@ static ResHttp g_game_https[MAX_RES];
 static int g_ngame_https;
 static ResHttp g_geo[MAX_RES];
 static int g_ngeo;
+static ResHttp g_updates[MAX_RES];
+static int g_nupdates;
 static ResTcp g_ai[MAX_RES];
 static int g_nai;
 static ResVideo g_video[MAX_RES];
@@ -4197,6 +4199,53 @@ static void resources_load_defaults(void) {
         {"Eurasia Peering (RU · IX)", "https://www.eurasiapeering.ru/"},
         {"Selectel speed 10MB (RU)", "https://speedtest.selectel.ru/10MB"},
     };
+    /* Репозитории Linux / зеркала + точки обновлений ОС и пакетных экосистем.
+     * 401/403 от registry часто = OK (ok_403 на этапе). */
+    static const struct { const char *name, *url; } updates[] = {
+        /* --- Linux: официальные репо / зеркала --- */
+        {"Debian (deb.debian.org)", "https://deb.debian.org/debian/dists/stable/Release"},
+        {"Debian security", "https://security.debian.org/debian-security/dists/stable-security/Release"},
+        {"Ubuntu archive", "https://archive.ubuntu.com/ubuntu/dists/noble/InRelease"},
+        {"Ubuntu security", "https://security.ubuntu.com/ubuntu/dists/noble-security/InRelease"},
+        {"Yandex mirror Debian", "https://mirror.yandex.ru/debian/dists/stable/Release"},
+        {"Yandex mirror Ubuntu", "https://mirror.yandex.ru/ubuntu/dists/noble/InRelease"},
+        {"Fedora", "https://dl.fedoraproject.org/pub/fedora/linux/releases/"},
+        {"Rocky Linux", "https://dl.rockylinux.org/pub/rocky/"},
+        {"AlmaLinux", "https://repo.almalinux.org/almalinux/"},
+        {"Arch Linux geo mirror", "https://geo.mirror.pkgbuild.com/core/os/x86_64/"},
+        {"Alpine CDN", "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz"},
+        {"openSUSE download", "https://download.opensuse.org/distribution/leap/"},
+        {"Kali rolling", "https://http.kali.org/kali/dists/kali-rolling/InRelease"},
+        {"Amazon Linux CDN", "https://cdn.amazonlinux.com/"},
+        /* --- Windows / Microsoft --- */
+        {"Windows Update CTL",
+         "https://ctldl.windowsupdate.com/msdownload/update/v3/static/trustedr/en/authrootstl.cab"},
+        {"Microsoft download CDN", "https://download.microsoft.com/"},
+        {"Winget CDN cache", "https://cdn.winget.microsoft.com/cache/"},
+        {"Chocolatey community", "https://community.chocolatey.org/api/v2/"},
+        /* --- Apple --- */
+        {"Apple software catalog (gdmf)", "https://gdmf.apple.com/v2/pmv"},
+        {"Apple mesu", "https://mesu.apple.com/assets/"},
+        {"Apple configuration",
+         "https://configuration.apple.com/configurations/internetservices/configuration.plist"},
+        /* --- Android / Google --- */
+        {"Android repository XML", "https://dl.google.com/android/repository/repository2-1.xml"},
+        {"Google update service", "https://update.googleapis.com/service/update2"},
+        {"Chrome updates (Omaha)", "https://update.googleapis.com/chrome"},
+        /* --- контейнеры / язык. экосистемы --- */
+        {"Docker Hub registry", "https://registry-1.docker.io/v2/"},
+        {"Docker Hub auth", "https://auth.docker.io/token"},
+        {"npm registry", "https://registry.npmjs.org/"},
+        {"PyPI", "https://pypi.org/simple/"},
+        {"crates.io", "https://static.crates.io/config.json"},
+        {"Maven Central", "https://repo1.maven.org/maven2/"},
+        {"NuGet", "https://api.nuget.org/v3/index.json"},
+        {"Homebrew formulae API", "https://formulae.brew.sh/api/formula.json"},
+        {"Flathub API", "https://flathub.org/api/v2/collection/recently-updated"},
+        {"Snapcraft API", "https://api.snapcraft.io/v2/snaps/info/core"},
+        {"Mozilla CDN", "https://download-installer.cdn.mozilla.net/"},
+        {"VS Code updates", "https://update.code.visualstudio.com/api/update/darwin/stable/latest"},
+    };
     static const struct { const char *name, *url; } ghttps[] = {
         {"Battle.net", "https://battle.net/"},
         {"Blizzard", "https://www.blizzard.com/"},
@@ -4368,6 +4417,14 @@ static void resources_load_defaults(void) {
         snprintf(g_geo[i].url, sizeof g_geo[i].url, "%s", geo[i].url);
     }
 
+    n = (int)(sizeof updates / sizeof updates[0]);
+    if (n > MAX_RES) n = MAX_RES;
+    g_nupdates = n;
+    for (i = 0; i < n; i++) {
+        snprintf(g_updates[i].name, sizeof g_updates[i].name, "%s", updates[i].name);
+        snprintf(g_updates[i].url, sizeof g_updates[i].url, "%s", updates[i].url);
+    }
+
     n = (int)(sizeof ghttps / sizeof ghttps[0]);
     if (n > MAX_RES) n = MAX_RES;
     g_ngame_https = n;
@@ -4413,8 +4470,8 @@ static int resources_load_file(const char *path) {
     FILE *f;
     char line[1024];
     char section[64] = "";
-    int got_sig = 0, got_ru = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_geo = 0, got_ai = 0, got_vid = 0, got_bank = 0;
-    int nsig = 0, nru = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, ngeo = 0, nai = 0, nvid = 0, nbank = 0;
+    int got_sig = 0, got_ru = 0, got_gtcp = 0, got_itcp = 0, got_ihttps = 0, got_ghttps = 0, got_geo = 0, got_updates = 0, got_ai = 0, got_vid = 0, got_bank = 0;
+    int nsig = 0, nru = 0, ngtcp = 0, nitcp = 0, nihttps = 0, nghttps = 0, ngeo = 0, nupdates = 0, nai = 0, nvid = 0, nbank = 0;
     ResSig sig[MAX_RES];
     ResSig ru[MAX_RES];
     ResTcp gtcp[MAX_RES];
@@ -4422,6 +4479,7 @@ static int resources_load_file(const char *path) {
     ResHttp ihttps[MAX_RES];
     ResHttp ghttps[MAX_RES];
     ResHttp geo[MAX_RES];
+    ResHttp updates[MAX_RES];
     ResTcp ai[MAX_RES];
     ResVideo vids[MAX_RES];
     ResBank banks[MAX_RES];
@@ -4489,6 +4547,11 @@ static int resources_load_file(const char *path) {
             snprintf(geo[ngeo].url, sizeof geo[ngeo].url, "%s", fields[1]);
             ngeo++;
             got_geo = 1;
+        } else if (strcmp(section, "updates") == 0 && nupdates < MAX_RES) {
+            snprintf(updates[nupdates].name, sizeof updates[nupdates].name, "%s", fields[0]);
+            snprintf(updates[nupdates].url, sizeof updates[nupdates].url, "%s", fields[1]);
+            nupdates++;
+            got_updates = 1;
         } else if (strcmp(section, "ai") == 0 && nai < MAX_RES) {
             /* name|host|port|crit — или устаревшее name|https://…|crit */
             snprintf(ai[nai].name, sizeof ai[nai].name, "%s", fields[0]);
@@ -4550,6 +4613,10 @@ static int resources_load_file(const char *path) {
     if (got_geo) {
         memcpy(g_geo, geo, (size_t)ngeo * sizeof geo[0]);
         g_ngeo = ngeo;
+    }
+    if (got_updates) {
+        memcpy(g_updates, updates, (size_t)nupdates * sizeof updates[0]);
+        g_nupdates = nupdates;
     }
     if (got_ai) {
         memcpy(g_ai, ai, (size_t)nai * sizeof ai[0]);
@@ -7413,6 +7480,36 @@ static int diagnose_core(void) {
             snprintf(tx, sizeof tx, "Не отвечают: %s.", names);
             add_finding(nfail >= 2 ? "warning" : "info", detail, tx);
         }
+        stage_done();
+    }
+
+    /* Репозитории Linux / зеркала + точки обновлений Windows/Apple/Android и пакетных экосистем */
+    if (g_nupdates > 0 &&
+        stage_begin("Репозитории / обновления",
+                    "Зеркала Debian/Ubuntu/Fedora/Arch…, Windows Update, Apple, Android, "
+                    "Docker/npm/PyPI/Homebrew/Flathub")) {
+        int nh = g_nupdates;
+        int nfail = 0;
+        Check *houts = (Check *)calloc((size_t)nh, sizeof(Check));
+        if (houts && nh > 0) {
+            HttpsResJobCtx hctx;
+            hctx.outs = houts; hctx.items = g_updates; hctx.cat = "Репозитории / обновления";
+            hctx.multi_ua = 0; hctx.timeout_sec = 12; hctx.ok_403 = 1;
+            run_parallel(nh, opt_jobs, https_res_job, &hctx, "репо/апдейты");
+            for (i = 0; i < nh; i++) {
+                add_check_from(&houts[i]);
+                if (strcmp(houts[i].status, "fail") == 0) nfail++;
+            }
+        }
+        free(houts);
+        if (nfail >= 5)
+            add_finding("warning", "Много сбоев репозиториев / обновлений",
+                        "Недоступны сразу несколько зеркал Linux или точек обновления ОС — "
+                        "возможен фильтр CDN/foreign AS или проблема исходящего HTTPS.");
+        else if (nfail >= 2)
+            add_finding("info", "Частичные сбои репозиториев / обновлений",
+                        "Часть зеркал или update-CDN не отвечает — проверьте локальные "
+                        "sources.list / зеркала и доступ к Windows/Apple update.");
         stage_done();
     }
 

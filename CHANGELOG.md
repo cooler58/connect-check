@@ -4,12 +4,20 @@
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-08-05
+
+### Added
+- Этап **Репозитории / обновления**: зеркала Debian/Ubuntu/Fedora/Rocky/Alma/Arch/Alpine/openSUSE/Kali (+ Yandex), Windows Update CTL / Winget / Chocolatey, Apple gdmf/mesu, Android/Chrome update, Docker/npm/PyPI/crates/Maven/NuGet/Homebrew/Flathub/Snap — секция `[updates]` в `resources.conf`.
+
+### Changed
+- GUI использует **системные шрифты** (Arial Unicode / Segoe UI / DejaVu|Noto из ОС); `DejaVuSans.ttf` убран из пакета и репозитория.
+
 ## [1.3.0] — 2026-08-05
 
 ### Changed
 - **GUI-only релиз**: диагностика и пробы выполняются **внутри приложения** (in-process движок `cc_engine` / `cc_probe_*`). Отдельные `connect-check` и `probe-*` больше не входят в пакет и архивы Release.
 - GUI: worker-thread + callbacks — этапы, счётчики сбоев/внимания, кнопка «Открыть отчёт»; баннер «Движок встроен» вместо пути к CLI.
-- Self-update и `dist/`: раскладка только GUI + `resources.conf` + `VERSION` (+ шрифты/лаунчеры).
+- Self-update и `dist/`: раскладка только GUI + `resources.conf` + `VERSION` (+ лаунчеры).
 - Документация: `docs/VERSIONING.md`, `docs/UPDATE.md`, `bin/README.md`.
 
 ### Notes

@@ -32,11 +32,11 @@ dist: package
 	@cp -f scripts/connect-check-gui-win.cmd bin/connect-check-gui.cmd
 	@chmod +x bin/connect-check-gui.sh bin/ConnectCheck-mac.command 2>/dev/null || true
 	tar -C bin -czf dist/connect-check-linux-x86_64-$(VERSION).tar.gz \
-	  connect-check-gui-linux connect-check-gui.sh libglfw.so.3 DejaVuSans.ttf VERSION resources.conf
+	  connect-check-gui-linux connect-check-gui.sh libglfw.so.3 VERSION resources.conf
 	tar -C bin -czf dist/connect-check-mac-arm64-$(VERSION).tar.gz \
-	  ConnectCheck-mac.app ConnectCheck-mac.command VERSION resources.conf DejaVuSans.ttf
+	  ConnectCheck-mac.app ConnectCheck-mac.command VERSION resources.conf
 	cd bin && zip -qr ../dist/connect-check-win-x86_64-$(VERSION).zip \
-	  connect-check-gui-win.exe connect-check-gui.cmd DejaVuSans.ttf VERSION resources.conf
+	  connect-check-gui-win.exe connect-check-gui.cmd VERSION resources.conf
 	@cd dist && (command -v shasum >/dev/null && shasum -a 256 connect-check-*-$(VERSION).* > SHA256SUMS) || \
 	  (command -v sha256sum >/dev/null && sha256sum connect-check-*-$(VERSION).* > SHA256SUMS) || \
 	  { echo "Нет shasum/sha256sum — SHA256SUMS не создан"; exit 1; }
@@ -56,7 +56,7 @@ mac linux win:
 	@$(MAKE) -f Makefile.package package
 
 clean-package:
-	rm -f bin/resources.conf bin/VERSION bin/DejaVuSans.ttf bin/libglfw.so*
+	rm -f bin/resources.conf bin/VERSION bin/DejaVuSans.ttf bin/libglfw.so* bin/.DS_Store
 	rm -f bin/connect-check-gui-linux bin/connect-check-gui-win.exe
 	rm -f bin/connect-check-gui.sh bin/ConnectCheck-mac.command bin/connect-check-gui.cmd
 	rm -rf bin/ConnectCheck-mac.app bin/mac bin/linux bin/win

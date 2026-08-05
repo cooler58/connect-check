@@ -7,7 +7,7 @@ alwaysApply: true
 
 - Проект называется **connect-check** (не netscan). Основной продукт: **GUI** с in-process движком (`connect-check-gui` / `ConnectCheck-mac.app`).
 - Версия только из корневого `VERSION` (semver). При релизе синхронизировать `CHANGELOG.md`, тег `vX.Y.Z`, пуш ветки и тега.
-- Исходники в `src/`, GUI в `gui/`. В `bin/`: **только GUI** (+ `resources.conf`, `VERSION`, шрифты) — коммитить при релизе (`make release`). CLI/`probe-*` не кладутся в релизный пакет.
+- Исходники в `src/`, GUI в `gui/`. В `bin/`: **только GUI** (+ `resources.conf`, `VERSION`; шрифты системные) — коммитить при релизе (`make release`). CLI/`probe-*` не кладутся в релизный пакет.
 - Не коммитить `reports/`, HTML-отчёты, `build/`, `dist/`, `.venv/`, отладочные бинарники в корне репо (`./connect-check`, `./probe-*`).
 - Сборка: `make gui`, `make -f Makefile.gui package-all`, `make release`. Подробности: `docs/VERSIONING.md`, `bin/README.md`.
 - После релиза — коммит + `git push` на `origin` (`cooler58/connect-check`) + тег `vX.Y.Z`, не force-push в `main`.

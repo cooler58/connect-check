@@ -354,83 +354,56 @@ static int resolve_pkg(void) {
     return 1;
 }
 
+/* Только системные TTF (кириллица). Бандл DejaVu в пакет не кладём. */
 static int find_font(char *out, size_t n) {
-    char pkg[PATH_MAX_G], try[PATH_MAX_G], windir[PATH_MAX_G];
     size_t i;
-    const char *bundled[] = {
-        "DejaVuSansMono.ttf",
-        "DejaVuSans.ttf",
-        NULL
-    };
 #ifdef _WIN32
-    const char *sysmono[6];
-    char sysbuf[5][PATH_MAX_G];
+    char windir[PATH_MAX_G];
+    char sysfonts[8][PATH_MAX_G];
+    const char *paths[9];
+    DWORD wlen = GetEnvironmentVariableA("WINDIR", windir, (DWORD)sizeof windir);
+    if (!wlen || wlen >= sizeof windir)
+        snprintf(windir, sizeof windir, "C:\\Windows");
+    snprintf(sysfonts[0], sizeof sysfonts[0], "%s\\Fonts\\segoeui.ttf", windir);
+    snprintf(sysfonts[1], sizeof sysfonts[1], "%s\\Fonts\\arial.ttf", windir);
+    snprintf(sysfonts[2], sizeof sysfonts[2], "%s\\Fonts\\tahoma.ttf", windir);
+    snprintf(sysfonts[3], sizeof sysfonts[3], "%s\\Fonts\\consola.ttf", windir);
+    snprintf(sysfonts[4], sizeof sysfonts[4], "%s\\Fonts\\cour.ttf", windir);
+    snprintf(sysfonts[5], sizeof sysfonts[5], "%s\\Fonts\\CascadiaMono.ttf", windir);
+    snprintf(sysfonts[6], sizeof sysfonts[6], "%s\\Fonts\\cascadiamono.ttf", windir);
+    snprintf(sysfonts[7], sizeof sysfonts[7], "%s\\Fonts\\lucon.ttf", windir);
+    for (i = 0; i < 8; i++) paths[i] = sysfonts[i];
+    paths[8] = NULL;
 #elif defined(__APPLE__)
-    const char *sysmono[] = {
+    const char *paths[] = {
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana.ttf",
         "/System/Library/Fonts/Supplemental/Courier New.ttf",
         "/Library/Fonts/Courier New.ttf",
         "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
-        "/Library/Fonts/Andale Mono.ttf",
         NULL
     };
 #else
-    const char *sysmono[] = {
+    const char *paths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
         NULL
     };
 #endif
-
-    if (package_root_from_gui(pkg, sizeof pkg)) {
-        for (i = 0; bundled[i]; i++) {
-            path_join(try, sizeof try, pkg, bundled[i]);
-            if (file_exists(try)) {
-                snprintf(out, n, "%s", try);
-                return 1;
-            }
-        }
-#ifdef __APPLE__
-        if (gui_exe_dir(try, sizeof try)) {
-            char f[PATH_MAX_G];
-            for (i = 0; bundled[i]; i++) {
-                path_join(f, sizeof f, try, bundled[i]);
-                if (file_exists(f)) {
-                    snprintf(out, n, "%s", f);
-                    return 1;
-                }
-            }
-        }
-#endif
-    }
-
-#ifdef _WIN32
-    {
-        DWORD wlen = GetEnvironmentVariableA("WINDIR", windir, (DWORD)sizeof windir);
-        if (!wlen || wlen >= sizeof windir)
-            snprintf(windir, sizeof windir, "C:\\Windows");
-        snprintf(sysbuf[0], sizeof sysbuf[0], "%s\\Fonts\\consola.ttf", windir);
-        snprintf(sysbuf[1], sizeof sysbuf[1], "%s\\Fonts\\cour.ttf", windir);
-        snprintf(sysbuf[2], sizeof sysbuf[2], "%s\\Fonts\\CascadiaMono.ttf", windir);
-        snprintf(sysbuf[3], sizeof sysbuf[3], "%s\\Fonts\\cascadiamono.ttf", windir);
-        snprintf(sysbuf[4], sizeof sysbuf[4], "%s\\Fonts\\lucon.ttf", windir);
-        sysmono[0] = sysbuf[0];
-        sysmono[1] = sysbuf[1];
-        sysmono[2] = sysbuf[2];
-        sysmono[3] = sysbuf[3];
-        sysmono[4] = sysbuf[4];
-        sysmono[5] = NULL;
-    }
-#else
-    (void)windir;
-#endif
-
-    for (i = 0; sysmono[i]; i++) {
-        if (file_exists(sysmono[i])) {
-            snprintf(out, n, "%s", sysmono[i]);
+    for (i = 0; paths[i]; i++) {
+        if (file_exists(paths[i])) {
+            snprintf(out, n, "%s", paths[i]);
             return 1;
         }
     }
@@ -1198,27 +1171,13 @@ static LRESULT CALLBACK gui_wndproc(HWND wnd, UINT msg, WPARAM wparam, LPARAM lp
 }
 
 static GdipFont *win_pick_font(void) {
+    /* Системные шрифты Windows (GDI+ по имени); кириллица — Segoe UI / Arial. */
     static const char *names[] = {
-        "Consolas", "Cascadia Mono", "Lucida Console", "Courier New", "Arial", NULL
+        "Segoe UI", "Arial", "Tahoma", "Consolas", "Cascadia Mono",
+        "Lucida Console", "Courier New", NULL
     };
-    char pkg[PATH_MAX_G], ttf[PATH_MAX_G];
-    WCHAR wpath[PATH_MAX_G];
     GdipFont *font = NULL;
     int i;
-
-    if (package_root_from_gui(pkg, sizeof pkg)) {
-        path_join(ttf, sizeof ttf, pkg, "DejaVuSansMono.ttf");
-        if (!file_exists(ttf))
-            path_join(ttf, sizeof ttf, pkg, "DejaVuSans.ttf");
-        if (file_exists(ttf) &&
-            MultiByteToWideChar(CP_UTF8, 0, ttf, -1, wpath, PATH_MAX_G) > 0) {
-            font = nk_gdipfont_create_from_file(wpath, 18);
-            if (font) {
-                log_add("font", ttf);
-                return font;
-            }
-        }
-    }
     for (i = 0; names[i]; i++) {
         font = nk_gdipfont_create(names[i], 18);
         if (font) {

@@ -7,8 +7,8 @@
 | Путь | Что |
 |------|-----|
 | **`bin/ConnectCheck-mac.app`** | GUI macOS (движок in-process) |
-| **`bin/connect-check-gui-linux`** | GUI Linux (+ `libglfw*.so`, `DejaVuSans.ttf`) |
-| **`bin/connect-check-gui-win.exe`** | GUI Windows (+ `DejaVuSans.ttf`, лаунчер `connect-check-gui.cmd`) |
+| **`bin/connect-check-gui-linux`** | GUI Linux (+ `libglfw*.so` при необходимости) |
+| **`bin/connect-check-gui-win.exe`** | GUI Windows (+ лаунчер `connect-check-gui.cmd`) |
 | `bin/resources.conf`, `bin/VERSION` | списки проверок и версия |
 
 Сборка: `make release` или `make -f Makefile.gui package-all` + `make dist`.
@@ -23,7 +23,7 @@ open bin/ConnectCheck-mac.app
 # Windows: connect-check-gui-win.exe
 ```
 
-Шрифт: `DejaVuSans.ttf` рядом с пакетом, иначе системный mono.
+Шрифт: системный (macOS Arial Unicode / Windows Segoe UI / Linux DejaVu или Noto из ОС).
 
 ## Отладочный CLI (не в релизе)
 
@@ -40,3 +40,4 @@ make cli   # connect-check + probe-* в корне репозитория
 | Умный дом / MQTT | Диагностика + проба MQTT |
 | Видео / CDN | Диагностика + проба Видео |
 | Один URL | вкладка URL |
+| apt/dnf/pacman / Windows Update / Apple | Диагностика → этап «Репозитории / обновления» |

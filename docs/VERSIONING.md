@@ -33,7 +33,7 @@
 ## Что коммитить в релизе
 
 - Исходники, `resources.conf`, `VERSION`, документация
-- **GUI только в корне `bin/`:** `ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe` (+ `DejaVuSans.ttf` / `libglfw*.so`, `resources.conf`, `VERSION`)
+- **GUI только в корне `bin/`:** `ConnectCheck-mac.app`, `connect-check-gui-linux`, `connect-check-gui-win.exe` (+ `libglfw*.so` на Linux, `resources.conf`, `VERSION`); шрифты системные
 
 ## Что не коммитить
 

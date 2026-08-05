@@ -13,6 +13,7 @@ dist/
 # локальные бинарники отладки в корне (пакет — в bin/)
 /connect-check
 /connect-check.exe
+/connect-check-gui
 /probe-quic
 /probe-battlenet
 /probe-mqtt
@@ -25,6 +26,11 @@ dist/
 /probe-video.exe
 /probe-captive.exe
 /probe-url.exe
+
+# устаревший бандл шрифтов (GUI использует системные)
+third_party/fonts/
+bin/DejaVuSans.ttf
+bin/**/DejaVuSans.ttf
 
 build/
 top_domains_embed.h
