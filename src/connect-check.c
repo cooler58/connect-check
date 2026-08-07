@@ -24,6 +24,7 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #  include <iphlpapi.h>
+#  include <icmpapi.h>
 #  include <wininet.h>
 #  include <shellapi.h>
 #  include <process.h>
@@ -2551,47 +2552,51 @@ static void detect_wifi(void) {
 
 /* ---------- ping via system ---------- */
 
+#ifdef _WIN32
+/* ICMP API — без парсинга локализованного вывода ping.exe (OEM/UTF-8). */
+static int ping_summary(const char *target, int count, int *loss, double *avg) {
+    HANDLE h;
+    IN_ADDR ina;
+    IPAddr dest;
+    char send[32];
+    unsigned char reply_buf[sizeof(ICMP_ECHO_REPLY) + 64];
+    int i, ok = 0;
+    double sum = 0;
+
+    *loss = 100;
+    *avg = 0;
+    if (!target || !target[0] || count < 1) return -1;
+    if (InetPtonA(AF_INET, target, &ina) != 1) return -1;
+    dest = ina.S_un.S_addr;
+
+    h = IcmpCreateFile();
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    memset(send, 0x5a, sizeof send);
+    for (i = 0; i < count; i++) {
+        DWORD n = IcmpSendEcho(h, dest, send, (WORD)sizeof send, NULL,
+                               reply_buf, (DWORD)sizeof reply_buf, 1000);
+        if (n > 0) {
+            const ICMP_ECHO_REPLY *r = (const ICMP_ECHO_REPLY *)reply_buf;
+            if (r->Status == IP_SUCCESS) {
+                ok++;
+                sum += (double)r->RoundTripTime;
+            }
+        }
+    }
+    IcmpCloseHandle(h);
+
+    *loss = ((count - ok) * 100) / count;
+    *avg = ok ? (sum / (double)ok) : 0.0;
+    return 0;
+}
+#else
 static int ping_summary(const char *target, int count, int *loss, double *avg) {
     char cmd[256], out[4096];
     *loss = 100;
     *avg = 0;
-#ifdef _WIN32
-    snprintf(cmd, sizeof cmd, "ping -n %d -w 1000 %s", count, target);
-#else
     snprintf(cmd, sizeof cmd, "ping -c %d -W 1000 %s 2>&1", count, target);
-#endif
     if (run_capture(cmd, out, sizeof out) != 0) return -1;
-#ifdef _WIN32
-    {
-        char *p = strstr(out, "(");
-        char *lost = strstr(out, "Lost =");
-        char *avgp = strstr(out, "Average =");
-        if (!avgp) avgp = strstr(out, "Average=");
-        if (!lost) lost = strstr(out, "потеряно =");
-        if (!lost) lost = strstr(out, "Lost=");
-        if (lost) {
-            int nloss = 0;
-            if (sscanf(lost, "Lost = %d", &nloss) == 1 ||
-                sscanf(lost, "Lost=%d", &nloss) == 1 ||
-                sscanf(strstr(out, "потеряно") ? strstr(out, "потеряно") : "потеряно = 0",
-                       "потеряно = %d", &nloss) == 1) {
-                *loss = (nloss * 100) / (count ? count : 1);
-            }
-            /* also parse "Lost = x (y% loss)" */
-            p = strstr(out, "% loss");
-            if (!p) p = strstr(out, "% потерь");
-            if (p) {
-                char *q = p;
-                while (q > out && *q != '(') q--;
-                if (*q == '(') *loss = atoi(q + 1);
-            }
-        }
-        if (avgp) {
-            avgp = strchr(avgp, '=');
-            if (avgp) *avg = atof(avgp + 1);
-        }
-    }
-#else
     {
         char *p = strstr(out, "packet loss");
         char *r = strstr(out, "round-trip");
@@ -2613,9 +2618,9 @@ static int ping_summary(const char *target, int count, int *loss, double *avg) {
             }
         }
     }
-#endif
     return 0;
 }
+#endif
 
 static int host_cmd_safe(const char *h) {
     size_t i;
@@ -2644,7 +2649,18 @@ static void net_ping_text(const char *target, char *buf, size_t buflen) {
     buf[0] = 0;
     if (!host_cmd_safe(target) || buflen < 8) return;
 #ifdef _WIN32
-    snprintf(cmd, sizeof cmd, "ping -n 4 -w 1000 %s", target);
+    {
+        /* Сводка через ICMP API — не зависит от языка Windows */
+        int loss = 100;
+        double avg = 0;
+        if (ping_summary(target, 4, &loss, &avg) == 0) {
+            snprintf(buf, buflen,
+                     "ping %s (ICMP API)\nloss=%d%%, avg=%.1f ms (4 probes)",
+                     target, loss, avg);
+            return;
+        }
+        snprintf(cmd, sizeof cmd, "ping -n 4 -w 1000 %s", target);
+    }
 #else
     snprintf(cmd, sizeof cmd, "ping -c 4 -W 1000 %s 2>&1", target);
 #endif
@@ -3958,7 +3974,8 @@ static void resources_load_defaults(void) {
          "HTTP; :443 часто недоступен", 0},
         {"Госдума", "http://duma.gov.ru/",
          "HTTP; :443 часто недоступен", 0},
-        {"Совет Федерации", "https://www.council.gov.ru/", "", 0},
+        {"Совет Федерации", "http://www.council.gov.ru/",
+         "HTTP; :443 часто недоступен", 0},
         {"ЦБ РФ", "https://www.cbr.ru/", "", 0},
         {"Почта России", "https://www.pochta.ru/", "", 0},
         {"Честный знак", "https://crpt.ru/", "", 0},
