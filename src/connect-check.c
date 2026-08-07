@@ -4885,6 +4885,41 @@ static void check_endpoint_fields(const Check *c,
     }
 }
 
+static void ip_for_filename(const char *ip, char *out, size_t n, const char *fallback) {
+    size_t i, j = 0;
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (!ip || !ip[0]) {
+        snprintf(out, n, "%s", fallback ? fallback : "unknown");
+        return;
+    }
+    for (i = 0; ip[i] && j + 1 < n; i++) {
+        unsigned char c = (unsigned char)ip[i];
+        if (isalnum(c) || c == '.' || c == '-')
+            out[j++] = (char)c;
+        else if (c == ':' || c == '%')
+            out[j++] = '-';
+    }
+    out[j] = 0;
+    if (!out[0])
+        snprintf(out, n, "%s", fallback ? fallback : "unknown");
+}
+
+/* Имя: net_diag_<stamp>_<lan>_<wan>.html — после сбора local/external IP */
+static void report_path_rebuild(const char *dir) {
+    char lan[72], wan[72];
+    const char *base = (dir && dir[0]) ? dir : ".";
+    ip_for_filename(local_ip, lan, sizeof lan, "no-lan");
+    ip_for_filename(external_ip, wan, sizeof wan, "no-wan");
+#ifdef _WIN32
+    snprintf(report_path, sizeof report_path, "%s\\net_diag_%s_%s_%s.html",
+             base, stamp, lan, wan);
+#else
+    snprintf(report_path, sizeof report_path, "%s/net_diag_%s_%s_%s.html",
+             base, stamp, lan, wan);
+#endif
+}
+
 static void write_html(void) {
     FILE *f;
     int i;
@@ -4893,33 +4928,34 @@ static void write_html(void) {
     char dns_line[256];
     int di;
 
+    report_path_rebuild(output_dir);
     f = fopen(report_path, "wb");
     if (!f) {
         /* Read-only том (DMG) или нет прав — пишем в домашний каталог */
-        char alt[STR];
+        char alt_dir[STR];
         const char *home = NULL;
 #ifdef _WIN32
         home = getenv("USERPROFILE");
         if (home && home[0]) {
-            snprintf(alt, sizeof alt, "%s\\Documents\\ConnectCheck", home);
-            CreateDirectoryA(alt, NULL);
-            snprintf(alt, sizeof alt, "%s\\Documents\\ConnectCheck\\net_diag_%s.html", home, stamp);
+            snprintf(alt_dir, sizeof alt_dir, "%s\\Documents\\ConnectCheck", home);
+            CreateDirectoryA(alt_dir, NULL);
+            report_path_rebuild(alt_dir);
         } else
-            alt[0] = 0;
+            alt_dir[0] = 0;
 #else
         home = getenv("HOME");
         if (home && home[0]) {
             char cmd[STR];
-            snprintf(cmd, sizeof cmd, "mkdir -p '%s/Documents/ConnectCheck'", home);
+            snprintf(alt_dir, sizeof alt_dir, "%s/Documents/ConnectCheck", home);
+            snprintf(cmd, sizeof cmd, "mkdir -p '%s'", alt_dir);
             system(cmd);
-            snprintf(alt, sizeof alt, "%s/Documents/ConnectCheck/net_diag_%s.html", home, stamp);
+            report_path_rebuild(alt_dir);
         } else
-            alt[0] = 0;
+            alt_dir[0] = 0;
 #endif
-        if (alt[0])
-            f = fopen(alt, "wb");
+        if (alt_dir[0])
+            f = fopen(report_path, "wb");
         if (f) {
-            snprintf(report_path, sizeof report_path, "%s", alt);
             engine_logf("Каталог отчёта недоступен — записано в %s", report_path);
         } else {
             engine_logf("Не удалось записать отчёт: %s", report_path);
@@ -6179,6 +6215,9 @@ static int diagnose_core(void) {
     int flaky_ok = 0, flaky_fail = 0, flaky_sum = 0;
 
     resources_init();
+    local_ip[0] = 0;
+    external_ip[0] = 0;
+    gateway[0] = 0;
 
 #ifdef _WIN32
     CreateDirectoryA(output_dir, NULL);
@@ -6194,11 +6233,8 @@ static int diagnose_core(void) {
     tm = localtime(&now);
     strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", tm);
     strftime(generated, sizeof generated, "%Y-%m-%d %H:%M:%S", tm);
-#ifdef _WIN32
-    snprintf(report_path, sizeof report_path, "%s\\net_diag_%s.html", output_dir, stamp);
-#else
-    snprintf(report_path, sizeof report_path, "%s/net_diag_%s.html", output_dir, stamp);
-#endif
+    /* Финальное имя с IP — в write_html(); здесь черновик со stamp */
+    report_path_rebuild(output_dir);
 
     engine_logf("Диагностика интернета (connect-check %s) — сбор данных...", CONNECT_CHECK_VERSION);
     if (!g_engine_lib_mode)
