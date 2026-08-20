@@ -4374,7 +4374,23 @@ static void resources_load_defaults(void) {
         {"Сервисы РФ", "DNS Shop", "https://www.dns-shop.ru/"},
         {"Сервисы РФ", "ЦИАН", "https://www.cian.ru/"},
         {"Проблемы провайдера", "Zoom", "https://www.zoom.com/"},
-        {"Проблемы провайдера", "Bitrix24", "https://www.bitrix24.ru/"},
+        {"CRM", "Bitrix24", "https://www.bitrix24.ru/"},
+        {"CRM", "Bitrix24 авторизация", "https://www.bitrix24.ru/authorization/"},
+        {"CRM", "Bitrix24 Паспорт", "https://auth2.bitrix24.net/"},
+        {"CRM", "Bitrix24.com", "https://www.bitrix24.com/"},
+        {"CRM", "amoCRM", "https://www.amocrm.ru/"},
+        {"CRM", "amoCRM аккаунт", "https://www.amocrm.ru/account"},
+        {"CRM", "Kommo (amoCRM)", "https://www.kommo.com/"},
+        {"CRM", "Мегаплан", "https://megaplan.ru/"},
+        {"CRM", "RetailCRM", "https://www.retailcrm.ru/"},
+        {"CRM", "МойСклад", "https://www.moysklad.ru/"},
+        {"CRM", "МойСклад вход", "https://online.moysklad.ru/"},
+        {"CRM", "Planfix", "https://www.planfix.ru/"},
+        {"CRM", "YCLIENTS", "https://www.yclients.com/"},
+        {"CRM", "ELMA365", "https://elma365.com/"},
+        {"CRM", "Creatio", "https://www.creatio.com/"},
+        {"CRM", "Salesforce login", "https://login.salesforce.com/"},
+        {"CRM", "HubSpot app", "https://app.hubspot.com/"},
     };
     int i, n;
 
@@ -4905,6 +4921,63 @@ static void ip_for_filename(const char *ip, char *out, size_t n, const char *fal
         snprintf(out, n, "%s", fallback ? fallback : "unknown");
 }
 
+/* Путь sidecar TXT сбоев рядом с HTML: …/net_diag_….html → …/net_diag_…_problems.txt */
+static void problems_txt_path_from_report(char *out, size_t n) {
+    size_t len;
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (!report_path[0]) return;
+    snprintf(out, n, "%s", report_path);
+    len = strlen(out);
+    if (len >= 5 && strcmp(out + len - 5, ".html") == 0) {
+        out[len - 5] = 0;
+        snprintf(out + strlen(out), n - strlen(out), "_problems.txt");
+    } else {
+        snprintf(out + len, n - len, "_problems.txt");
+    }
+}
+
+/* Пишет TXT сбоев (тот же формат, что кнопка в HTML) рядом с отчётом. */
+static void write_problems_txt(void) {
+    FILE *tf;
+    char path[STR];
+    int i, nprob = 0;
+
+    problems_txt_path_from_report(path, sizeof path);
+    if (!path[0]) return;
+    tf = fopen(path, "wb");
+    if (!tf) return;
+
+    fprintf(tf, "# connect-check problem nodes (fail only)\n");
+    fprintf(tf, "# generated: %s · connect-check %s\n",
+            stamp[0] ? stamp : "report", CONNECT_CHECK_VERSION);
+    fprintf(tf, "# NAME | CHECKED | STATUS | IP | PORT | PROTO | SNI | URL\n\n");
+
+    for (i = 0; i < nchecks; i++) {
+        Check *c = &checks[i];
+        char ip[64], port[16], proto[32], sni[128], url[256];
+        if (strcmp(c->status, "fail") != 0)
+            continue;
+        check_endpoint_fields(c, ip, sizeof ip, port, sizeof port,
+                              proto, sizeof proto, sni, sizeof sni, url, sizeof url);
+        fprintf(tf, "%s\n", c->name);
+        fprintf(tf, "  checked: %s\n", c->category);
+        fprintf(tf, "  status:  %s\n", c->status);
+        fprintf(tf, "  IP: %s  PORT: %s  PROTO: %s\n",
+                ip[0] ? ip : "-", port[0] ? port : "-", proto[0] ? proto : "-");
+        fprintf(tf, "  SNI: %s\n", sni[0] ? sni : "-");
+        fprintf(tf, "  URL: %s\n", url[0] ? url : "-");
+        if (c->detail[0])
+            fprintf(tf, "  detail: %s\n", c->detail);
+        fputc('\n', tf);
+        nprob++;
+    }
+    if (nprob == 0)
+        fputs("(нет сбоев)\n", tf);
+    fclose(tf);
+    engine_logf("TXT сбоев: %s (%d)", path, nprob);
+}
+
 /* Имя: net_diag_<stamp>_<lan>_<wan>.html — после сбора local/external IP */
 static void report_path_rebuild(const char *dir) {
     char lan[72], wan[72];
@@ -5043,6 +5116,16 @@ static void write_html(void) {
         "button.btn-dl{background:#243040;border:1px solid var(--info);color:var(--text);border-radius:10px;"
         "padding:10px 16px;font-size:.95rem;font-weight:650;cursor:pointer}\n"
         "button.btn-dl:hover{background:#2c3a4c}.toolbar .muted{color:var(--muted);font-size:.85rem}\n"
+        "button.btn-mail{background:#243040;border:1px solid var(--fail);color:var(--text);border-radius:10px;"
+        "padding:10px 16px;font-size:.95rem;font-weight:650;cursor:pointer}\n"
+        "button.btn-mail:hover{background:#3a2830}\n"
+        ".mail-box{margin:0 0 18px;padding:14px 16px;border-radius:12px;background:#1a1214;"
+        "border:1px solid var(--fail);color:var(--text);display:none}\n"
+        ".mail-box.show{display:block}.mail-box h3{margin:0 0 8px;font-size:1rem;color:var(--fail)}\n"
+        ".mail-box pre{margin:8px 0;padding:10px;background:#0c1015;border-radius:8px;"
+        "border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;font-size:.85rem;"
+        "max-height:260px;overflow:auto}\n"
+        ".mail-box .row{margin:6px 0;color:var(--muted);font-size:.9rem}\n"
         "pre.netdiag{margin:6px 0 4px;padding:8px 10px;background:#0c1015;border-radius:8px;"
         "border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;max-height:280px;"
         "overflow:auto;font-size:.78rem;line-height:1.35;color:var(--text)}\n"
@@ -5064,7 +5147,7 @@ static void write_html(void) {
         "setTimeout(()=>el.scrollIntoView({behavior:'smooth',block:'center'}),30)}\n"
         "window.addEventListener('hashchange',revealTarget);"
         "window.addEventListener('DOMContentLoaded',revealTarget);\n"
-        "function downloadProblemsTxt(){\n"
+        "function buildProblemsTxt(){\n"
         "const rows=window.CC_PROBLEMS||[];\n"
         "const stamp=window.CC_STAMP||'report';\n"
         "let t='# connect-check problem nodes (fail only)\\n';\n"
@@ -5081,12 +5164,81 @@ static void write_html(void) {
         "  if(r.detail)t+='  detail: '+r.detail+'\\n';\n"
         "  t+='\\n';\n"
         "}\n"
+        "return t;\n"
+        "}\n"
+        "function downloadProblemsTxt(){\n"
+        "const stamp=window.CC_STAMP||'report';\n"
+        "const t=buildProblemsTxt();\n"
         "const blob=new Blob([t],{type:'text/plain;charset=utf-8'});\n"
         "const a=document.createElement('a');\n"
         "a.href=URL.createObjectURL(blob);\n"
         "a.download='connect-check-problems-'+stamp+'.txt';\n"
         "document.body.appendChild(a);a.click();a.remove();\n"
         "setTimeout(()=>URL.revokeObjectURL(a.href),1500);\n"
+        "return a.download;\n"
+        "}\n"
+        "function buildNocMail(){\n"
+        "const m=window.CC_META||{};\n"
+        "const ip=(m.external_ip&&m.external_ip!=='\\u2014')?m.external_ip:'(внешний IP не определён)';\n"
+        "const subj='с адреса '+ip+' недоступна значительная часть ресурсов сети интернет';\n"
+        "let body='С адреса '+ip+' недоступна значительная часть ресурсов сети интернет.\\n\\n';\n"
+        "body+='Сводка по проверке connect-check:\\n';\n"
+        "body+='\\u2014 Дата проверки: '+(m.generated||'\\u2014')+'\\n';\n"
+        "body+='\\u2014 Внешний IP: '+(m.external_ip||'\\u2014')+'\\n';\n"
+        "body+='\\u2014 Локальный IP: '+(m.local_ip||'\\u2014')+'\\n';\n"
+        "body+='\\u2014 Сбои: '+(m.fail_n||0)+', Внимание: '+(m.warn_n||0)+', OK: '+(m.ok_n||0)+'\\n';\n"
+        "body+='\\u2014 Версия: connect-check '+(m.ver||'')+'\\n';\n"
+        "body+='\\u2014 Файл отчёта: '+(m.report_name||'\\u2014')+'\\n';\n"
+        "if(m.findings&&m.findings.length){\n"
+        "  body+='\\nКлючевые выводы:\\n';\n"
+        "  m.findings.slice(0,12).forEach(f=>{body+='\\u2014 '+f+'\\n';});\n"
+        "}\n"
+        "body+='\\nВо вложении \\u2014 текстовый список сбойных ресурсов "
+        "(connect-check-problems-*.txt).\\n';\n"
+        "return {to:'info@noc.gov.ru',cc:'support@on-telecom.ru',subj:subj,body:body};\n"
+        "}\n"
+        "function mPathHint(){\n"
+        "const p=(window.CC_META&&window.CC_META.problems_txt)||'';\n"
+        "return p?(' <span class=\"muted\">(также рядом с отчётом: '+p+')</span>'):'';\n"
+        "}\n"
+        "function showNocMailFallback(mail,attachName,opened){\n"
+        "const box=document.getElementById('noc-mail-box');\n"
+        "if(!box)return;\n"
+        "const title=opened\n"
+        "  ?'Черновик письма (если почта не открылась — отправьте вручную)'\n"
+        "  :'Не удалось открыть почтовую программу — отправьте вручную';\n"
+        "const tip='Кому / копия / тема / текст ниже. "
+        "Вложение mailto не передаёт: прикрепите скачанный TXT сбоев "
+        "(или файл *_problems.txt рядом с HTML-отчётом).';\n"
+        "box.innerHTML='<h3>'+title+'</h3>'+\n"
+        "'<div class=\"row\">'+tip+'</div>'+\n"
+        "'<div class=\"row\"><strong>Кому:</strong> '+mail.to+\n"
+        "' &nbsp;·&nbsp; <strong>Копия:</strong> '+mail.cc+'</div>'+\n"
+        "'<div class=\"row\"><strong>Тема:</strong> '+mail.subj+'</div>'+\n"
+        "'<div class=\"row\"><strong>Вложение:</strong> '+(attachName||'connect-check-problems-*.txt')+\n"
+        " mPathHint()+'</div>'+\n"
+        "'<pre id=\"noc-mail-body\"></pre>'+\n"
+        "'<button type=\"button\" class=\"btn-dl\" onclick=\"copyText("
+        "document.getElementById(\\'noc-mail-body\\').textContent,this)\">"
+        "Скопировать текст письма</button>';\n"
+        "document.getElementById('noc-mail-body').textContent=mail.body;\n"
+        "box.classList.add('show');\n"
+        "box.scrollIntoView({behavior:'smooth',block:'nearest'});\n"
+        "}\n"
+        "function composeNocEmail(){\n"
+        "const mail=buildNocMail();\n"
+        "const attachName=downloadProblemsTxt();\n"
+        "const href='mailto:'+encodeURIComponent(mail.to).replace(/%%40/g,'@')+\n"
+        "'?cc='+encodeURIComponent(mail.cc)+\n"
+        "'&subject='+encodeURIComponent(mail.subj)+\n"
+        "'&body='+encodeURIComponent(mail.body);\n"
+        "let opened=false;\n"
+        "try{\n"
+        "  const a=document.createElement('a');\n"
+        "  a.href=href;a.style.display='none';document.body.appendChild(a);\n"
+        "  a.click();a.remove();opened=true;\n"
+        "}catch(e){opened=false;}\n"
+        "setTimeout(function(){showNocMailFallback(mail,attachName,opened);},400);\n"
         "}\n"
         "</script></head><body>\n",
         CONNECT_CHECK_VERSION, CONNECT_CHECK_VERSION, stamp);
@@ -5114,19 +5266,71 @@ static void write_html(void) {
         "<div class=\"card ok\"><div class=\"n\">%d</div><div class=\"l\">OK</div></div>"
         "</div>\n", fail_n, ok_n);
 
-    /* Кнопка TXT проблемных узлов + данные для скачивания */
+    /* Кнопка TXT проблемных узлов + письмо в НОК при ≥10 сбоях */
     {
-        int nprob = 0, first = 1;
+        int nprob = 0, first = 1, fi;
+        char problems_path[STR];
+        const char *report_base;
+
+        problems_txt_path_from_report(problems_path, sizeof problems_path);
+        report_base = strrchr(report_path,
+#ifdef _WIN32
+                               '\\'
+#else
+                               '/'
+#endif
+        );
+        report_base = report_base ? report_base + 1 : report_path;
+
         fputs("<div class=\"toolbar\">"
               "<button type=\"button\" class=\"btn-dl\" onclick=\"downloadProblemsTxt()\">"
-              "Скачать TXT сбоев</button>"
-              "<span class=\"muted\">только fail · имя, что проверяли, IP : PORT PROTO SNI URL</span>"
-              "</div>\n", f);
+              "Скачать TXT сбоев</button>", f);
+        if (fail_n >= 10) {
+            fputs("<button type=\"button\" class=\"btn-mail\" onclick=\"composeNocEmail()\">"
+                  "Письмо в НОК (≥10 сбоев)</button>"
+                  "<span class=\"muted\">to: info@noc.gov.ru · cc: support@on-telecom.ru · "
+                  "TXT приложите вручную</span>", f);
+        } else {
+            fputs("<span class=\"muted\">только fail · имя, что проверяли, IP : PORT PROTO SNI URL"
+                  " · письмо в НОК при ≥10 сбоях</span>", f);
+        }
+        fputs("</div>\n"
+              "<div id=\"noc-mail-box\" class=\"mail-box\"></div>\n", f);
+
         fputs("<script>\nwindow.CC_STAMP=\"", f);
         json_esc(f, stamp);
         fputs("\";\nwindow.CC_VER=\"", f);
         json_esc(f, CONNECT_CHECK_VERSION);
-        fputs("\";\nwindow.CC_PROBLEMS=[", f);
+        fputs("\";\nwindow.CC_META={", f);
+        fputs("\"generated\":\"", f); json_esc(f, generated); fputs("\",", f);
+        fputs("\"local_ip\":\"", f); json_esc(f, local_ip[0] ? local_ip : "—"); fputs("\",", f);
+        fputs("\"external_ip\":\"", f); json_esc(f, external_ip[0] ? external_ip : "—"); fputs("\",", f);
+        fprintf(f, "\"fail_n\":%d,\"warn_n\":%d,\"ok_n\":%d,", fail_n, warn_n, ok_n);
+        fputs("\"ver\":\"", f); json_esc(f, CONNECT_CHECK_VERSION); fputs("\",", f);
+        fputs("\"report_name\":\"", f); json_esc(f, report_base); fputs("\",", f);
+        fputs("\"problems_txt\":\"", f);
+        {
+            const char *pb = strrchr(problems_path,
+#ifdef _WIN32
+                                     '\\'
+#else
+                                     '/'
+#endif
+            );
+            json_esc(f, pb ? pb + 1 : problems_path);
+        }
+        fputs("\",\"findings\":[", f);
+        first = 1;
+        for (fi = 0; fi < nfindings && fi < 16; fi++) {
+            char line[512];
+            if (!first) fputc(',', f);
+            first = 0;
+            snprintf(line, sizeof line, "%s: %s",
+                     findings[fi].title, findings[fi].text);
+            fputc('"', f); json_esc(f, line); fputc('"', f);
+        }
+        fputs("]};\nwindow.CC_PROBLEMS=[", f);
+        first = 1;
         for (i = 0; i < nchecks; i++) {
             Check *c = &checks[i];
             char ip[64], port[16], proto[32], sni[128], url[256];
@@ -5344,7 +5548,8 @@ static void write_html(void) {
         "<div class=\"howto\"><h2>Как читать отчёт</h2><ul>"
         "<li><strong>Шапка</strong> — крупно только <em>Сбои</em>; <em>Внимание</em> свёрнуто "
         "(карточки и warning-выводы по клику). Critical-выводы открыты. "
-        "Кнопка TXT сбоев (только fail; имя, IP, PORT, PROTO, SNI, URL), затем таблицы проверок.</li>"
+        "Кнопка TXT сбоев (только fail; имя, IP, PORT, PROTO, SNI, URL); "
+        "при ≥10 сбоев — «Письмо в НОК» (mailto + инструкция), затем таблицы проверок.</li>"
         "<li><strong>SNI / IP / URL / сеть</strong> — в спойлере у проверки: хост, IP, URL; "
         "для сбоев (fail) дополнительно ping и traceroute с кнопками копирования.</li>"
         "<li><strong>Captive / OS</strong> — URL, по которым телефон/ПК решают «есть ли интернет». "
@@ -7300,19 +7505,20 @@ static int diagnose_core(void) {
         }
     }
 
-    /* RU banks / services */
-    if (stage_begin("Банки и сервисы РФ", "Доступность популярных банков и порталов")) {
+    /* RU banks / CRM / services */
+    if (stage_begin("Банки, CRM и сервисы РФ",
+                    "Доступность банков, CRM (Bitrix24, amoCRM и др.) и порталов")) {
         int n = g_nbanks;
         Check *outs = (Check *)calloc((size_t)n, sizeof(Check));
         int *failed = (int *)calloc((size_t)n, sizeof(int));
         int *slow_ms = (int *)calloc((size_t)n, sizeof(int));
         if (g_resources_from_file)
-            add_check("Банки и сервисы РФ", "Список", "info",
+            add_check("Банки, CRM и сервисы РФ", "Список", "info",
                       resources_loaded[0] ? resources_loaded : "resources.conf", "");
         if (outs && failed && slow_ms && n > 0) {
             BankJobCtx bctx;
             bctx.outs = outs; bctx.failed = failed; bctx.slow_ms = slow_ms;
-            run_parallel(n, opt_jobs, bank_job, &bctx, "банки");
+            run_parallel(n, opt_jobs, bank_job, &bctx, "банки/CRM");
             for (i = 0; i < n; i++) {
                 add_check_from(&outs[i]);
                 if (failed[i] && nfail < 40)
@@ -7900,6 +8106,7 @@ static int diagnose_core(void) {
     flush_cdn_findings();
     enrich_fail_netdiag();
     write_html();
+    write_problems_txt();
     engine_logf("Отчёт: %s", report_path);
     engine_logf("Итого: OK=%d WARN=%d FAIL=%d", ok_n, warn_n, fail_n);
     if (g_engine_cb && g_engine_cb->on_done)
@@ -7937,7 +8144,7 @@ int cc_engine_stages(const CcOpts *opts, char titles[][CC_STAGE_TITLE_LEN],
         "CDN / счётчики",
         "Значимые ресурсы (Белые списки МЦ)",
         "Зарубежные ресурсы",
-        "Банки и сервисы РФ",
+        "Банки, CRM и сервисы РФ",
         "Почта",
         "Видео",
         "Игры",

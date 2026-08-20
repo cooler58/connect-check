@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-08-20
+
+### Added
+- CRM в этапе банков/сервисов: Bitrix24 (+ авторизация / Паспорт), amoCRM / Kommo, Мегаплан,
+  RetailCRM, МойСклад, Planfix, YCLIENTS, ELMA365, Creatio, Salesforce, HubSpot.
+- При ≥10 сбоях: кнопка «Письмо в НОК» в HTML-отчёте и GUI — mailto на
+  `info@noc.gov.ru` (cc `support@on-telecom.ru`), тема/тело с внешним IP и сводкой;
+  скачивается TXT сбоев; если почтовый клиент не открылся — инструкция в отчёте/логе.
+- Sidecar TXT сбоев рядом с HTML (`*_problems.txt`).
+
 ## [1.5.6] — 2026-08-07
 
 ### Changed

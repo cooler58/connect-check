@@ -1039,6 +1039,153 @@ static void open_path(const char *path) {
 #endif
 }
 
+static void problems_path_from_report(const char *report, char *out, size_t n) {
+    size_t len;
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (!report || !report[0]) return;
+    snprintf(out, n, "%s", report);
+    len = strlen(out);
+    if (len >= 5 && strcmp(out + len - 5, ".html") == 0) {
+        out[len - 5] = 0;
+        snprintf(out + strlen(out), n - strlen(out), "_problems.txt");
+    } else {
+        snprintf(out + len, n - len, "_problems.txt");
+    }
+}
+
+/* Простой percent-encode для mailto (UTF-8 байты → %XX). */
+static void mailto_enc(const char *in, char *out, size_t n) {
+    static const char *hex = "0123456789ABCDEF";
+    size_t o = 0;
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (!in) return;
+    for (; *in && o + 4 < n; in++) {
+        unsigned char c = (unsigned char)*in;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else if (c == ' ') {
+            out[o++] = '%'; out[o++] = '2'; out[o++] = '0';
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        }
+    }
+    out[o] = 0;
+}
+
+static void report_wan_ip(const char *report, char *out, size_t n) {
+    const char *base, *dot, *us;
+    size_t len;
+    out[0] = 0;
+    if (!report || !report[0] || !out || n == 0) return;
+    base = strrchr(report, '/');
+#ifdef _WIN32
+    {
+        const char *b2 = strrchr(report, '\\');
+        if (b2 && (!base || b2 > base)) base = b2;
+    }
+#endif
+    base = base ? base + 1 : report;
+    dot = strrchr(base, '.');
+    len = dot ? (size_t)(dot - base) : strlen(base);
+    if (len == 0 || len >= 240) return;
+    {
+        char tmp[256];
+        if (len >= sizeof tmp) len = sizeof tmp - 1;
+        memcpy(tmp, base, len);
+        tmp[len] = 0;
+        us = strrchr(tmp, '_');
+        if (!us || !us[1]) return;
+        if (strcmp(us + 1, "no-wan") == 0) return;
+        snprintf(out, n, "%s", us + 1);
+    }
+}
+
+static void compose_noc_mail(void) {
+    char abs[PATH_MAX_G], problems[PATH_MAX_G], wan[80];
+    char subj[320], body[2048];
+    char esubj[960], ebody[6144], ecc[128];
+    char mailto[8192];
+    char cmd[PATH_MAX_G + 64];
+    const char *ip;
+    int opened = 0;
+
+    if (g_ui_fail < 10) {
+        log_add("mail", "письмо в НОК доступно при ≥10 сбоях");
+        snprintf(g_status, sizeof g_status, "Нужно ≥10 сбоев");
+        return;
+    }
+    if (!g_report_path[0]) {
+        log_add("mail", "нет отчёта — сначала завершите диагностику");
+        snprintf(g_status, sizeof g_status, "Отчёт ещё не готов");
+        return;
+    }
+    snprintf(abs, sizeof abs, "%s", g_report_path);
+#ifndef _WIN32
+    if (abs[0] != '/' && g_workdir[0]) {
+        char joined[PATH_MAX_G];
+        path_join(joined, sizeof joined, g_workdir, abs);
+        snprintf(abs, sizeof abs, "%s", joined);
+    }
+#else
+    if (!(abs[0] && abs[1] == ':') && abs[0] != '\\' && g_workdir[0]) {
+        char joined[PATH_MAX_G];
+        path_join(joined, sizeof joined, g_workdir, abs);
+        snprintf(abs, sizeof abs, "%s", joined);
+    }
+#endif
+    problems_path_from_report(abs, problems, sizeof problems);
+    report_wan_ip(abs, wan, sizeof wan);
+    ip = wan[0] ? wan : "(внешний IP не определён)";
+
+    snprintf(subj, sizeof subj,
+             "с адреса %s недоступна значительная часть ресурсов сети интернет", ip);
+    snprintf(body, sizeof body,
+             "С адреса %s недоступна значительная часть ресурсов сети интернет.\n\n"
+             "Сводка по проверке connect-check:\n"
+             "— Сбои: %d, Внимание: %d, OK: %d\n"
+             "— Файл отчёта: %s\n"
+             "— Вложение (TXT сбоев): %s\n\n"
+             "Во вложении — текстовый список сбойных ресурсов.\n"
+             "(mailto не прикрепляет файлы автоматически — приложите TXT вручную.)\n",
+             ip, g_ui_fail, g_ui_warn, g_ui_ok, abs, problems);
+
+    mailto_enc(subj, esubj, sizeof esubj);
+    mailto_enc(body, ebody, sizeof ebody);
+    mailto_enc("support@on-telecom.ru", ecc, sizeof ecc);
+    snprintf(mailto, sizeof mailto,
+             "mailto:info@noc.gov.ru?cc=%s&subject=%s&body=%s",
+             ecc, esubj, ebody);
+
+#ifdef _WIN32
+    if ((int)(intptr_t)ShellExecuteA(NULL, "open", mailto, NULL, NULL, SW_SHOWNORMAL) > 32)
+        opened = 1;
+#elif defined(__APPLE__)
+    snprintf(cmd, sizeof cmd, "/usr/bin/open \"%s\"", mailto);
+    if (system(cmd) == 0) opened = 1;
+#else
+    snprintf(cmd, sizeof cmd, "xdg-open \"%s\" >/dev/null 2>&1 &", mailto);
+    if (system(cmd) == 0) opened = 1;
+#endif
+
+    if (opened) {
+        log_add("mail", "открыта почтовая программа — приложите TXT сбоев вручную");
+        log_add("mail", problems);
+        snprintf(g_status, sizeof g_status, "Письмо: приложите TXT вручную");
+    } else {
+        log_add("mail", "не удалось открыть почтовую программу — отправьте вручную:");
+        log_add("mail", "to: info@noc.gov.ru  cc: support@on-telecom.ru");
+        log_add("mail", subj);
+        log_add("mail", problems);
+        log_add("mail", body);
+        snprintf(g_status, sizeof g_status, "Почта недоступна — см. лог");
+    }
+}
+
 /* ---------- self-update ---------- */
 
 static void update_check_startup(void) {
@@ -1214,12 +1361,17 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
         nk_group_end(ctx);
     }
 
-    nk_layout_row_dynamic(ctx, 34, 3);
+    nk_layout_row_dynamic(ctx, 34, 4);
     if (nk_button_label(ctx, g_diag_busy ? "Идёт…" : "Запустить диагностику")) {
         if (!g_diag_busy) run_diagnose();
     }
     if (nk_button_label(ctx, "Остановить")) stop_diagnose();
     if (nk_button_label(ctx, "Открыть отчёт")) open_path(g_report_path);
+    if (g_ui_fail >= 10) {
+        if (nk_button_label(ctx, "Письмо в НОК")) compose_noc_mail();
+    } else {
+        nk_label_colored(ctx, "НОК: ≥10 сбоев", NK_TEXT_CENTERED, nk_rgb(120, 120, 130));
+    }
 }
 
 static void ui_tab_probes(struct nk_context *ctx) {
