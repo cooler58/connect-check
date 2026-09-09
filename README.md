@@ -42,7 +42,9 @@ open bin/ConnectCheck-mac.app             # GUI mac (CLI из bin/mac)
 
 Рядом с CLI лежит **`resources.conf`**. Без файла — встроенные списки.
 
-Этапы включают значимые ресурсы, игры, **AI (TCP :443)**, видео, банки, облако, IoT. Витрины с antibot/DPI проверяются через CDN/API/облака клиента — см. [`CHANGELOG.md`](CHANGELOG.md) и [`bin/README.md`](bin/README.md).
+Этапы включают значимые ресурсы, игры, **AI (TCP :443)**, видео, банки, облако, IoT.
+Этап **DPI** отличает тип ограничения (SNI / IP / L4-25 / QUIC / порты / DoH).
+Витрины с antibot проверяются через CDN/API/облака клиента — см. [`CHANGELOG.md`](CHANGELOG.md) и [`bin/README.md`](bin/README.md).
 
 ## Сборка
 

@@ -39,6 +39,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -115,6 +116,7 @@ static int opt_skip_dns_bulk;
 static int opt_force_dns_bulk; /* --dns-bulk: запустить даже при -y / без Enter */
 static int opt_skip_speed;
 static int opt_skip_video;
+static int opt_only_dpi; /* CLI: сеть + DPI, остальное пропустить */
 static int opt_jobs = DEFAULT_JOBS; /* параллельные пробы внутри этапа */
 static int opt_dns_limit = 1000; /* полный прогон: --dns-limit 10000 */
 static int g_sys_dns_broken; /* getaddrinfo не резолвит известные имена — remote-этапы бессмысленны */
@@ -505,11 +507,48 @@ static int tcp_open(const char *host, int port, int timeout_ms) {
 typedef SOCKET net_sock;
 #  define NET_SOCK_BAD INVALID_SOCKET
 #  define net_sock_close closesocket
+#  define NET_SEND_FLAGS 0
 #else
 typedef int net_sock;
 #  define NET_SOCK_BAD (-1)
 #  define net_sock_close close
+#  ifdef MSG_NOSIGNAL
+#    define NET_SEND_FLAGS MSG_NOSIGNAL
+#  else
+#    define NET_SEND_FLAGS 0
+#  endif
 #endif
+
+static void sock_prep(net_sock s) {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof one);
+#endif
+}
+
+static int net_readable(net_sock s, int timeout_ms) {
+    fd_set rset;
+    struct timeval tv;
+    FD_ZERO(&rset);
+    FD_SET(s, &rset);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef _WIN32
+    return select(0, &rset, NULL, NULL, &tv) > 0;
+#else
+    return select((int)s + 1, &rset, NULL, NULL, &tv) > 0;
+#endif
+}
+
+static int net_is_reset(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAECONNRESET || e == WSAECONNABORTED || e == WSAECONNREFUSED;
+#else
+    return errno == ECONNRESET || errno == EPIPE || errno == ECONNREFUSED;
+#endif
+}
 
 static int net_wait_recv(net_sock s, unsigned char *buf, int buflen, int timeout_ms) {
     fd_set rset;
@@ -551,6 +590,7 @@ static net_sock tcp_connect_sock(const char *host, int port, int timeout_ms) {
         ioctlsocket(s, FIONBIO, &nb);
         if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) {
             nb = 0; ioctlsocket(s, FIONBIO, &nb);
+            sock_prep(s);
             freeaddrinfo(res);
             return s;
         }
@@ -563,6 +603,7 @@ static net_sock tcp_connect_sock(const char *host, int port, int timeout_ms) {
                 getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
                 if (err == 0) {
                     nb = 0; ioctlsocket(s, FIONBIO, &nb);
+                    sock_prep(s);
                     freeaddrinfo(res);
                     return s;
                 }
@@ -594,6 +635,7 @@ static net_sock tcp_connect_sock(const char *host, int port, int timeout_ms) {
         fcntl(s, F_SETFL, flags | O_NONBLOCK);
         if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) {
             fcntl(s, F_SETFL, flags);
+            sock_prep(s);
             freeaddrinfo(res);
             return s;
         }
@@ -608,6 +650,7 @@ static net_sock tcp_connect_sock(const char *host, int port, int timeout_ms) {
                 getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &errlen);
                 if (err == 0) {
                     fcntl(s, F_SETFL, flags);
+                    sock_prep(s);
                     freeaddrinfo(res);
                     return s;
                 }
@@ -621,16 +664,16 @@ static net_sock tcp_connect_sock(const char *host, int port, int timeout_ms) {
 #endif
 }
 
-/* Минимальный TLS ClientHello + SNI; ждём ServerHello/Alert (как в probe-mqtt). */
-static int tls_clienthello_sni(net_sock s, const char *sni, int timeout_ms) {
+/* 1 = TLS record, 0 = timeout, -1 = RST/close, -2 = send fail. */
+static int tls_clienthello_sni_ex(net_sock s, const char *sni, int timeout_ms) {
     unsigned char pkt[512];
     unsigned char *p = pkt;
-    size_t sni_len = strlen(sni);
+    size_t sni_len = sni ? strlen(sni) : 0;
     size_t ext_len, hello_len, rec_len;
     unsigned char resp[1500];
     int n;
 
-    if (!sni || sni_len == 0 || sni_len > 200) return 0;
+    if (!sni || sni_len == 0 || sni_len > 200) return -2;
     p += 5;
     *p++ = 0x01;
     p += 3;
@@ -663,9 +706,83 @@ static int tls_clienthello_sni(net_sock s, const char *sni, int timeout_ms) {
     pkt[3] = (unsigned char)((rec_len >> 8) & 0xff);
     pkt[4] = (unsigned char)(rec_len & 0xff);
 
-    if (send(s, (const char *)pkt, (int)(p - pkt), 0) <= 0) return 0;
-    n = net_wait_recv(s, resp, sizeof resp, timeout_ms);
-    return n > 0 && (resp[0] == 0x16 || resp[0] == 0x15 || resp[0] == 0x14);
+    if (send(s, (const char *)pkt, (int)(p - pkt), NET_SEND_FLAGS) <= 0)
+        return net_is_reset() ? -1 : -2;
+    if (!net_readable(s, timeout_ms)) return 0;
+    n = recv(s, (char *)resp, sizeof resp, 0);
+    if (n > 0 && (resp[0] == 0x16 || resp[0] == 0x15 || resp[0] == 0x14)) return 1;
+    if (n <= 0) return (n == 0 || net_is_reset()) ? -1 : 0;
+    return 0;
+}
+
+/* Минимальный TLS ClientHello + SNI; ждём ServerHello/Alert (как в probe-mqtt). */
+static int tls_clienthello_sni(net_sock s, const char *sni, int timeout_ms) {
+    return tls_clienthello_sni_ex(s, sni, timeout_ms) == 1;
+}
+
+static const char *dpi_tls_how(int rc) {
+    if (rc == 1) return "TLS";
+    if (rc == -1) return "RST";
+    if (rc == -2) return "send fail";
+    return "timeout";
+}
+
+/*
+ * L4-25: после TCP (+ попытка ClientHello) шлём мелкие сегменты (TCP_NODELAY).
+ * ТСПУ часто рвёт сессию примерно на 25 пакетах в обе стороны, не по объёму.
+ * extra=сколько 1-байтовых пакетов ушло до RST; survive=1 если ушли все 40 без обрыва.
+ */
+#define DPI_L425_EXTRA 40
+#define DPI_L425_GAP_MS 40
+
+static void dpi_l425_run(const char *host, int *tcp_ok, int *hello_rc,
+                         int *extra, int *cut) {
+    net_sock s;
+    int i, n;
+    char b;
+
+    *tcp_ok = 0;
+    *hello_rc = 0;
+    *extra = 0;
+    *cut = 0;
+    s = tcp_connect_sock(host, 443, 3000);
+    if (s == NET_SOCK_BAD) return;
+    *tcp_ok = 1;
+    *hello_rc = tls_clienthello_sni_ex(s, host, 2000);
+    if (*hello_rc == -1) {
+        *cut = 1;
+        net_sock_close(s);
+        return;
+    }
+    for (i = 0; i < DPI_L425_EXTRA; i++) {
+        b = (char)(0x17);
+        n = send(s, &b, 1, NET_SEND_FLAGS);
+        if (n <= 0) {
+            *cut = 1;
+            break;
+        }
+        (*extra)++;
+        if (net_readable(s, DPI_L425_GAP_MS)) {
+            unsigned char dump[64];
+            int r = recv(s, (char *)dump, sizeof dump, 0);
+            if (r <= 0) {
+                *cut = 1;
+                break;
+            }
+        }
+    }
+    net_sock_close(s);
+}
+
+static int dpi_tls_to_ip(const char *ip, const char *sni, int timeout_ms) {
+    net_sock s;
+    int rc;
+    if (!ip || !ip[0] || !sni || !sni[0]) return -2;
+    s = tcp_connect_sock(ip, 443, timeout_ms);
+    if (s == NET_SOCK_BAD) return -3; /* no TCP */
+    rc = tls_clienthello_sni_ex(s, sni, timeout_ms);
+    net_sock_close(s);
+    return rc;
 }
 
 /* SNI для DoT: у IP-адресов резолверов имя из сертификата. */
@@ -2924,6 +3041,10 @@ static int stage_begin_ex(const char *title, const char *desc, int default_run) 
     long long until;
 
     if (g_engine_cancel) return 0;
+
+    if (opt_only_dpi && title &&
+        strcmp(title, "Сеть и Wi‑Fi") != 0 && strcmp(title, "DPI") != 0)
+        return 0;
 
     if (g_engine_cb && g_engine_cb->on_stage)
         g_engine_cb->on_stage(g_engine_cb->userdata, title ? title : "", desc ? desc : "");
@@ -5565,7 +5686,9 @@ static void write_html(void) {
         "<li><strong>Почта</strong> — веб-интерфейсы и SMTP/IMAP/POP3 (баннер или TLS на :587/:465/:993/:995).</li>"
         "<li><strong>Умный дом / IoT</strong> — облака и MQTT (:443 / :8883); браузер может жить, а Tuya/Алиса — нет.</li>"
         "<li><strong>Игры / AI / Видео</strong> — отдельные контуры (Battle.net, LLM API, видеохостинги РФ).</li>"
-        "<li><strong>DPI</strong> — служебные порты, DoH, SNI, QUIC. Живой HTTPS к ya.ru не значит, что MQTT/QUIC/DoH тоже живы.</li>"
+        "<li><strong>DPI</strong> — порты, DoH/DoT, SNI vs IP, L4-25 (лимит пакетов сессии), QUIC. "
+        "В выводе «Тип ограничения»: SNI-фильтр, IP/CIDR, L4-25, QUIC drop, порт-фильтр. "
+        "Живой HTTPS к ya.ru не значит, что MQTT/QUIC/DoH тоже живы.</li>"
         "<li><strong>DNS-прогон</strong> — массовый резолв через DNS РФ и публичные резолверы.</li>"
         "<li><strong>NTP</strong> — кривое время ломает TLS на IoT и TV.</li>"
         "<li><strong>DFS</strong> — Wi‑Fi каналы 52–64 и 100–144 дают краткие обрывы; стабильнее 36/40/44/48.</li>"
@@ -6290,6 +6413,134 @@ static void quic_job(int idx, void *v) {
 
 typedef struct {
     Check *outs;
+    int *tcp_ok;
+    int *hello_rc;
+    int *extra;
+    int *cut;
+    int *expected_ru;
+    int *is_control;
+    const char **names;
+    const char **hosts;
+} L425Ctx;
+
+static void l425_job(int idx, void *v) {
+    L425Ctx *ctx = (L425Ctx *)v;
+    char ip[64], url[256], detail[STR], hint[STR];
+    const char *st, *how;
+    int tcp = 0, hello = 0, extra = 0, cut = 0;
+
+    ip[0] = 0;
+    dns_resolve(ctx->hosts[idx], ip, sizeof ip);
+    snprintf(url, sizeof url, "https://%s/", ctx->hosts[idx]);
+    dpi_l425_run(ctx->hosts[idx], &tcp, &hello, &extra, &cut);
+    ctx->tcp_ok[idx] = tcp;
+    ctx->hello_rc[idx] = hello;
+    ctx->extra[idx] = extra;
+    ctx->cut[idx] = cut;
+
+    if (!tcp) {
+        st = ctx->expected_ru[idx] ? "info" : "warn";
+        snprintf(detail, sizeof detail, "TCP :443 нет");
+        snprintf(hint, sizeof hint, "%s",
+                 ctx->expected_ru[idx]
+                     ? "Ожидаемо для ограниченного сервиса — не тип L4-25."
+                     : "Нет сессии — IP/порт-фильтр, не лимит пакетов.");
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail, hint, ip, url, 0);
+        return;
+    }
+    how = dpi_tls_how(hello);
+    if (hello == -1 && extra == 0) {
+        st = ctx->expected_ru[idx] ? "info" : "warn";
+        snprintf(detail, sizeof detail, "обрыв на ClientHello (%s)", how);
+        snprintf(hint, sizeof hint, "%s",
+                 "RST/close на handshake — SNI или сброс сессии, не счётчик пакетов L4-25.");
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail, hint, ip, url, 0);
+        return;
+    }
+    if (cut && extra >= 6 && extra <= 35) {
+        st = ctx->is_control[idx] ? "warn" : (ctx->expected_ru[idx] ? "info" : "fail");
+        snprintf(detail, sizeof detail, "L4-25? extra %d/%d · hello %s · RST",
+                 extra, DPI_L425_EXTRA, how);
+        snprintf(hint, sizeof hint, "%s",
+                 "Сессия рвётся после небольшого числа мелких пакетов "
+                 "(типичный ТСПУ L4-25 / бывший TCP 16-20).");
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail, hint, ip, url, 0);
+        return;
+    }
+    if (!cut && extra >= DPI_L425_EXTRA) {
+        st = (hello != 1 && ctx->expected_ru[idx]) ? "info" : "ok";
+        snprintf(detail, sizeof detail, "сессия жива · extra %d · hello %s", extra, how);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail,
+                  "Лимит пакетов на этой цели не сработал.", ip, url, 0);
+        return;
+    }
+    snprintf(detail, sizeof detail, "extra %d/%d · hello %s%s",
+             extra, DPI_L425_EXTRA, how, cut ? " · обрыв" : "");
+    st = ctx->expected_ru[idx] ? "info" : "warn";
+    check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail, "", ip, url, 0);
+}
+
+typedef struct {
+    Check *outs;
+    int *tcp_ok;
+    int *real_rc;
+    int *fake_rc;
+    int *expected_ru;
+    const char **names;
+    const char **hosts;
+    const char **fake_sni;
+} SniIpCtx;
+
+static void sni_ip_job(int idx, void *v) {
+    SniIpCtx *ctx = (SniIpCtx *)v;
+    char ip[64], url[256], detail[STR], hint[STR];
+    int real_rc, fake_rc, tcp;
+    const char *st;
+
+    ip[0] = 0;
+    ctx->tcp_ok[idx] = 0;
+    ctx->real_rc[idx] = -3;
+    ctx->fake_rc[idx] = -3;
+    snprintf(url, sizeof url, "https://%s/", ctx->hosts[idx]);
+    if (!dns_resolve(ctx->hosts[idx], ip, sizeof ip) || !ip[0]) {
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], "warn",
+                  "DNS не резолвит имя", "Сбой DNS, не SNI vs IP.", NULL, url, 0);
+        return;
+    }
+    tcp = tcp_open(ip, 443, 3000);
+    ctx->tcp_ok[idx] = tcp;
+    if (!tcp) {
+        st = ctx->expected_ru[idx] ? "info" : "fail";
+        snprintf(detail, sizeof detail, "IP %s :443 закрыт", ip);
+        check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail,
+                  "Блок по адресу/подсети (CIDR), не по SNI.", ip, url, 0);
+        return;
+    }
+    real_rc = dpi_tls_to_ip(ip, ctx->hosts[idx], 3000);
+    fake_rc = dpi_tls_to_ip(ip, ctx->fake_sni[idx], 3000);
+    ctx->real_rc[idx] = real_rc;
+    ctx->fake_rc[idx] = fake_rc;
+    snprintf(detail, sizeof detail, "IP жив · SNI %s=%s · чужой SNI %s=%s",
+             ctx->hosts[idx], dpi_tls_how(real_rc),
+             ctx->fake_sni[idx], dpi_tls_how(fake_rc));
+    hint[0] = 0;
+    if (real_rc != 1 && fake_rc == 1) {
+        st = ctx->expected_ru[idx] ? "info" : "fail";
+        snprintf(hint, sizeof hint, "%s",
+                 "Фильтр по имени (SNI): до IP достучались, с настоящим SNI — RST/timeout.");
+    } else if (real_rc != 1 && fake_rc != 1) {
+        st = ctx->expected_ru[idx] ? "info" : "warn";
+        snprintf(hint, sizeof hint, "%s",
+                 "TCP есть, TLS не проходит ни с каким SNI — handshake/DPI или мёртвый origin.");
+    } else {
+        st = "ok";
+        snprintf(hint, sizeof hint, "%s", "SNI на этом IP не режется отдельно от адреса.");
+    }
+    check_set(&ctx->outs[idx], "DPI", ctx->names[idx], st, detail, hint, ip, url, 0);
+}
+
+typedef struct {
+    Check *outs;
     int *ok;
     const char **hosts;
 } NtpCtx;
@@ -6380,6 +6631,7 @@ static void usage(const char *argv0) {
         "  --skip-dns-bulk        не предлагать DNS-прогон\n"
         "  --skip-speed           пропустить замер скорости\n"
         "  --skip-video           пропустить скрытую проверку видео\n"
+        "  --only-dpi             только этапы «Сеть» и «DPI» (классификация типа)\n"
         "  --dns-limit N          доменов на резолвер (по умолчанию 1000, макс. 10000)\n"
         "  --domains FILE         свой список доменов (иначе файл или встроенный)\n"
         "  --resources FILE       списки ресурсов по группам (иначе resources.conf рядом)\n"
@@ -7030,14 +7282,18 @@ static int diagnose_core(void) {
             add_finding("critical", detail, tx);
         }
         stage_done();
-    } else if (!g_sys_dns_broken) {
+    } else if (!g_sys_dns_broken && !opt_only_dpi) {
         add_check("Умный дом / IoT", "Этап", "info", "пропущен пользователем", "");
     }
 
     /* DPI */
-    if (stage_begin("DPI", "Служебные порты, DoH, SNI, QUIC")) {
+    if (stage_begin("DPI", "Служебные порты, DoH, SNI/IP, L4-25, QUIC")) {
         char dpi_fail[40][64];
         int ndpi = 0;
+        int classify_doh_fail = 0, classify_doh_ok = 0;
+        int classify_sni_fail = 0, classify_quic_ok = 0, classify_quic_ran = 0;
+        int classify_l425 = 0, classify_l425_ru = 0;
+        int classify_sniip = 0, classify_sniip_ru = 0, classify_cidr = 0;
         struct { const char *name, *host; int port; int expect_open; } dpi[] = {
             {"HTTPS 1.1.1.1:443", "1.1.1.1", 443, 1},
             {"HTTPS ya.ru:443", "ya.ru", 443, 1},
@@ -7050,7 +7306,7 @@ static int diagnose_core(void) {
             {"XMPP xmpp.org:5222", "xmpp.org", 5222, 0},
         };
         int n = (int)(sizeof dpi / sizeof dpi[0]);
-        int dpi_total = n + 2 + 4 + 6; /* ports + DoH×2 + SNI×4 + QUIC×6 */
+        int dpi_total = n + 2 + 4 + 6 + 3 + 3; /* ports + DoH + SNI + QUIC + L4-25 + SNI/IP */
         int step = 0;
         int dot_open = 0;
         {
@@ -7154,6 +7410,8 @@ static int diagnose_core(void) {
                 }
             }
             free(outs);
+            classify_doh_fail = doh_fail;
+            classify_doh_ok = doh_ok;
             if (doh_fail > 0 && dot_open > 0) {
                 add_finding("info", "DoH режется, DoT (TCP/853 + TLS) доступен",
                             "Включайте шифрованный DNS как DoT / Private DNS (хост dns.google или 1dot1dot1dot1.cloudflare-dns.com), "
@@ -7201,6 +7459,7 @@ static int diagnose_core(void) {
                 }
             }
             free(outs); free(sf); free(names); free(urls); free(eru);
+            classify_sni_fail = sni_fail;
             if (sni_fail >= 1)
                 add_finding("warning", "Похоже на SNI/DPI фильтрацию",
                             "Неожиданно недоступны «обычные» зарубежные HTTPS (не YouTube/Telegram/Discord). "
@@ -7239,14 +7498,158 @@ static int diagnose_core(void) {
                 }
             }
             free(outs); free(qo); free(names); free(hosts); free(eru);
-            (void)step;
-            (void)dpi_total;
+            classify_quic_ran = 1;
+            classify_quic_ok = qok;
             if (qok == 0)
                 add_finding("warning", "QUIC недоступен",
                             "Ни один контрольный хост (кроме ожидаемо ограниченных в РФ) "
                             "не ответил на UDP/443. Возможна фильтрация QUIC на пути.");
         }
 
+        /* SNI vs IP: тот же адрес, настоящий SNI и чужой SNI. */
+        {
+            struct {
+                const char *name, *host, *fake_sni;
+                int expected_ru;
+            } sip[] = {
+                {"SNI/IP ya.ru", "ya.ru", "www.cloudflare.com", 0},
+                {"SNI/IP cloudflare", "www.cloudflare.com", "ya.ru", 0},
+                {"SNI/IP discord", "discord.com", "ya.ru", 1},
+            };
+            int nsip = (int)(sizeof sip / sizeof sip[0]);
+            Check *outs = (Check *)calloc((size_t)nsip, sizeof(Check));
+            int *tcp = (int *)calloc((size_t)nsip, sizeof(int));
+            int *real = (int *)calloc((size_t)nsip, sizeof(int));
+            int *fake = (int *)calloc((size_t)nsip, sizeof(int));
+            int *eru = (int *)calloc((size_t)nsip, sizeof(int));
+            const char **names = (const char **)calloc((size_t)nsip, sizeof(char *));
+            const char **hosts = (const char **)calloc((size_t)nsip, sizeof(char *));
+            const char **fsni = (const char **)calloc((size_t)nsip, sizeof(char *));
+            if (outs && tcp && real && fake && eru && names && hosts && fsni) {
+                SniIpCtx sctx;
+                for (i = 0; i < nsip; i++) {
+                    names[i] = sip[i].name;
+                    hosts[i] = sip[i].host;
+                    fsni[i] = sip[i].fake_sni;
+                    eru[i] = sip[i].expected_ru;
+                }
+                sctx.outs = outs; sctx.tcp_ok = tcp; sctx.real_rc = real;
+                sctx.fake_rc = fake; sctx.expected_ru = eru;
+                sctx.names = names; sctx.hosts = hosts; sctx.fake_sni = fsni;
+                run_parallel(nsip, opt_jobs, sni_ip_job, &sctx, "SNI/IP");
+                step += nsip;
+                for (i = 0; i < nsip; i++) {
+                    add_check_from(&outs[i]);
+                    if (!tcp[i] && !eru[i]) classify_cidr = 1;
+                    else if (real[i] != 1 && fake[i] == 1) {
+                        if (eru[i]) classify_sniip_ru = 1;
+                        else classify_sniip = 1;
+                    }
+                }
+            }
+            free(outs); free(tcp); free(real); free(fake); free(eru);
+            free(names); free(hosts); free(fsni);
+        }
+
+        /* L4-25: лимит пакетов сессии (ТСПУ). Контроль ya.ru vs Cloudflare / Discord. */
+        {
+            struct {
+                const char *name, *host;
+                int expected_ru, is_control;
+            } lh[] = {
+                {"L4-25 ya.ru", "ya.ru", 0, 1},
+                {"L4-25 cloudflare", "www.cloudflare.com", 0, 0},
+                {"L4-25 discord", "discord.com", 1, 0},
+            };
+            int nl = (int)(sizeof lh / sizeof lh[0]);
+            Check *outs = (Check *)calloc((size_t)nl, sizeof(Check));
+            int *tcp = (int *)calloc((size_t)nl, sizeof(int));
+            int *hello = (int *)calloc((size_t)nl, sizeof(int));
+            int *extra = (int *)calloc((size_t)nl, sizeof(int));
+            int *cut = (int *)calloc((size_t)nl, sizeof(int));
+            int *eru = (int *)calloc((size_t)nl, sizeof(int));
+            int *ctrl = (int *)calloc((size_t)nl, sizeof(int));
+            const char **names = (const char **)calloc((size_t)nl, sizeof(char *));
+            const char **hosts = (const char **)calloc((size_t)nl, sizeof(char *));
+            if (outs && tcp && hello && extra && cut && eru && ctrl && names && hosts) {
+                L425Ctx lctx;
+                int ctrl_ok = 0;
+                for (i = 0; i < nl; i++) {
+                    names[i] = lh[i].name;
+                    hosts[i] = lh[i].host;
+                    eru[i] = lh[i].expected_ru;
+                    ctrl[i] = lh[i].is_control;
+                }
+                lctx.outs = outs; lctx.tcp_ok = tcp; lctx.hello_rc = hello;
+                lctx.extra = extra; lctx.cut = cut;
+                lctx.expected_ru = eru; lctx.is_control = ctrl;
+                lctx.names = names; lctx.hosts = hosts;
+                run_parallel(nl, opt_jobs, l425_job, &lctx, "L4-25");
+                step += nl;
+                for (i = 0; i < nl; i++)
+                    add_check_from(&outs[i]);
+                if (tcp[0] && !cut[0] && extra[0] >= DPI_L425_EXTRA)
+                    ctrl_ok = 1;
+                if (ctrl_ok) {
+                    for (i = 1; i < nl; i++) {
+                        if (tcp[i] && cut[i] && extra[i] >= 6 && extra[i] <= 35) {
+                            if (eru[i]) classify_l425_ru = 1;
+                            else classify_l425 = 1;
+                        }
+                    }
+                }
+            }
+            free(outs); free(tcp); free(hello); free(extra); free(cut);
+            free(eru); free(ctrl); free(names); free(hosts);
+        }
+
+        {
+            char typ[256], tx[LONGSTR];
+            const char *st;
+            typ[0] = 0;
+            if (classify_l425) {
+                snprintf(typ, sizeof typ, "L4-25 (лимит пакетов сессии)");
+                snprintf(tx, sizeof tx,
+                         "Контроль ya.ru держит мелкие TCP-сегменты, зарубежный HTTPS обрывается "
+                         "после ~10–30 extra-пакетов. Это ТСПУ L4-25 (раньше «TCP 16-20»), не «интернета нет». "
+                         "IoT/MQTT поверх длинной сессии и крупные загрузки могут рваться так же.");
+                add_finding("warning", "Тип ограничения: L4-25", tx);
+            } else if (classify_sniip) {
+                snprintf(typ, sizeof typ, "SNI-фильтр (IP жив)");
+                snprintf(tx, sizeof tx,
+                         "До IP достучались, TLS с настоящим SNI — RST/timeout, с чужим SNI — ответ есть. "
+                         "Режется имя в ClientHello, не маршрут до адреса. Облака IoT с зарубежным SNI "
+                         "могут падать при живом браузере на «белых» сайтах.");
+                add_finding("warning", "Тип ограничения: SNI-фильтр", tx);
+            } else if (classify_cidr) {
+                snprintf(typ, sizeof typ, "IP/CIDR (адрес недоступен)");
+                snprintf(tx, sizeof tx,
+                         "TCP :443 на резолвленном IP закрыт, при этом ya.ru жив. Похоже на фильтр "
+                         "подсети (whitelist/DPI-лист), не на SNI. Обход по имени без смены адреса не поможет.");
+                add_finding("warning", "Тип ограничения: IP/CIDR", tx);
+            } else if (classify_quic_ran && classify_quic_ok == 0 && classify_doh_ok > 0) {
+                snprintf(typ, sizeof typ, "QUIC drop (TCP жив)");
+                /* finding already added in QUIC block */
+            } else if (ndpi >= 2) {
+                snprintf(typ, sizeof typ, "порт-фильтр (MQTT/push/DoH)");
+            } else if (classify_sniip_ru || classify_l425_ru || classify_sni_fail) {
+                snprintf(typ, sizeof typ, "ограничены отдельные сервисы (ожидаемо)");
+                snprintf(tx, sizeof tx,
+                         "Discord/YouTube/Telegram или их L4/SNI режутся, обычный HTTPS (ya.ru / Cloudflare) жив. "
+                         "Это не поломка домашней сети — отдельные реестры/DPI на сервисах.");
+                add_finding("info", "Тип ограничения: отдельные сервисы", tx);
+            } else if (classify_doh_fail && dot_open > 0) {
+                snprintf(typ, sizeof typ, "DoH режется, DoT жив");
+            } else {
+                snprintf(typ, sizeof typ, "явного DPI-типа нет");
+            }
+            st = (classify_l425 || classify_sniip || classify_cidr || ndpi >= 2) ? "warn" : "ok";
+            add_check("DPI", "Тип ограничения", st, typ,
+                      "Сводка по SNI/IP, L4-25, QUIC, портам и DoH/DoT. Не обход — только тип.");
+        }
+
+        (void)step;
+        (void)dpi_total;
         if (ndpi >= 2) {
             char names[LONGSTR] = "", tx[LONGSTR];
             for (i = 0; i < ndpi; i++) {
@@ -7260,7 +7663,7 @@ static int diagnose_core(void) {
             add_finding("warning", detail, tx);
         }
         stage_done();
-    } else if (!g_sys_dns_broken) {
+    } else if (!g_sys_dns_broken && !opt_only_dpi) {
         add_check("DPI", "Этап", "info", "пропущен пользователем", "");
     }
 
@@ -7720,7 +8123,7 @@ static int diagnose_core(void) {
             add_finding(ngame >= 3 ? "critical" : "warning", detail, tx);
         }
         stage_done();
-    } else if (!g_sys_dns_broken) {
+    } else if (!g_sys_dns_broken && !opt_only_dpi) {
         add_check("Игры", "Этап", "info", "пропущен пользователем", "");
     }
 
@@ -7875,7 +8278,7 @@ static int diagnose_core(void) {
             add_finding(nai_fail >= 2 ? "critical" : "warning", detail, tx);
         }
         stage_done();
-    } else if (!g_sys_dns_broken) {
+    } else if (!g_sys_dns_broken && !opt_only_dpi) {
         add_check("AI / LLM", "Этап", "info", "пропущен пользователем", "");
     }
 
@@ -8334,6 +8737,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--skip-dns-bulk") == 0) opt_skip_dns_bulk = 1;
         else if (strcmp(argv[i], "--skip-speed") == 0) opt_skip_speed = 1;
         else if (strcmp(argv[i], "--skip-video") == 0) opt_skip_video = 1;
+        else if (strcmp(argv[i], "--only-dpi") == 0) opt_only_dpi = 1;
         else if ((strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
             opt_jobs = atoi(argv[++i]);
             if (opt_jobs < 1) opt_jobs = 1;
