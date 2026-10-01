@@ -11,7 +11,7 @@
 UNAME_S := $(shell uname -s)
 ROOT    := $(CURDIR)
 TP      := $(ROOT)/third_party
-ENGINE  := src/connect-check.c src/cc_probes.c src/selfupdate.c
+ENGINE  := src/connect-check.c src/cc_probes.c src/selfupdate.c src/cc_spawn.c
 SRC     := gui/connect-check-gui.c $(ENGINE)
 GLFW_WIN ?= $(TP)/win
 VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
@@ -106,7 +106,7 @@ else
 	@echo "mac launcher только на Darwin"; exit 1
 endif
 
-$(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION \
+$(MAC_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h src/cc_spawn.h VERSION \
                $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h gui/icons/icon_rgba.h gui/icons/AppIcon.icns
 ifeq ($(UNAME_S),Darwin)
 	mkdir -p $(STAGING)/mac
@@ -161,7 +161,7 @@ $(WIN_ICON_O): gui/win_icon.rc gui/icons/connect-check.ico
 	mkdir -p $(STAGING)/win
 	$(WIN_WINDRES) -I gui gui/win_icon.rc -O coff -o $@
 
-$(WIN_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h VERSION \
+$(WIN_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h src/cc_spawn.h VERSION \
                $(TP)/nuklear.h $(TP)/nuklear_gdip.h $(WIN_ICON_O)
 	mkdir -p $(STAGING)/win
 	$(WIN_CC) $(WIN_CFLAGS) -o $@ $(SRC) $(WIN_ICON_O) $(WIN_LDFLAGS)
@@ -182,7 +182,7 @@ package-linux-native: $(LINUX_STAGED)
 	@rm -rf bin/linux
 	@ls -lh bin/connect-check-gui-linux
 
-$(LINUX_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h \
+$(LINUX_STAGED): $(SRC) $(EMBED_H) src/version.h src/selfupdate.h src/cc_engine.h src/cc_spawn.h \
                  $(TP)/nuklear.h $(TP)/nuklear_glfw_gl2.h gui/icons/icon_rgba.h
 ifeq ($(UNAME_S),Linux)
 	mkdir -p $(STAGING)/linux
@@ -210,7 +210,7 @@ else
 	    gcc -O2 -Wall -Ithird_party -Isrc -Ibuild -Igui -DCONNECT_CHECK_VERSION=\"$(VERSION)\" -DCC_ENGINE_LIBRARY \
 	      $$(pkg-config --cflags glfw3) \
 	      -o build/gui/linux/connect-check-gui gui/connect-check-gui.c src/selfupdate.c \
-	      src/connect-check.c src/cc_probes.c \
+	      src/connect-check.c src/cc_probes.c src/cc_spawn.c \
 	      $$(pkg-config --libs glfw3) -lGL -lm -ldl -lpthread -Wl,-rpath,\$$ORIGIN; \
 	    SO=$$(ldd build/gui/linux/connect-check-gui | awk "/libglfw/{print \$$3; exit}"); \
 	    if [ -n "$$SO" ] && [ -f "$$SO" ]; then \

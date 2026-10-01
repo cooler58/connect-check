@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+#define CC_STAGE_MAX 24
+
 typedef struct {
     int yes;            /* без интерактива (как -y) */
     int skip_dns_bulk;
@@ -19,6 +21,9 @@ typedef struct {
     char outdir[512];
     char resources[1024];
     char workdir[1024]; /* cwd / корень пакета для resources.conf */
+    /* Если stage_on_n > 0 — явный набор этапов (1=вкл). Иначе defaults + skip_*. */
+    int stage_on[CC_STAGE_MAX];
+    int stage_on_n;
 } CcOpts;
 
 typedef struct {
@@ -44,6 +49,11 @@ int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb);
 #define CC_STAGE_TITLE_LEN 96
 int cc_engine_stages(const CcOpts *opts, char titles[][CC_STAGE_TITLE_LEN],
                      int *skipped, int max);
+
+/* Каталог этапов (порядок прогона). default_on: 0 только у «DNS-прогон». */
+int cc_engine_stage_count(void);
+const char *cc_engine_stage_title(int i);
+int cc_engine_stage_default_on(int i);
 
 /* Запросить остановку (из UI-потока). */
 void cc_engine_request_cancel(void);

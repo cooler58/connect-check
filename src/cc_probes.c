@@ -1,6 +1,7 @@
 /* In-process cyclic probes (formerly probe-* binaries). */
 #define _CRT_SECURE_NO_WARNINGS
 #include "cc_engine.h"
+#include "cc_spawn.h"
 #include "version.h"
 
 #include <stdio.h>
@@ -124,7 +125,6 @@ static int tcp_open_host(const char *host, int port, int timeout_ms, int *ms_out
 
 static int http_code(const char *url, int follow, int *ms_out) {
     char cmd[1536], out[64];
-    FILE *fp;
     long long t0 = now_ms();
     int code = 0;
     if (ms_out) *ms_out = 0;
@@ -139,10 +139,8 @@ static int http_code(const char *url, int follow, int *ms_out) {
              "%s '%s' 2>/dev/null",
              follow ? "-L --max-redirs 5" : "--max-redirs 0", url);
 #endif
-    fp = popen(cmd, "r");
-    if (!fp) return 0;
-    if (fgets(out, sizeof out, fp)) code = atoi(out);
-    pclose(fp);
+    if (cc_run_capture(cmd, out, sizeof out) != 0) return 0;
+    code = atoi(out);
     if (ms_out) *ms_out = (int)(now_ms() - t0);
     return code;
 }

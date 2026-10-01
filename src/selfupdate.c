@@ -7,6 +7,7 @@
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include "selfupdate.h"
+#include "cc_spawn.h"
 #include "version.h"
 
 #include <ctype.h>
@@ -116,11 +117,7 @@ static long long file_size(const char *path) {
 }
 
 static int run_cmd(const char *cmd) {
-#ifdef _WIN32
-    return system(cmd);
-#else
-    return system(cmd);
-#endif
+    return cc_run_cmd(cmd);
 }
 
 /* ---------- platform asset id ---------- */
@@ -450,27 +447,24 @@ static int file_sha256_hex(const char *path, char *hex, size_t hexlen, char *err
 #ifdef _WIN32
     char cmd[SU_STR * 2];
     char out[512];
-    FILE *fp;
     char *p;
+    char *nl;
     snprintf(cmd, sizeof cmd, "certutil -hashfile \"%s\" SHA256", path);
-    fp = _popen(cmd, "r");
-    if (!fp) {
+    if (cc_run_capture(cmd, out, sizeof out) != 0 || !out[0]) {
         set_err(err, errlen, "certutil недоступен");
         return -1;
     }
     /* skip first line "SHA256 hash of ..." then read hex line */
-    if (!fgets(out, sizeof out, fp)) {
-        _pclose(fp);
+    nl = strchr(out, '\n');
+    if (!nl) {
         set_err(err, errlen, "certutil: нет вывода");
         return -1;
     }
-    if (!fgets(out, sizeof out, fp)) {
-        _pclose(fp);
+    p = nl + 1;
+    if (!*p) {
         set_err(err, errlen, "certutil: нет хеша");
         return -1;
     }
-    _pclose(fp);
-    p = out;
     while (*p && isspace((unsigned char)*p)) p++;
     {
         size_t i = 0;

@@ -72,8 +72,8 @@
 #define TAB_PROBES  1
 #define TAB_URL     2
 #define TAB_COUNT   3
-#define STAGE_PANEL_H_DEFAULT 168
-#define STAGE_PANEL_H_MIN     90
+#define STAGE_PANEL_H_DEFAULT 280
+#define STAGE_PANEL_H_MIN     160
 #define LOG_H_FLOOR           220
 #define LOG_H_FLOOR_MIN       180
 
@@ -93,6 +93,7 @@ typedef enum {
 typedef struct {
     char title[CC_STAGE_TITLE_LEN];
     StageState state;
+    int enabled;
 } StageItem;
 
 typedef enum {
@@ -119,8 +120,9 @@ static LogBuf g_logs[TAB_COUNT];
 static int g_log_prog_idx[TAB_COUNT] = { -1, -1, -1 };
 static char g_status[128] = "Готово";
 
-static int opt_yes = 1, opt_skip_dns = 1, opt_skip_video, opt_dns_bulk;
-static int opt_skip_speed, opt_no_open;
+static int opt_yes = 1, opt_no_open;
+static int g_stage_on[MAX_STAGES];
+static int g_stage_on_n;
 static char opt_outdir[PATH_MAX_G] = "reports";
 
 static int probe_on[5] = {1, 0, 0, 0, 0};
@@ -629,20 +631,44 @@ static void cb_on_done(void *ud, const char *report_path, int ok_n, int warn_n, 
     ev_push(&e);
 }
 
+static void stages_apply_defaults(void) {
+    int n = cc_engine_stage_count();
+    int i;
+    if (n > MAX_STAGES) n = MAX_STAGES;
+    g_stage_on_n = n;
+    for (i = 0; i < n; i++)
+        g_stage_on[i] = cc_engine_stage_default_on(i) ? 1 : 0;
+}
+
+static void stages_enable_all(void) {
+    int i;
+    for (i = 0; i < g_stage_on_n; i++)
+        g_stage_on[i] = 1;
+}
+
+static void opts_fill_stages(CcOpts *opts) {
+    int i, n = g_stage_on_n;
+    if (!opts) return;
+    if (n > CC_STAGE_MAX) n = CC_STAGE_MAX;
+    opts->stage_on_n = n;
+    for (i = 0; i < n; i++)
+        opts->stage_on[i] = g_stage_on[i] ? 1 : 0;
+}
+
 static void stages_rebuild_plan(void) {
     CcOpts opts;
     char titles[MAX_STAGES][CC_STAGE_TITLE_LEN];
     int skipped[MAX_STAGES];
     int n, i;
     memset(&opts, 0, sizeof opts);
-    opts.skip_dns_bulk = opt_skip_dns && !opt_dns_bulk;
-    opts.force_dns_bulk = opt_dns_bulk;
-    opts.skip_video = opt_skip_video;
-    opts.skip_speed = opt_skip_speed;
+    if (g_stage_on_n <= 0)
+        stages_apply_defaults();
+    opts_fill_stages(&opts);
     n = cc_engine_stages(&opts, titles, skipped, MAX_STAGES);
     g_stage_n = 0;
     for (i = 0; i < n; i++) {
         snprintf(g_stages[i].title, sizeof g_stages[i].title, "%s", titles[i]);
+        g_stages[i].enabled = (i < g_stage_on_n) ? g_stage_on[i] : !skipped[i];
         g_stages[i].state = skipped[i] ? ST_SKIPPED : ST_PENDING;
         g_stage_n++;
     }
@@ -833,11 +859,8 @@ static void run_diagnose(void) {
     opts = (CcOpts *)calloc(1, sizeof *opts);
     if (!opts) return;
     opts->yes = opt_yes;
-    opts->skip_dns_bulk = opt_skip_dns && !opt_dns_bulk;
-    opts->force_dns_bulk = opt_dns_bulk;
-    opts->skip_video = opt_skip_video;
-    opts->skip_speed = opt_skip_speed;
     opts->no_open = opt_no_open;
+    opts_fill_stages(opts);
     snprintf(opts->outdir, sizeof opts->outdir, "%s", opt_outdir);
     if (g_resources[0])
         snprintf(opts->resources, sizeof opts->resources, "%s", g_resources);
@@ -1273,6 +1296,38 @@ static void do_self_update(void) {
 
 /* ---------- UI ---------- */
 
+static void ui_apply_theme(struct nk_context *ctx) {
+    struct nk_color text = nk_rgb(228, 228, 232);
+    struct nk_color dim = nk_rgb(160, 162, 170);
+    struct nk_style_toggle *cb;
+    if (!ctx) return;
+    ctx->style.text.color = text;
+    ctx->style.window.background = nk_rgb(32, 33, 38);
+    ctx->style.window.fixed_background = nk_style_item_color(nk_rgb(32, 33, 38));
+    ctx->style.button.normal = nk_style_item_color(nk_rgb(58, 60, 70));
+    ctx->style.button.hover = nk_style_item_color(nk_rgb(72, 78, 92));
+    ctx->style.button.active = nk_style_item_color(nk_rgb(70, 110, 170));
+    ctx->style.button.text_normal = text;
+    ctx->style.button.text_hover = nk_rgb(255, 255, 255);
+    ctx->style.button.text_active = nk_rgb(255, 255, 255);
+    ctx->style.edit.normal = nk_style_item_color(nk_rgb(48, 50, 58));
+    ctx->style.edit.text_normal = text;
+    cb = &ctx->style.checkbox;
+    cb->normal = nk_style_item_color(nk_rgb(48, 50, 58));
+    cb->hover = nk_style_item_color(nk_rgb(64, 70, 84));
+    cb->active = nk_style_item_color(nk_rgb(70, 110, 170));
+    cb->cursor_normal = nk_style_item_color(nk_rgb(61, 204, 138));
+    cb->cursor_hover = nk_style_item_color(nk_rgb(90, 224, 154));
+    cb->padding = nk_vec2(3.0f, 3.0f);
+    cb->border = 1.5f;
+    cb->border_color = nk_rgb(180, 184, 196);
+    cb->text_normal = text;
+    cb->text_hover = nk_rgb(255, 255, 255);
+    cb->text_active = text;
+    cb->text_background = nk_rgb(32, 33, 38);
+    (void)dim;
+}
+
 /* Целое в поле ввода без кнопок ± (nk_property_* на узкой строке наползают). */
 static void ui_int_field(struct nk_context *ctx, char *buf, int bufsz,
                          int *val, int minv, int maxv) {
@@ -1303,16 +1358,13 @@ static void ui_labeled_int_row(struct nk_context *ctx, const char *label,
 static void ui_tab_diagnose(struct nk_context *ctx) {
     int i;
     char sum[160];
-    static int prev_skip_dns = -1, prev_skip_video = -1, prev_dns_bulk = -1, prev_skip_speed = -1;
+    static int prev_sig = -1;
+    int sig = 0;
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, "Параметры диагностики", NK_TEXT_LEFT);
-    nk_layout_row_dynamic(ctx, 24, 1);
+    nk_layout_row_dynamic(ctx, 24, 2);
     nk_checkbox_label(ctx, "Без вопросов", &opt_yes);
-    nk_checkbox_label(ctx, "Пропустить DNS-прогон", &opt_skip_dns);
-    nk_checkbox_label(ctx, "Пропустить видео", &opt_skip_video);
-    nk_checkbox_label(ctx, "DNS-прогон (полный)", &opt_dns_bulk);
-    nk_checkbox_label(ctx, "Пропустить скорость", &opt_skip_speed);
     nk_checkbox_label(ctx, "Не открывать HTML", &opt_no_open);
     nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
     nk_layout_row_push(ctx, 140);
@@ -1321,15 +1373,27 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, opt_outdir, sizeof opt_outdir, nk_filter_default);
     nk_layout_row_end(ctx);
 
-    if (!g_diag_busy &&
-        (prev_skip_dns != opt_skip_dns || prev_skip_video != opt_skip_video ||
-         prev_dns_bulk != opt_dns_bulk || prev_skip_speed != opt_skip_speed ||
-         g_stage_n == 0)) {
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_label(ctx, "Этапы (текущий набор по умолчанию включён; DNS-прогон — выкл.)", NK_TEXT_LEFT);
+    nk_layout_row_dynamic(ctx, 28, 2);
+    if (nk_button_label(ctx, "Все этапы")) {
+        if (!g_diag_busy) {
+            stages_enable_all();
+            stages_rebuild_plan();
+        }
+    }
+    if (nk_button_label(ctx, "По умолчанию")) {
+        if (!g_diag_busy) {
+            stages_apply_defaults();
+            stages_rebuild_plan();
+        }
+    }
+
+    for (i = 0; i < g_stage_on_n; i++)
+        sig = sig * 33 + (g_stage_on[i] ? i + 1 : 0);
+    if (!g_diag_busy && (prev_sig != sig || g_stage_n == 0)) {
         stages_rebuild_plan();
-        prev_skip_dns = opt_skip_dns;
-        prev_skip_video = opt_skip_video;
-        prev_dns_bulk = opt_dns_bulk;
-        prev_skip_speed = opt_skip_speed;
+        prev_sig = sig;
     }
 
     snprintf(sum, sizeof sum, "Сбои: %d   Внимание: %d   OK: %d", g_ui_fail, g_ui_warn, g_ui_ok);
@@ -1339,24 +1403,18 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
 
     nk_layout_row_dynamic(ctx, (float)g_stage_panel_h, 1);
     if (nk_group_begin(ctx, "stages", NK_WINDOW_BORDER)) {
-        nk_layout_row_dynamic(ctx, 18, 1);
-        nk_label(ctx, "Этапы:", NK_TEXT_LEFT);
+        nk_layout_row_dynamic(ctx, 22, 2);
         for (i = 0; i < g_stage_n; i++) {
-            char lab[140];
-            const char *mark = "○";
-            struct nk_color col = nk_rgb(120, 120, 130);
-            if (g_stages[i].state == ST_RUNNING) {
-                mark = "→";
-                col = nk_rgb(80, 160, 220);
-            } else if (g_stages[i].state == ST_DONE) {
-                mark = "✓";
-                col = nk_rgb(40, 140, 60);
-            } else if (g_stages[i].state == ST_SKIPPED) {
-                mark = "⏭";
-                col = nk_rgb(150, 150, 155);
-            }
-            snprintf(lab, sizeof lab, "%s %s", mark, g_stages[i].title);
-            nk_label_colored(ctx, lab, NK_TEXT_LEFT, col);
+            char lab[160];
+            const char *mark = "";
+            if (g_stages[i].state == ST_RUNNING) mark = "→ ";
+            else if (g_stages[i].state == ST_DONE) mark = "✓ ";
+            else if (g_stages[i].state == ST_SKIPPED) mark = "⏭ ";
+            snprintf(lab, sizeof lab, "%s%s", mark, g_stages[i].title);
+            if (i < g_stage_on_n)
+                nk_checkbox_label(ctx, lab, &g_stage_on[i]);
+            else
+                nk_label(ctx, lab, NK_TEXT_LEFT);
         }
         nk_group_end(ctx);
     }
@@ -1511,6 +1569,7 @@ static void gui_init_common(void) {
     g_ev_lock_ok = 1;
 #endif
     resolve_pkg();
+    stages_apply_defaults();
     stages_rebuild_plan();
     log_add_tab(TAB_DIAG, "", "Connect Check GUI " CONNECT_CHECK_VERSION " — движок встроен");
     if (g_workdir[0]) log_add_tab(TAB_DIAG, "pkg", g_workdir);
@@ -1573,13 +1632,13 @@ int main(int argc, char **argv) {
     struct nk_context *ctx;
     GdipFont *font;
     WNDCLASSW wc;
-    RECT rect = {0, 0, 960, 720};
+    RECT rect = {0, 0, 980, 820};
     DWORD style = WS_OVERLAPPEDWINDOW;
     DWORD exstyle = WS_EX_APPWINDOW;
     HWND wnd;
     int running = 1;
     int needs_refresh = 1;
-    int width = 960, height = 720;
+    int width = 980, height = 820;
     char titlea[96];
     wchar_t titlew[128];
 
@@ -1617,6 +1676,7 @@ int main(int argc, char **argv) {
     ctx = nk_gdip_init(wnd, (unsigned)width, (unsigned)height);
     font = win_pick_font();
     if (font) nk_gdip_set_font(font);
+    ui_apply_theme(ctx);
 
     update_check_startup();
 
@@ -1678,7 +1738,7 @@ static void error_callback(int e, const char *d) {
 int main(int argc, char **argv) {
     GLFWwindow *win;
     struct nk_context *ctx;
-    int width = 960, height = 720;
+    int width = 980, height = 820;
 
     (void)argc;
     (void)argv;
@@ -1747,6 +1807,7 @@ int main(int argc, char **argv) {
         nk_glfw3_font_stash_end();
         if (font)
             nk_style_set_font(ctx, &font->handle);
+        ui_apply_theme(ctx);
     }
 
     while (!glfwWindowShouldClose(win)) {

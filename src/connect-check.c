@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
@@ -17,6 +18,7 @@
 #include "version.h"
 #include "selfupdate.h"
 #include "cc_engine.h"
+#include "cc_spawn.h"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -117,6 +119,12 @@ static int opt_force_dns_bulk; /* --dns-bulk: запустить даже при
 static int opt_skip_speed;
 static int opt_skip_video;
 static int opt_only_dpi; /* CLI: сеть + DPI, остальное пропустить */
+static int opt_only_time; /* CLI: сеть + «Время / синхронизация» */
+static int opt_stage_on[CC_STAGE_MAX];
+static int opt_stage_on_n;
+static int g_time_skew_abs = -1; /* сек, -1 неизвестно */
+static int g_time_ntp_ok;
+static int g_time_http_ok;
 static int opt_jobs = DEFAULT_JOBS; /* параллельные пробы внутри этапа */
 static int opt_dns_limit = 1000; /* полный прогон: --dns-limit 10000 */
 static int g_sys_dns_broken; /* getaddrinfo не резолвит известные имена — remote-этапы бессмысленны */
@@ -162,6 +170,7 @@ static int g_prog_total;
 static void stage_progress(const char *msg, int cur, int total);
 static void stage_done(void);
 static void host_from_url(const char *url, char *host, size_t hostlen);
+static const char *ua_default(void);
 
 /* ---------- utils ---------- */
 
@@ -392,27 +401,7 @@ static void add_check_from(const Check *src) {
 }
 
 static int run_capture(const char *cmd, char *buf, size_t buflen) {
-    FILE *fp;
-    size_t n = 0;
-    buf[0] = 0;
-#ifdef _WIN32
-    fp = _popen(cmd, "r");
-#else
-    fp = popen(cmd, "r");
-#endif
-    if (!fp) return -1;
-    while (n + 1 < buflen) {
-        size_t r = fread(buf + n, 1, buflen - 1 - n, fp);
-        if (r == 0) break;
-        n += r;
-    }
-    buf[n] = 0;
-#ifdef _WIN32
-    _pclose(fp);
-#else
-    pclose(fp);
-#endif
-    return 0;
+    return cc_run_capture(cmd, buf, buflen);
 }
 
 /* ---------- TCP ---------- */
@@ -1025,8 +1014,210 @@ static int tcp_hold(const char *host, int port, int connect_ms, int hold_ms) {
 #endif
 }
 
-/* Minimal NTP client (UDP/123). Returns 1 if response received. */
-static int ntp_probe(const char *host, int timeout_ms) {
+#define NTP_UNIX_DELTA 2208988800UL
+
+#ifndef _WIN32
+#include <strings.h>
+#define cc_strncasecmp strncasecmp
+#else
+#define cc_strncasecmp _strnicmp
+#endif
+
+static const char *const k_stage_titles[] = {
+    "Сеть и Wi‑Fi",
+    "Captive / OS",
+    "Время / синхронизация",
+    "Умный дом / IoT",
+    "DPI",
+    "CDN / счётчики",
+    "Значимые ресурсы (Белые списки МЦ)",
+    "Зарубежные ресурсы",
+    "Банки, CRM и сервисы РФ",
+    "Почта",
+    "Видео",
+    "Игры",
+    "Облако",
+    "Репозитории / обновления",
+    "Гео / IX",
+    "AI / LLM",
+    "Скорость",
+    "DNS-прогон",
+};
+#define K_STAGE_N ((int)(sizeof k_stage_titles / sizeof k_stage_titles[0]))
+
+int cc_engine_stage_count(void) { return K_STAGE_N; }
+
+const char *cc_engine_stage_title(int i) {
+    if (i < 0 || i >= K_STAGE_N) return "";
+    return k_stage_titles[i];
+}
+
+int cc_engine_stage_default_on(int i) {
+    if (i < 0 || i >= K_STAGE_N) return 0;
+    return strcmp(k_stage_titles[i], "DNS-прогон") == 0 ? 0 : 1;
+}
+
+static int stage_index_of(const char *title) {
+    int i;
+    if (!title || !title[0]) return -1;
+    for (i = 0; i < K_STAGE_N; i++) {
+        if (strcmp(k_stage_titles[i], title) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int stage_is_on(const char *title) {
+    int idx = stage_index_of(title);
+    if (opt_only_dpi && title &&
+        strcmp(title, "Сеть и Wi‑Fi") != 0 && strcmp(title, "DPI") != 0)
+        return 0;
+    if (opt_only_time && title &&
+        strcmp(title, "Сеть и Wi‑Fi") != 0 &&
+        strcmp(title, "Время / синхронизация") != 0)
+        return 0;
+    if (idx < 0) return 1;
+    if (opt_stage_on_n > 0)
+        return idx < opt_stage_on_n ? (opt_stage_on[idx] ? 1 : 0) : 0;
+    if (strcmp(title, "Видео") == 0) return opt_skip_video ? 0 : 1;
+    if (strcmp(title, "Скорость") == 0) return opt_skip_speed ? 0 : 1;
+    if (strcmp(title, "DNS-прогон") == 0)
+        return (opt_skip_dns_bulk && !opt_force_dns_bulk) ? 0 : 1;
+    return 1;
+}
+
+typedef struct {
+    int ok;          /* UDP/123 ответ ≥48 байт и stratum 1..15 */
+    int kiss;        /* stratum 0 / LI=unsync */
+    int stratum;
+    int rtt_ms;
+    long skew_sec;   /* local_unix - ntp_unix */
+    time_t ntp_unix;
+} NtpResult;
+
+typedef struct {
+    int ok;
+    int ms;
+    time_t http_unix;
+    char raw[80];
+} HttpDateResult;
+
+static uint32_t rd_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* UTC Y-M-D H:M:S → unix, без TZ/locale. mon0 = 0..11. */
+static time_t ymd_to_unix(int y, int mon0, int d, int h, int mi, int s) {
+    int yy, days;
+    static const int mdays[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    if (y < 1970 || mon0 < 0 || mon0 > 11 || d < 1 || d > 31) return 0;
+    yy = y - 1;
+    days = (y - 1970) * 365 + (yy / 4 - 1969 / 4) - (yy / 100 - 1969 / 100) +
+           (yy / 400 - 1969 / 400);
+    days += mdays[mon0];
+    if (mon0 >= 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0))
+        days++;
+    days += d - 1;
+    return (time_t)days * 86400 + h * 3600 + mi * 60 + s;
+}
+
+static int parse_http_date(const char *s, time_t *out) {
+    static const char *const mon[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    int d = 0, y = 0, h = 0, mi = 0, sec = 0, i, m = -1;
+    char moname[8];
+    const char *p;
+    if (!s || !out) return 0;
+    p = s;
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
+    while (*p == ' ') p++;
+    moname[0] = 0;
+    if (sscanf(p, "%d %7s %d %d:%d:%d", &d, moname, &y, &h, &mi, &sec) < 6)
+        return 0;
+    for (i = 0; i < 12; i++) {
+        if (cc_strncasecmp(moname, mon[i], 3) == 0) { m = i; break; }
+    }
+    if (m < 0) return 0;
+    *out = ymd_to_unix(y, m, d, h, mi, sec);
+    return *out > 0 ? 1 : 0;
+}
+
+static HttpDateResult http_date_probe(const char *url, int timeout_sec) {
+    HttpDateResult r;
+    memset(&r, 0, sizeof r);
+#ifdef _WIN32
+    {
+        HINTERNET hNet = NULL, hUrl = NULL;
+        DWORD flags, to, dlen;
+        char date[128];
+        long long t0 = now_ms();
+        to = (DWORD)timeout_sec * 1000;
+        hNet = InternetOpenA(ua_default(), INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+        if (!hNet) return r;
+        InternetSetOptionA(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof to);
+        InternetSetOptionA(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof to);
+        flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                INTERNET_FLAG_NO_AUTO_REDIRECT;
+        if (starts_with(url, "https://"))
+            flags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID |
+                     INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+        hUrl = InternetOpenUrlA(hNet, url, NULL, 0, flags, 0);
+        if (hUrl) {
+            dlen = sizeof date;
+            if (HttpQueryInfoA(hUrl, HTTP_QUERY_DATE, date, &dlen, NULL) && date[0]) {
+                snprintf(r.raw, sizeof r.raw, "%s", date);
+                if (parse_http_date(date, &r.http_unix))
+                    r.ok = 1;
+            }
+            InternetCloseHandle(hUrl);
+        }
+        InternetCloseHandle(hNet);
+        r.ms = (int)(now_ms() - t0);
+        return r;
+    }
+#else
+    {
+        char cmd[LONGSTR * 2], out[STR];
+        char *p, *nl;
+        long long t0 = now_ms();
+        snprintf(cmd, sizeof cmd,
+                 CURL_SSL_ENV
+                 "curl -sS --max-time %d --connect-timeout %d -o /dev/null -D - "
+                 "-A '%s' -k --max-redirs 3 -L '%s' 2>/dev/null",
+                 timeout_sec, timeout_sec > 2 ? timeout_sec - 1 : timeout_sec,
+                 ua_default(), url);
+        if (run_capture(cmd, out, sizeof out) == 0 && out[0]) {
+            p = out;
+            while (p && *p) {
+                if (cc_strncasecmp(p, "Date:", 5) == 0) {
+                    p += 5;
+                    while (*p == ' ' || *p == '\t') p++;
+                    nl = strchr(p, '\r');
+                    if (!nl) nl = strchr(p, '\n');
+                    if (nl) *nl = 0;
+                    snprintf(r.raw, sizeof r.raw, "%s", p);
+                    str_trim(r.raw);
+                    if (parse_http_date(r.raw, &r.http_unix))
+                        r.ok = 1;
+                    break;
+                }
+                p = strchr(p, '\n');
+                if (p) p++;
+            }
+        }
+        r.ms = (int)(now_ms() - t0);
+        return r;
+    }
+#endif
+}
+
+/* NTP client: parse transmit timestamp + stratum. ok=0 if no reply / kiss. */
+static NtpResult ntp_probe_ex(const char *host, int timeout_ms) {
+    NtpResult nr;
 #ifdef _WIN32
     SOCKET s;
 #else
@@ -1036,18 +1227,20 @@ static int ntp_probe(const char *host, int timeout_ms) {
     unsigned char req[48], resp[48];
     fd_set rset;
     struct timeval tv;
-    int ok = 0;
     long long t0;
+    time_t local_unix;
 
+    memset(&nr, 0, sizeof nr);
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, "123", &hints, &res) != 0) return 0;
+    if (getaddrinfo(host, "123", &hints, &res) != 0) return nr;
 
     memset(req, 0, sizeof req);
     req[0] = 0x1b; /* LI=0, VN=3, Mode=3 (client) */
+    local_unix = time(NULL);
 
-    for (ai = res; ai && !ok; ai = ai->ai_next) {
+    for (ai = res; ai && !nr.ok; ai = ai->ai_next) {
 #ifdef _WIN32
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCKET) continue;
@@ -1063,20 +1256,29 @@ static int ntp_probe(const char *host, int timeout_ms) {
             tv.tv_sec = timeout_ms / 1000;
             tv.tv_usec = (timeout_ms % 1000) * 1000;
             if (select(0, &rset, NULL, NULL, &tv) > 0) {
-                if (recvfrom(s, (char *)resp, sizeof resp, 0, NULL, NULL) >= 48)
-                    ok = 1;
-            }
+                if (recvfrom(s, (char *)resp, sizeof resp, 0, NULL, NULL) >= 48) {
 #else
             FD_SET(s, &rset);
             tv.tv_sec = timeout_ms / 1000;
             tv.tv_usec = (timeout_ms % 1000) * 1000;
             if (select(s + 1, &rset, NULL, NULL, &tv) > 0) {
-                if (recvfrom(s, resp, sizeof resp, 0, NULL, NULL) >= 48)
-                    ok = 1;
-            }
+                if (recvfrom(s, resp, sizeof resp, 0, NULL, NULL) >= 48) {
 #endif
+                    uint32_t sec;
+                    int li = (resp[0] >> 6) & 0x3;
+                    nr.rtt_ms = (int)(now_ms() - t0);
+                    nr.stratum = (int)resp[1];
+                    sec = rd_be32(resp + 40);
+                    if (nr.stratum == 0 || li == 3 || sec < NTP_UNIX_DELTA) {
+                        nr.kiss = 1;
+                    } else {
+                        nr.ntp_unix = (time_t)(sec - NTP_UNIX_DELTA);
+                        nr.skew_sec = (long)(local_unix - nr.ntp_unix);
+                        nr.ok = 1;
+                    }
+                }
+            }
         }
-        (void)t0;
 #ifdef _WIN32
         closesocket(s);
 #else
@@ -1084,7 +1286,116 @@ static int ntp_probe(const char *host, int timeout_ms) {
 #endif
     }
     freeaddrinfo(res);
-    return ok;
+    return nr;
+}
+
+static void time_os_clock_check(void) {
+    time_t now = time(NULL);
+    struct tm *gtm = gmtime(&now);
+    struct tm *ltm = localtime(&now);
+    char utc[64], loc[80], detail[STR];
+    if (gtm)
+        snprintf(utc, sizeof utc, "%04d-%02d-%02d %02d:%02d:%02d UTC",
+                 gtm->tm_year + 1900, gtm->tm_mon + 1, gtm->tm_mday,
+                 gtm->tm_hour, gtm->tm_min, gtm->tm_sec);
+    else
+        snprintf(utc, sizeof utc, "unix %ld", (long)now);
+    if (ltm) {
+        char tz[32] = "";
+#ifdef _WIN32
+        {
+            TIME_ZONE_INFORMATION tzi;
+            if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID) {
+                int bias = tzi.Bias;
+                snprintf(tz, sizeof tz, "UTC%+d", -bias / 60);
+            }
+        }
+#else
+        {
+            char tzn[16];
+            if (strftime(tzn, sizeof tzn, "%z %Z", ltm) > 0)
+                snprintf(tz, sizeof tz, "%s", tzn);
+        }
+#endif
+        snprintf(loc, sizeof loc, "%04d-%02d-%02d %02d:%02d:%02d %s",
+                 ltm->tm_year + 1900, ltm->tm_mon + 1, ltm->tm_mday,
+                 ltm->tm_hour, ltm->tm_min, ltm->tm_sec, tz);
+    } else {
+        snprintf(loc, sizeof loc, "%s", utc);
+    }
+    snprintf(detail, sizeof detail, "локально %s · эталонный формат %s", loc, utc);
+    add_check("Время", "Системные часы", "ok", detail,
+              "Сравнение с NTP/HTTP Date — ниже. Если год/месяц не те — TLS на телефонах и IoT падает.");
+
+#ifdef _WIN32
+    {
+        char out[STR];
+        if (run_capture("w32tm /query /status", out, sizeof out) == 0 && out[0]) {
+            char *src = strstr(out, "Source:");
+            char *last = strstr(out, "Last Successful Sync Time:");
+            if (!last) last = strstr(out, "Last Successful Sync Time");
+            if (src || last) {
+                char line[200] = "";
+                if (src) {
+                    char *nl = strchr(src, '\n');
+                    if (nl) *nl = 0;
+                    snprintf(line, sizeof line, "%s", src);
+                    str_trim(line);
+                }
+                add_check("Время", "Служба времени Windows",
+                          strstr(out, "Local CMOS Clock") ? "warn" : "ok",
+                          line[0] ? line : "w32tm ответил",
+                          strstr(out, "Local CMOS Clock")
+                              ? "Синхронизация с NTP не идёт — только CMOS. Включите «Устанавливать время автоматически»."
+                              : "");
+            } else {
+                add_check("Время", "Служба времени Windows", "info",
+                          "w32tm не разобран", "Проверьте службу W32Time вручную.");
+            }
+        } else {
+            add_check("Время", "Служба времени Windows", "info",
+                      "w32tm недоступен", "");
+        }
+    }
+#elif defined(__APPLE__)
+    {
+        char out[256];
+        if (run_capture("systemsetup -getusingnetworktime 2>/dev/null", out, sizeof out) == 0 &&
+            out[0] && !strstr(out, "error") && !strstr(out, "Error")) {
+            int on = strstr(out, "On") || strstr(out, "on");
+            str_trim(out);
+            add_check("Время", "Синхронизация macOS", on ? "ok" : "warn", out,
+                      on ? "" : "Сетевое время выключено — после сбоя CMOS часы не выправятся сами.");
+        } else {
+            add_check("Время", "Синхронизация macOS", "info",
+                      "статус службы без прав не читается (timed)",
+                      "Сравните локальные часы с NTP/Date ниже. В Системных настройках: Дата и время → автоматически.");
+        }
+    }
+#else
+    {
+        char out[STR];
+        if (run_capture("timedatectl show -p NTP -p NTPSynchronized -p Timezone 2>/dev/null",
+                        out, sizeof out) == 0 && out[0]) {
+            int ntp = strstr(out, "NTP=yes") != NULL;
+            int sync = strstr(out, "NTPSynchronized=yes") != NULL;
+            str_trim(out);
+            add_check("Время", "systemd-timesyncd / chrony",
+                      sync ? "ok" : (ntp ? "warn" : "warn"),
+                      out,
+                      sync ? "" : "NTP включён, но ещё не синхронизирован — или служба выключена.");
+        } else {
+            add_check("Время", "Служба NTP ОС", "info",
+                      "timedatectl недоступен", "");
+        }
+    }
+#endif
+}
+
+static const char *time_skew_status(long abs_sec) {
+    if (abs_sec < 2) return "ok";
+    if (abs_sec < 300) return "warn";
+    return "fail";
 }
 
 static void check_tcp_ep_fill(Check *out, const char *cat, const char *name,
@@ -3042,8 +3353,7 @@ static int stage_begin_ex(const char *title, const char *desc, int default_run) 
 
     if (g_engine_cancel) return 0;
 
-    if (opt_only_dpi && title &&
-        strcmp(title, "Сеть и Wi‑Fi") != 0 && strcmp(title, "DPI") != 0)
+    if (!stage_is_on(title))
         return 0;
 
     if (g_engine_cb && g_engine_cb->on_stage)
@@ -5690,7 +6000,10 @@ static void write_html(void) {
         "В выводе «Тип ограничения»: SNI-фильтр, IP/CIDR, L4-25, QUIC drop, порт-фильтр. "
         "Живой HTTPS к ya.ru не значит, что MQTT/QUIC/DoH тоже живы.</li>"
         "<li><strong>DNS-прогон</strong> — массовый резолв через DNS РФ и публичные резолверы.</li>"
-        "<li><strong>NTP</strong> — кривое время ломает TLS на IoT и TV.</li>"
+        "<li><strong>Время / синхронизация</strong> — системные часы, NTP (метка из пакета, не только UDP/123) "
+        "и HTTP <code>Date</code> (ya.ru / Google / Cloudflare). «Нет интернета» на телефоне/TV часто = "
+        "часы уехали или UDP/123 закрыт навсегда. Тип сбоя: часы уехали / NTP мёртв Date жив / NTP врёт / "
+        "все эталоны мертвы.</li>"
         "<li><strong>DFS</strong> — Wi‑Fi каналы 52–64 и 100–144 дают краткие обрывы; стабильнее 36/40/44/48.</li>"
         "<li>Запускайте с той же Wi‑Fi/VLAN, что и проблемные клиенты.</li>"
         "</ul>"
@@ -6542,22 +6855,80 @@ static void sni_ip_job(int idx, void *v) {
 typedef struct {
     Check *outs;
     int *ok;
+    long *skew;
     const char **hosts;
 } NtpCtx;
 
 static void ntp_job(int idx, void *v) {
     NtpCtx *ctx = (NtpCtx *)v;
-    char name[80];
+    NtpResult nr;
+    char name[80], detail[STR];
     snprintf(name, sizeof name, "NTP %s", ctx->hosts[idx]);
-    if (ntp_probe(ctx->hosts[idx], 2500)) {
+    nr = ntp_probe_ex(ctx->hosts[idx], 2500);
+    ctx->skew[idx] = 0;
+    if (nr.ok) {
+        long abs_sk = nr.skew_sec < 0 ? -nr.skew_sec : nr.skew_sec;
         ctx->ok[idx] = 1;
-        check_set(&ctx->outs[idx], "NTP / время", name, "ok", "UDP/123 ответ получен", "",
+        ctx->skew[idx] = nr.skew_sec;
+        snprintf(detail, sizeof detail,
+                 "stratum %d · RTT %d ms · расхождение часов %+ld с",
+                 nr.stratum, nr.rtt_ms, nr.skew_sec);
+        check_set(&ctx->outs[idx], "Время", name, time_skew_status(abs_sk), detail,
+                  abs_sk >= 300
+                      ? "Локальные часы уехали от NTP — TLS/captive на телефонах и IoT часто пишут «нет интернета»."
+                      : (abs_sk >= 2
+                             ? "Небольшое расхождение. Часть IoT уже нервничает."
+                             : ""),
+                  NULL, NULL, 0);
+    } else if (nr.kiss) {
+        ctx->ok[idx] = 0;
+        check_set(&ctx->outs[idx], "Время", name, "warn",
+                  "ответ UDP/123 без валидного времени (kiss / unsync)",
+                  "Пакет есть, но это не эталон. Похоже на captive или мёртвый NTP.",
                   NULL, NULL, 0);
     } else {
         ctx->ok[idx] = 0;
-        check_set(&ctx->outs[idx], "NTP / время", name, "warn", "нет ответа UDP/123",
-                  "Без NTP часы на IoT сбиваются → TLS handshake fail → туннель не поднимается.",
+        check_set(&ctx->outs[idx], "Время", name, "warn", "нет ответа UDP/123",
+                  "Без NTP устройства после перезагрузки не выправят часы.",
                   NULL, NULL, 0);
+    }
+}
+
+typedef struct {
+    Check *outs;
+    int *ok;
+    long *skew;
+    const char **urls;
+    const char **names;
+} HttpDateCtx;
+
+static void http_date_job(int idx, void *v) {
+    HttpDateCtx *ctx = (HttpDateCtx *)v;
+    HttpDateResult hd;
+    char detail[STR];
+    time_t local = time(NULL);
+    hd = http_date_probe(ctx->urls[idx], 8);
+    ctx->skew[idx] = 0;
+    if (hd.ok) {
+        long sk = (long)(local - hd.http_unix);
+        long abs_sk = sk < 0 ? -sk : sk;
+        ctx->ok[idx] = 1;
+        ctx->skew[idx] = sk;
+        snprintf(detail, sizeof detail, "Date %s · расхождение %+ld с (%d ms)",
+                 hd.raw, sk, hd.ms);
+        check_set(&ctx->outs[idx], "Время", ctx->names[idx],
+                  time_skew_status(abs_sk), detail,
+                  abs_sk >= 300
+                      ? "Локальное время не совпадает с HTTP Date (Google/Ya). ОС и телефоны решают, что сети нет."
+                      : "",
+                  NULL, ctx->urls[idx], 0);
+    } else {
+        ctx->ok[idx] = 0;
+        snprintf(detail, sizeof detail, "%s",
+                 hd.raw[0] ? hd.raw : "нет заголовка Date");
+        check_set(&ctx->outs[idx], "Время", ctx->names[idx], "warn", detail,
+                  "HTTPS жив, но Date не разобрали — смотрите NTP.",
+                  NULL, ctx->urls[idx], 0);
     }
 }
 
@@ -6632,6 +7003,7 @@ static void usage(const char *argv0) {
         "  --skip-speed           пропустить замер скорости\n"
         "  --skip-video           пропустить скрытую проверку видео\n"
         "  --only-dpi             только этапы «Сеть» и «DPI» (классификация типа)\n"
+        "  --only-time            только этапы «Сеть» и «Время / синхронизация»\n"
         "  --dns-limit N          доменов на резолвер (по умолчанию 1000, макс. 10000)\n"
         "  --domains FILE         свой список доменов (иначе файл или встроенный)\n"
         "  --resources FILE       списки ресурсов по группам (иначе resources.conf рядом)\n"
@@ -7083,49 +7455,125 @@ static int diagnose_core(void) {
     }
     } /* !g_sys_dns_broken external IP */
 
-    /* NTP — IoT TLS depends on correct clock */
-    if (stage_begin("NTP", "UDP/123 — время для TLS на IoT")) {
+    /* Время — сбитые часы = «нет интернета» на телефонах/TV/IoT */
+    g_time_skew_abs = -1;
+    g_time_ntp_ok = 0;
+    g_time_http_ok = 0;
+    if (stage_begin("Время / синхронизация",
+                    "Системные часы, NTP (время из пакета) и HTTP Date")) {
         const char *ntp_hosts[] = {
-            "time.google.com", "time.cloudflare.com", "pool.ntp.org"
+            "time.google.com", "time.cloudflare.com", "pool.ntp.org",
+            "ntp.msk-ix.ru", "ntp1.vniiftri.ru", "time.windows.com"
         };
-        int ntp_ok = 0;
+        const char *date_urls[] = {
+            "https://ya.ru/", "https://www.google.com/", "https://www.cloudflare.com/"
+        };
+        const char *date_names[] = {
+            "HTTP Date ya.ru", "HTTP Date google.com", "HTTP Date cloudflare.com"
+        };
         int ntp_n = (int)(sizeof ntp_hosts / sizeof ntp_hosts[0]);
+        int date_n = (int)(sizeof date_urls / sizeof date_urls[0]);
+        int ntp_ok = 0, date_ok = 0;
+        long best_abs = -1;
+        long ntp_vs_http = -1;
         Check *nout = (Check *)calloc((size_t)ntp_n, sizeof(Check));
         int *nok = (int *)calloc((size_t)ntp_n, sizeof(int));
-        if (nout && nok) {
+        long *nskew = (long *)calloc((size_t)ntp_n, sizeof(long));
+        Check *dout = (Check *)calloc((size_t)date_n, sizeof(Check));
+        int *dok = (int *)calloc((size_t)date_n, sizeof(int));
+        long *dskew = (long *)calloc((size_t)date_n, sizeof(long));
+
+        time_os_clock_check();
+
+        if (nout && nok && nskew) {
             NtpCtx nctx;
-            nctx.outs = nout; nctx.ok = nok; nctx.hosts = ntp_hosts;
+            nctx.outs = nout; nctx.ok = nok; nctx.skew = nskew; nctx.hosts = ntp_hosts;
             run_parallel(ntp_n, opt_jobs, ntp_job, &nctx, "NTP");
             for (i = 0; i < ntp_n; i++) {
                 add_check_from(&nout[i]);
-                if (nok[i]) ntp_ok++;
-            }
-        } else {
-            for (i = 0; i < ntp_n; i++) {
-                char name[80];
-                int ok;
-                snprintf(name, sizeof name, "NTP %s", ntp_hosts[i]);
-                stage_progress(name, i + 1, ntp_n);
-                ok = ntp_probe(ntp_hosts[i], 2500);
-                if (ok) {
+                if (nok[i]) {
+                    long a = nskew[i] < 0 ? -nskew[i] : nskew[i];
                     ntp_ok++;
-                    add_check("NTP / время", name, "ok", "UDP/123 ответ получен", "");
-                } else {
-                    add_check("NTP / время", name, "warn", "нет ответа UDP/123",
-                              "Без NTP часы на IoT сбиваются → TLS handshake fail → туннель не поднимается.");
+                    if (best_abs < 0 || a < best_abs) best_abs = a;
                 }
             }
         }
-        free(nout); free(nok);
+        if (dout && dok && dskew) {
+            HttpDateCtx dctx;
+            dctx.outs = dout; dctx.ok = dok; dctx.skew = dskew;
+            dctx.urls = date_urls; dctx.names = date_names;
+            run_parallel(date_n, opt_jobs, http_date_job, &dctx, "HTTP Date");
+            for (i = 0; i < date_n; i++) {
+                add_check_from(&dout[i]);
+                if (dok[i]) {
+                    long a = dskew[i] < 0 ? -dskew[i] : dskew[i];
+                    date_ok++;
+                    if (best_abs < 0 || a < best_abs) best_abs = a;
+                }
+            }
+        }
+        if (ntp_ok && date_ok && nskew && dskew) {
+            /* NTP и Date должны сходиться; иначе NTP врут / captive */
+            long ntp_med = 0, http_med = 0;
+            int nc = 0, dc = 0;
+            for (i = 0; i < ntp_n; i++) if (nok && nok[i]) { ntp_med += nskew[i]; nc++; }
+            for (i = 0; i < date_n; i++) if (dok && dok[i]) { http_med += dskew[i]; dc++; }
+            if (nc) ntp_med /= nc;
+            if (dc) http_med /= dc;
+            ntp_vs_http = ntp_med - http_med;
+            if (ntp_vs_http < 0) ntp_vs_http = -ntp_vs_http;
+        }
+        g_time_ntp_ok = ntp_ok;
+        g_time_http_ok = date_ok;
+        g_time_skew_abs = (int)best_abs;
+        free(nout); free(nok); free(nskew);
+        free(dout); free(dok); free(dskew);
         stage_done();
-        if (ntp_ok == 0)
-            add_finding("critical", "NTP полностью недоступен",
-                        "Умные устройства не смогут проверить TLS-сертификаты облака. "
-                        "Разрешите UDP/123 к pool.ntp.org / time.google.com / time.cloudflare.com "
-                        "(или свой NTP на роутере).");
-        else if (ntp_ok < ntp_n)
+
+        if (ntp_ok == 0 && date_ok == 0) {
+            add_finding("critical", "Тип сбоя времени: все эталоны мертвы",
+                        "Нет ни NTP (UDP/123), ни HTTP Date. Сначала сеть/DPI — не часы. "
+                        "Если браузер при этом открывается, проверьте фильтр Date/UDP.");
+            add_check("Время", "Тип сбоя времени", "fail", "все эталоны мертвы",
+                      "Нет опорного времени — устройства после reboot не синхронизируются.");
+        } else if (ntp_ok == 0 && date_ok > 0) {
+            add_finding("critical", "Тип сбоя времени: NTP мёртв, HTTP Date жив",
+                        "Браузер и ПК с HTTPS-временем живут. Телефоны, TV и IoT, которые умеют "
+                        "только UDP/123, после перезагрузки навсегда останутся с кривыми часами "
+                        "и будут писать «нет интернета». Откройте UDP/123 или NTP на роутере "
+                        "(time.google.com, pool.ntp.org, ntp.msk-ix.ru, ntp1.vniiftri.ru).");
+            add_check("Время", "Тип сбоя времени", "fail",
+                      "NTP мёртв · HTTP Date жив",
+                      "Фильтр UDP/123. Браузер ок, устройства без HTTPS-времени — нет.");
+        } else if (ntp_vs_http >= 30) {
+            add_finding("warning", "Тип сбоя времени: NTP врёт",
+                        "Метка в NTP-пакете расходится с HTTP Date. Похоже на captive/подмену, "
+                        "а не на «нет интернета».");
+            add_check("Время", "Тип сбоя времени", "warn",
+                      "NTP врёт относительно HTTP Date",
+                      "Не доверяйте этому NTP — поставьте свой или другой пул.");
+        } else if (best_abs >= 300) {
+            add_finding("critical", "Тип сбоя времени: часы уехали",
+                        "Локальные часы расходятся с Google/Ya/NTP больше чем на 5 минут. "
+                        "TLS-сертификаты «ещё не действительны» / «истекли» — Android, TV и IoT "
+                        "пишут «нет интернета». Включите автосинхронизацию и перезагрузите устройства.");
+            add_check("Время", "Тип сбоя времени", "fail", "часы уехали от эталона",
+                      "Выставьте автоматическое время. Иначе TLS не заработает никогда.");
+        } else if (best_abs >= 2) {
+            add_finding("warning", "Тип сбоя времени: небольшое расхождение",
+                        "Часы отстают/спешат на несколько секунд. Большинство стеков живы, "
+                        "часть IoT уже капризничает.");
+            add_check("Время", "Тип сбоя времени", "warn",
+                      "небольшое расхождение часов", "");
+        } else if (ntp_ok < ntp_n) {
             add_finding("warning", "NTP частично фильтруется",
                         "Часть NTP-серверов не отвечает. IoT иногда «теряет» облако после перезагрузки.");
+            add_check("Время", "Тип сбоя времени", "ok",
+                      "эталон есть, часть NTP недоступна", "");
+        } else {
+            add_check("Время", "Тип сбоя времени", "ok",
+                      "часы и синхронизация в порядке", "");
+        }
     }
 
     /* Smart home / IoT clouds */
@@ -7279,6 +7727,13 @@ static int diagnose_core(void) {
             snprintf(tx, sizeof tx,
                      "Не отвечают: %s. Браузер может работать, а Tuya/Алиса — нет. "
                      "Проверьте DNS и allowlist хостов/портов 443 и 8883.", names);
+            if (g_time_skew_abs >= 300) {
+                size_t ntx = strlen(tx);
+                snprintf(tx + ntx, sizeof tx - ntx,
+                         " Сначала часы: локальное время уехало от эталона на %d с — "
+                         "TLS облака IoT часто падает из‑за этого, а не из‑за фильтра.",
+                         g_time_skew_abs);
+            }
             add_finding("critical", detail, tx);
         }
         stage_done();
@@ -8538,39 +8993,22 @@ static int diagnose_core(void) {
 
 int cc_engine_stages(const CcOpts *opts, char titles[][CC_STAGE_TITLE_LEN],
                      int *skipped, int max) {
-    static const char *const all[] = {
-        "Сеть и Wi‑Fi",
-        "Captive / OS",
-        "NTP",
-        "Умный дом / IoT",
-        "DPI",
-        "CDN / счётчики",
-        "Значимые ресурсы (Белые списки МЦ)",
-        "Зарубежные ресурсы",
-        "Банки, CRM и сервисы РФ",
-        "Почта",
-        "Видео",
-        "Игры",
-        "Облако",
-        "Репозитории / обновления",
-        "Гео / IX",
-        "AI / LLM",
-        "Скорость",
-        "DNS-прогон",
-    };
-    int nall = (int)(sizeof all / sizeof all[0]);
-    int skip_video = opts && opts->skip_video;
-    int skip_speed = opts && opts->skip_speed;
-    int skip_dns = opts && opts->skip_dns_bulk && !opts->force_dns_bulk;
     int i, n = 0;
 
     if (!titles || max <= 0) return 0;
-    for (i = 0; i < nall && n < max; i++) {
+    for (i = 0; i < K_STAGE_N && n < max; i++) {
         int sk = 0;
-        if (strcmp(all[i], "Видео") == 0) sk = skip_video;
-        else if (strcmp(all[i], "Скорость") == 0) sk = skip_speed;
-        else if (strcmp(all[i], "DNS-прогон") == 0) sk = skip_dns;
-        snprintf(titles[n], CC_STAGE_TITLE_LEN, "%s", all[i]);
+        if (opts && opts->stage_on_n > 0)
+            sk = (i < opts->stage_on_n && opts->stage_on[i]) ? 0 : 1;
+        else if (opts) {
+            if (strcmp(k_stage_titles[i], "Видео") == 0) sk = opts->skip_video;
+            else if (strcmp(k_stage_titles[i], "Скорость") == 0) sk = opts->skip_speed;
+            else if (strcmp(k_stage_titles[i], "DNS-прогон") == 0)
+                sk = opts->skip_dns_bulk && !opts->force_dns_bulk;
+        } else {
+            sk = !cc_engine_stage_default_on(i);
+        }
+        snprintf(titles[n], CC_STAGE_TITLE_LEN, "%s", k_stage_titles[i]);
         if (skipped) skipped[n] = sk ? 1 : 0;
         n++;
     }
@@ -8599,6 +9037,10 @@ int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb) {
     opt_force_dns_bulk = 0;
     opt_skip_speed = 0;
     opt_skip_video = 0;
+    opt_only_dpi = 0;
+    opt_only_time = 0;
+    opt_stage_on_n = 0;
+    memset(opt_stage_on, 0, sizeof opt_stage_on);
     opt_jobs = DEFAULT_JOBS;
     opt_dns_limit = 1000;
     domains_path[0] = 0;
@@ -8612,6 +9054,28 @@ int cc_engine_run(const CcOpts *opts, const CcCallbacks *cb) {
         opt_force_dns_bulk = opts->force_dns_bulk ? 1 : 0;
         opt_skip_video = opts->skip_video ? 1 : 0;
         opt_skip_speed = opts->skip_speed ? 1 : 0;
+        if (opts->stage_on_n > 0) {
+            int n = opts->stage_on_n;
+            int si;
+            if (n > CC_STAGE_MAX) n = CC_STAGE_MAX;
+            opt_stage_on_n = n;
+            memcpy(opt_stage_on, opts->stage_on, (size_t)n * sizeof opt_stage_on[0]);
+            for (si = 0; si < n && si < K_STAGE_N; si++) {
+                if (strcmp(k_stage_titles[si], "Видео") == 0)
+                    opt_skip_video = opts->stage_on[si] ? 0 : 1;
+                else if (strcmp(k_stage_titles[si], "Скорость") == 0)
+                    opt_skip_speed = opts->stage_on[si] ? 0 : 1;
+                else if (strcmp(k_stage_titles[si], "DNS-прогон") == 0) {
+                    if (opts->stage_on[si]) {
+                        opt_skip_dns_bulk = 0;
+                        opt_force_dns_bulk = 1;
+                    } else {
+                        opt_skip_dns_bulk = 1;
+                        opt_force_dns_bulk = 0;
+                    }
+                }
+            }
+        }
         no_open = opts->no_open ? 1 : 0;
         if (opts->jobs >= 1 && opts->jobs <= 256) opt_jobs = opts->jobs;
         if (opts->outdir[0])
@@ -8738,6 +9202,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--skip-speed") == 0) opt_skip_speed = 1;
         else if (strcmp(argv[i], "--skip-video") == 0) opt_skip_video = 1;
         else if (strcmp(argv[i], "--only-dpi") == 0) opt_only_dpi = 1;
+        else if (strcmp(argv[i], "--only-time") == 0) opt_only_time = 1;
         else if ((strcmp(argv[i], "--jobs") == 0) && i + 1 < argc) {
             opt_jobs = atoi(argv[++i]);
             if (opt_jobs < 1) opt_jobs = 1;
