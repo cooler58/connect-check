@@ -32,6 +32,13 @@ int update_check(UpdateInfo *out, char *err, size_t errlen);
 int update_detect_install_root(const char *argv0_or_bindir, char *out, size_t n);
 
 /*
+ * Скачать архив этой ОС в папку «Загрузки» (без замены запущенного GUI).
+ * out_path — полный путь к файлу. SHA256 проверяется, если есть в релизе.
+ */
+int update_download_archive(const UpdateInfo *info, char *out_path, size_t n,
+                            char *err, size_t errlen);
+
+/*
  * Download, verify, stage, write helper that swaps after this process exits,
  * then relaunches relaunch_path with relaunch_argv (NULL-terminated; argv[0]
  * should be the program path). Does not return on success (process exits 0

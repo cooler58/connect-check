@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <wchar.h>
 #  include <process.h>
 #  include <shellapi.h>
 #  include <direct.h>
@@ -1234,64 +1235,49 @@ static void update_check_startup(void) {
     }
 }
 
-static void do_self_update(void) {
-    char root[PATH_MAX_G], err[256];
-    char relaunch[PATH_MAX_G];
-    char *rargv[4];
-    int n = 0;
-
-    if (!g_update_ready) return;
-    update_detect_install_root(g_workdir[0] ? g_workdir : NULL, root, sizeof root);
-    log_add("update", root);
-    snprintf(g_status, sizeof g_status, "Обновление до %s…", g_update.tag);
-
-#if defined(__APPLE__)
+static void open_url(const char *url) {
+    if (!url || !url[0]) return;
+#ifdef _WIN32
+    if ((int)(intptr_t)ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) <= 32)
+        log_add("update", "не открыть браузер");
+#elif defined(__APPLE__)
     {
-        char app[PATH_MAX_G];
-        path_join(app, sizeof app, root, "ConnectCheck-mac.app");
-        if (path_is_dir(app) || file_exists(app)) {
-            snprintf(relaunch, sizeof relaunch, "/usr/bin/open");
-            rargv[n++] = relaunch;
-            rargv[n++] = app;
-            rargv[n] = NULL;
-        } else {
-            uint32_t sz = sizeof relaunch;
-            if (_NSGetExecutablePath(relaunch, &sz) != 0)
-                snprintf(relaunch, sizeof relaunch, "%s", "connect-check-gui");
-            rargv[n++] = relaunch;
-            rargv[n] = NULL;
-        }
-    }
-#elif defined(_WIN32)
-    {
-        char gui[PATH_MAX_G];
-        path_join(gui, sizeof gui, root, "connect-check-gui-win.exe");
-        if (GetFileAttributesA(gui) != INVALID_FILE_ATTRIBUTES)
-            snprintf(relaunch, sizeof relaunch, "%s", gui);
-        else if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
-            snprintf(relaunch, sizeof relaunch, "connect-check-gui-win.exe");
-        rargv[n++] = relaunch;
-        rargv[n] = NULL;
+        char cmd[PATH_MAX_G + 64];
+        snprintf(cmd, sizeof cmd, "/usr/bin/open \"%s\"", url);
+        if (system(cmd) != 0) log_add("update", "open URL завершился с ошибкой");
     }
 #else
     {
-        char gui[PATH_MAX_G];
-        path_join(gui, sizeof gui, root, "connect-check-gui-linux");
-        if (access(gui, X_OK) == 0)
-            snprintf(relaunch, sizeof relaunch, "%s", gui);
-        else
-            snprintf(relaunch, sizeof relaunch, "%s", "connect-check-gui-linux");
-        rargv[n++] = relaunch;
-        rargv[n] = NULL;
+        char cmd[PATH_MAX_G + 64];
+        snprintf(cmd, sizeof cmd, "xdg-open \"%s\" >/dev/null 2>&1 &", url);
+        if (system(cmd) != 0) log_add("update", "xdg-open URL завершился с ошибкой");
     }
 #endif
+}
 
-    log_add("update", "скачивание и замена пакета…");
-    if (update_apply(&g_update, root, relaunch, rargv, err, sizeof err) != 0) {
+static void do_download_update(void) {
+    char dest[PATH_MAX_G], err[256];
+    if (!g_update_ready) return;
+    snprintf(g_status, sizeof g_status, "Скачиваю %s…", g_update.asset_name[0] ? g_update.asset_name : g_update.tag);
+    log_add("update", "скачивание архива этой ОС в «Загрузки»…");
+    if (update_download_archive(&g_update, dest, sizeof dest, err, sizeof err) != 0) {
         log_add("update", err);
-        snprintf(g_status, sizeof g_status, "Ошибка обновления");
+        snprintf(g_status, sizeof g_status, "Ошибка скачивания — открываю страницу");
+        if (g_update.html_url[0])
+            open_url(g_update.html_url);
         return;
     }
+    log_add("update", dest);
+    snprintf(g_status, sizeof g_status, "Скачано в «Загрузки»");
+    open_path(dest);
+}
+
+static void do_open_release_page(void) {
+    const char *u = g_update.html_url[0]
+        ? g_update.html_url
+        : "https://github.com/cooler58/connect-check/releases/latest";
+    log_add("update", u);
+    open_url(u);
 }
 
 /* ---------- UI ---------- */
@@ -1304,6 +1290,9 @@ static void ui_apply_theme(struct nk_context *ctx) {
     ctx->style.text.color = text;
     ctx->style.window.background = nk_rgb(32, 33, 38);
     ctx->style.window.fixed_background = nk_style_item_color(nk_rgb(32, 33, 38));
+    ctx->style.window.padding = nk_vec2(12.0f, 10.0f);
+    ctx->style.window.spacing = nk_vec2(8.0f, 6.0f);
+    ctx->style.window.border = 0;
     ctx->style.button.normal = nk_style_item_color(nk_rgb(58, 60, 70));
     ctx->style.button.hover = nk_style_item_color(nk_rgb(72, 78, 92));
     ctx->style.button.active = nk_style_item_color(nk_rgb(70, 110, 170));
@@ -1363,18 +1352,18 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, "Параметры диагностики", NK_TEXT_LEFT);
-    nk_layout_row_dynamic(ctx, 24, 2);
+    nk_layout_row_dynamic(ctx, 28, 2);
     nk_checkbox_label(ctx, "Без вопросов", &opt_yes);
     nk_checkbox_label(ctx, "Не открывать HTML", &opt_no_open);
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
-    nk_layout_row_push(ctx, 140);
+    nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 2);
+    nk_layout_row_push(ctx, 0.22f);
     nk_label(ctx, "Каталог отчётов:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 280);
+    nk_layout_row_push(ctx, 0.78f);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, opt_outdir, sizeof opt_outdir, nk_filter_default);
     nk_layout_row_end(ctx);
 
     nk_layout_row_dynamic(ctx, 22, 1);
-    nk_label(ctx, "Этапы (текущий набор по умолчанию включён; DNS-прогон — выкл.)", NK_TEXT_LEFT);
+    nk_label(ctx, "Этапы (по умолчанию включены; DNS-прогон — выкл.)", NK_TEXT_LEFT);
     nk_layout_row_dynamic(ctx, 28, 2);
     if (nk_button_label(ctx, "Все этапы")) {
         if (!g_diag_busy) {
@@ -1403,7 +1392,10 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
 
     nk_layout_row_dynamic(ctx, (float)g_stage_panel_h, 1);
     if (nk_group_begin(ctx, "stages", NK_WINDOW_BORDER)) {
-        nk_layout_row_dynamic(ctx, 22, 2);
+        int cols = 2;
+        if (ctx->current && ctx->current->layout)
+            cols = (ctx->current->bounds.w >= 980.0f) ? 2 : 1;
+        nk_layout_row_dynamic(ctx, 28, cols);
         for (i = 0; i < g_stage_n; i++) {
             char lab[160];
             const char *mark = "";
@@ -1419,11 +1411,12 @@ static void ui_tab_diagnose(struct nk_context *ctx) {
         nk_group_end(ctx);
     }
 
-    nk_layout_row_dynamic(ctx, 34, 4);
-    if (nk_button_label(ctx, g_diag_busy ? "Идёт…" : "Запустить диагностику")) {
+    nk_layout_row_dynamic(ctx, 34, 2);
+    if (nk_button_label(ctx, g_diag_busy ? "Идёт…" : "Запустить")) {
         if (!g_diag_busy) run_diagnose();
     }
     if (nk_button_label(ctx, "Остановить")) stop_diagnose();
+    nk_layout_row_dynamic(ctx, 34, 2);
     if (nk_button_label(ctx, "Открыть отчёт")) open_path(g_report_path);
     if (g_ui_fail >= 10) {
         if (nk_button_label(ctx, "Письмо в НОК")) compose_noc_mail();
@@ -1461,10 +1454,10 @@ static void ui_tab_url(struct nk_context *ctx) {
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_label(ctx, g_probe_busy[5] ? "Проверка URL — идёт" : "Проверка URL", NK_TEXT_LEFT);
-    nk_layout_row_begin(ctx, NK_STATIC, 28, 2);
-    nk_layout_row_push(ctx, 50);
+    nk_layout_row_begin(ctx, NK_DYNAMIC, 28, 2);
+    nk_layout_row_push(ctx, 0.10f);
     nk_label(ctx, "URL:", NK_TEXT_LEFT);
-    nk_layout_row_push(ctx, 500);
+    nk_layout_row_push(ctx, 0.90f);
     nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, url_buf, sizeof url_buf, nk_filter_default);
     nk_layout_row_end(ctx);
     ui_labeled_int_row(ctx, "Интервал, сек:", interval_buf, (int)sizeof interval_buf,
@@ -1488,20 +1481,23 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
     if (nk_begin(ctx, "Connect Check", nk_rect(0, 0, (float)width, (float)height),
                  NK_WINDOW_NO_SCROLLBAR)) {
         if (g_resources[0])
-            snprintf(hdr, sizeof hdr, "Движок встроен · %s", g_resources);
+            snprintf(hdr, sizeof hdr, "Connect Check %s · пакет готов", CONNECT_CHECK_VERSION);
         else
-            snprintf(hdr, sizeof hdr, "Движок встроен · resources.conf не найден рядом с пакетом");
+            snprintf(hdr, sizeof hdr, "Connect Check %s · resources.conf не найден", CONNECT_CHECK_VERSION);
         nk_layout_row_dynamic(ctx, 22, 1);
         nk_label_colored(ctx, hdr, NK_TEXT_LEFT,
                          g_resources[0] ? nk_rgb(40, 140, 60) : nk_rgb(180, 120, 40));
 
         if (g_update_ready) {
-            nk_layout_row_begin(ctx, NK_STATIC, 30, 2);
-            nk_layout_row_push(ctx, (float)(width - 160));
-            nk_label_colored(ctx, g_update_banner, NK_TEXT_LEFT, nk_rgb(160, 100, 20));
+            nk_layout_row_begin(ctx, NK_STATIC, 32, 3);
+            nk_layout_row_push(ctx, (float)(width > 360 ? width - 300 : 160));
+            nk_label_colored(ctx, g_update_banner, NK_TEXT_LEFT, nk_rgb(220, 170, 70));
             nk_layout_row_push(ctx, 140);
-            if (nk_button_label(ctx, "Обновить"))
-                do_self_update();
+            if (nk_button_label(ctx, "Скачать архив"))
+                do_download_update();
+            nk_layout_row_push(ctx, 140);
+            if (nk_button_label(ctx, "Страница релиза"))
+                do_open_release_page();
             nk_layout_row_end(ctx);
         }
 
@@ -1540,7 +1536,7 @@ static void ui_frame(struct nk_context *ctx, int width, int height) {
             snprintf(group_id, sizeof group_id, "log%d", tab);
             if (nk_group_begin(ctx, group_id, NK_WINDOW_BORDER)) {
                 int i;
-                nk_layout_row_dynamic(ctx, 18, 1);
+                nk_layout_row_dynamic(ctx, 20, 1);
                 for (i = 0; i < log->n; i++) {
                     const char *ln = log->lines[i];
                     if (i == prog || strstr(ln, " … "))
@@ -1600,6 +1596,12 @@ static void win_dpi_aware(void) {
 
 static LRESULT CALLBACK gui_wndproc(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mm = (MINMAXINFO *)lparam;
+        mm->ptMinTrackSize.x = 920;
+        mm->ptMinTrackSize.y = 700;
+        return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1610,35 +1612,53 @@ static LRESULT CALLBACK gui_wndproc(HWND wnd, UINT msg, WPARAM wparam, LPARAM lp
 }
 
 static GdipFont *win_pick_font(void) {
-    /* Системные шрифты Windows (GDI+ по имени); кириллица — Segoe UI / Arial. */
-    static const char *names[] = {
-        "Segoe UI", "Arial", "Tahoma", "Consolas", "Cascadia Mono",
-        "Lucida Console", "Courier New", NULL
+    /* TTF с диска — GDI+ по имени часто даёт семейство без кириллицы. */
+    static const wchar_t *files[] = {
+        L"segoeui.ttf", L"arial.ttf", L"tahoma.ttf", L"calibri.ttf", NULL
     };
+    wchar_t windir[MAX_PATH];
     GdipFont *font = NULL;
+    UINT n;
     int i;
-    for (i = 0; names[i]; i++) {
-        font = nk_gdipfont_create(names[i], 18);
-        if (font) {
-            log_add("font", names[i]);
-            return font;
+
+    n = GetWindowsDirectoryW(windir, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        for (i = 0; files[i]; i++) {
+            wchar_t full[MAX_PATH];
+            swprintf(full, MAX_PATH, L"%s\\Fonts\\%s", windir, files[i]);
+            if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES)
+                continue;
+            font = nk_gdipfont_create_from_file(full, 15);
+            if (font && font->handle) {
+                log_add("font", "segoeui/arial from Fonts");
+                return font;
+            }
+            if (font) {
+                nk_gdipfont_del(font);
+                font = NULL;
+            }
         }
     }
+    font = nk_gdipfont_create("Segoe UI", 15);
+    if (font && font->handle) {
+        log_add("font", "Segoe UI");
+        return font;
+    }
     log_add("font", "fallback Arial");
-    return nk_gdipfont_create("Arial", 18);
+    return nk_gdipfont_create("Arial", 15);
 }
 
 int main(int argc, char **argv) {
     struct nk_context *ctx;
     GdipFont *font;
     WNDCLASSW wc;
-    RECT rect = {0, 0, 980, 820};
+    RECT rect = {0, 0, 1100, 860};
     DWORD style = WS_OVERLAPPEDWINDOW;
     DWORD exstyle = WS_EX_APPWINDOW;
     HWND wnd;
     int running = 1;
     int needs_refresh = 1;
-    int width = 980, height = 820;
+    int width = 1100, height = 860;
     char titlea[96];
     wchar_t titlew[128];
 
@@ -1738,7 +1758,7 @@ static void error_callback(int e, const char *d) {
 int main(int argc, char **argv) {
     GLFWwindow *win;
     struct nk_context *ctx;
-    int width = 980, height = 820;
+    int width = 1100, height = 860;
 
     (void)argc;
     (void)argv;

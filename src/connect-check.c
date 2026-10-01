@@ -2492,6 +2492,32 @@ static void fmt_page_speed(char *out, size_t n, const PageLoadStats *st) {
 }
 
 #ifdef _WIN32
+/* WinINet 12002 — таймаут, не DNS (12007) и не «сокет не открылся» (12029). */
+static void wininet_fmt_err(char *out, size_t n, DWORD err) {
+    const char *msg = NULL;
+    switch (err) {
+    case ERROR_INTERNET_TIMEOUT:              msg = "таймаут (сервер не ответил вовремя)"; break;
+    case ERROR_INTERNET_NAME_NOT_RESOLVED:    msg = "не удалось разрешить имя (DNS)"; break;
+    case ERROR_INTERNET_CANNOT_CONNECT:       msg = "нет соединения с сервером"; break;
+    case ERROR_INTERNET_CONNECTION_ABORTED:   msg = "соединение оборвано"; break;
+    case ERROR_INTERNET_CONNECTION_RESET:     msg = "соединение сброшено"; break;
+    case ERROR_INTERNET_INVALID_URL:          msg = "некорректный URL"; break;
+    case ERROR_INTERNET_UNRECOGNIZED_SCHEME:  msg = "неподдерживаемая схема URL"; break;
+    case ERROR_INTERNET_OPERATION_CANCELLED:  msg = "операция отменена"; break;
+#ifdef ERROR_INTERNET_SECURITY_CHANNEL_ERROR
+    case ERROR_INTERNET_SECURITY_CHANNEL_ERROR: msg = "ошибка TLS/SSL"; break;
+#endif
+#ifdef ERROR_INTERNET_INVALID_CA
+    case ERROR_INTERNET_INVALID_CA:           msg = "недоверенный сертификат"; break;
+#endif
+    default: break;
+    }
+    if (msg)
+        snprintf(out, n, "%s", msg);
+    else
+        snprintf(out, n, "сеть недоступна (код %lu)", (unsigned long)err);
+}
+
 static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, const char *ua, int follow) {
     HttpResult r;
     HINTERNET hNet = NULL, hUrl = NULL;
@@ -2514,7 +2540,7 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
     hNet = InternetOpenA(ua && ua[0] ? ua : ua_default(),
                          INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hNet) {
-        snprintf(r.error, sizeof r.error, "InternetOpen failed");
+        wininet_fmt_err(r.error, sizeof r.error, GetLastError());
         r.ms = (int)(now_ms() - t0);
         return r;
     }
@@ -2531,8 +2557,7 @@ static HttpResult http_probe_ua(const char *url, int timeout_sec, int insecure, 
 
     hUrl = InternetOpenUrlA(hNet, url, hdrs, (DWORD)strlen(hdrs), flags, 0);
     if (!hUrl) {
-        DWORD err = GetLastError();
-        snprintf(r.error, sizeof r.error, "ошибка WinINet %lu", (unsigned long)err);
+        wininet_fmt_err(r.error, sizeof r.error, GetLastError());
         r.ms = (int)(now_ms() - t0);
         InternetCloseHandle(hNet);
         return r;
@@ -7009,7 +7034,7 @@ static void usage(const char *argv0) {
         "  --resources FILE       списки ресурсов по группам (иначе resources.conf рядом)\n"
         "  --jobs N               параллельные пробы внутри этапа (по умолчанию %d, env CONNECT_CHECK_JOBS)\n"
         "  --check-update         проверить GitHub Releases (exit 0 актуально, 2 есть новее, 1 ошибка)\n"
-        "  --self-update          скачать latest release и заменить пакет (см. docs/UPDATE.md)\n"
+        "  --self-update          скачать архив этой ОС в «Загрузки» (см. docs/UPDATE.md)\n"
         "Клавиши на этапах: Enter — далее/запустить, Space — пропустить (без эха).\n",
         argv0, CONNECT_CHECK_VERSION, DEFAULT_JOBS);
 }
@@ -9230,8 +9255,6 @@ int main(int argc, char **argv) {
     if (opt_check_update || opt_self_update) {
         UpdateInfo ui;
         char err[256];
-        char root[STR];
-        char relaunch[STR];
         if (update_check(&ui, err, sizeof err) != 0) {
             fprintf(stderr, "check-update: %s\n", err);
             return 1;
@@ -9247,30 +9270,18 @@ int main(int argc, char **argv) {
         printf("Доступно обновление: %s → %s\n", CONNECT_CHECK_VERSION, ui.version);
         if (opt_check_update && !opt_self_update)
             return 2;
-        /* --self-update */
-        update_detect_install_root(argv[0], root, sizeof root);
-        printf("Корень установки: %s\n", root);
-#ifdef _WIN32
-        if (!GetModuleFileNameA(NULL, relaunch, (DWORD)sizeof relaunch))
-            snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
-#else
+        /* --self-update: архив в «Загрузки», без замены запущенного процесса */
         {
-            char real[STR];
-            if (realpath(argv[0], real))
-                snprintf(relaunch, sizeof relaunch, "%s", real);
-            else
-                snprintf(relaunch, sizeof relaunch, "%s", argv[0]);
-        }
-#endif
-        {
-            char *rargv[2];
-            rargv[0] = relaunch;
-            rargv[1] = NULL;
-            printf("Скачиваю и применяю обновление...\n");
-            if (update_apply(&ui, root, relaunch, rargv, err, sizeof err) != 0) {
+            char dest[STR];
+            printf("Скачиваю архив этой ОС в «Загрузки»…\n");
+            if (update_download_archive(&ui, dest, sizeof dest, err, sizeof err) != 0) {
                 fprintf(stderr, "self-update: %s\n", err);
+                if (ui.html_url[0])
+                    fprintf(stderr, "Страница: %s\n", ui.html_url);
                 return 1;
             }
+            printf("Скачано: %s\nРаспакуйте и замените пакет вручную.\n", dest);
+            return 0;
         }
         return 0; /* helper exits parent */
     }

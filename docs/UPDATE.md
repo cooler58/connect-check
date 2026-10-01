@@ -2,15 +2,18 @@
 
 Проверка и установка обновлений с GitHub Releases: [`cooler58/connect-check`](https://github.com/cooler58/connect-check/releases).
 
-## GUI (основной путь с 1.3.0)
+## GUI (основной путь с 1.8.1)
 
-При старте GUI дергает `releases/latest`. Если remote semver больше локального — баннер и кнопка **«Обновить»**. По кнопке: download → staging → helper после выхода процесса → relaunch GUI.
+При старте GUI дергает `releases/latest`. Если remote semver больше локального —
+баннер и две кнопки:
 
-Relaunch:
+- **Скачать архив** — ассет этой ОС (`*-win-*.zip` / `*-mac-*.tar.gz` /
+  `*-linux-*.tar.gz`) в папку «Загрузки», проверка `SHA256SUMS`, затем
+  открыть файл.
+- **Страница релиза** — браузер на GitHub Releases.
 
-- macOS: `open ConnectCheck-mac.app`
-- Linux: `connect-check-gui-linux`
-- Windows: `connect-check-gui-win.exe`
+In-place замена запущенного `.exe` / `.app` больше не предлагается: на Windows
+это всплывающие консоли и блокировка файла, на macOS — quarantine/подписи.
 
 ## Отладочный CLI
 

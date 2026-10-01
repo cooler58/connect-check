@@ -765,6 +765,10 @@ nk_gdipfont_get_text_width(nk_handle handle, float height, const char *text, int
     MultiByteToWideChar(CP_UTF8, 0, text, len, wstr, wsize);
 
     GdipMeasureString(gdip.memory, wstr, wsize, font->handle, &layout, gdip.format, &bbox, NULL, NULL);
+    /* GDI+ MeasureString добавляет «cell padding» — из-за него кириллица
+     * не влезает в ячейку и переносится посередине слова. */
+    if (bbox.Width > 3.0f)
+        return bbox.Width - (height > 0.0f ? height * 0.12f : 2.0f);
     return bbox.Width;
 }
 
@@ -850,8 +854,7 @@ nk_gdip_init(HWND hwnd, unsigned int width, unsigned int height)
     GdipCreateSolidFill(0, &gdip.brush);
     GdipStringFormatGetGenericTypographic(&gdip.format);
     GdipSetStringFormatFlags(gdip.format, StringFormatFlagsNoFitBlackBox |
-        StringFormatFlagsMeasureTrailingSpaces | StringFormatFlagsNoWrap |
-        StringFormatFlagsNoClip);
+        StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
 
     for(i=0; i< sizeof(gdip.fontCollection)/sizeof(gdip.fontCollection[0]); i++)
         gdip.fontCollection[i] = NULL;

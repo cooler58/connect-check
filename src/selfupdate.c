@@ -192,6 +192,23 @@ int update_semver_gt(const char *remote, const char *local) {
 /* ---------- HTTP GET (body or file) ---------- */
 
 #ifdef _WIN32
+static void wininet_fmt_err(char *err, size_t errlen, DWORD code) {
+    const char *msg = NULL;
+    switch (code) {
+    case ERROR_INTERNET_TIMEOUT:           msg = "таймаут (сервер не ответил вовремя)"; break;
+    case ERROR_INTERNET_NAME_NOT_RESOLVED: msg = "не удалось разрешить имя (DNS)"; break;
+    case ERROR_INTERNET_CANNOT_CONNECT:    msg = "нет соединения с сервером"; break;
+    default: break;
+    }
+    if (msg)
+        set_err(err, errlen, msg);
+    else {
+        char buf[96];
+        snprintf(buf, sizeof buf, "сеть недоступна (код %lu)", (unsigned long)code);
+        set_err(err, errlen, buf);
+    }
+}
+
 static int http_get_body(const char *url, char *body, size_t bodylen, char *err, size_t errlen) {
     HINTERNET hNet = NULL, hUrl = NULL;
     DWORD nread = 0;
@@ -200,7 +217,7 @@ static int http_get_body(const char *url, char *body, size_t bodylen, char *err,
     snprintf(ua, sizeof ua, "connect-check/%s", CONNECT_CHECK_VERSION);
     hNet = InternetOpenA(ua, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hNet) {
-        set_err(err, errlen, "InternetOpen failed");
+        wininet_fmt_err(err, errlen, GetLastError());
         return -1;
     }
     hUrl = InternetOpenUrlA(hNet, url, "Accept: application/vnd.github+json\r\n",
@@ -209,7 +226,7 @@ static int http_get_body(const char *url, char *body, size_t bodylen, char *err,
                                 INTERNET_FLAG_NO_CACHE_WRITE,
                             0);
     if (!hUrl) {
-        set_err(err, errlen, "InternetOpenUrl failed");
+        wininet_fmt_err(err, errlen, GetLastError());
         InternetCloseHandle(hNet);
         return -1;
     }
@@ -239,7 +256,7 @@ static int http_download_file(const char *url, const char *path, char *err, size
     snprintf(ua, sizeof ua, "connect-check/%s", CONNECT_CHECK_VERSION);
     hNet = InternetOpenA(ua, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hNet) {
-        set_err(err, errlen, "InternetOpen failed");
+        wininet_fmt_err(err, errlen, GetLastError());
         return -1;
     }
     hUrl = InternetOpenUrlA(hNet, url, NULL, 0,
@@ -247,7 +264,7 @@ static int http_download_file(const char *url, const char *path, char *err, size
                                 INTERNET_FLAG_NO_CACHE_WRITE,
                             0);
     if (!hUrl) {
-        set_err(err, errlen, "скачивание: InternetOpenUrl failed");
+        wininet_fmt_err(err, errlen, GetLastError());
         InternetCloseHandle(hNet);
         return -1;
     }
@@ -905,6 +922,68 @@ static int spawn_helper_and_exit(const char *helper_path) {
     _exit(0);
     return 0;
 #endif
+}
+
+static int asset_name_safe(const char *name)
+{
+    size_t i;
+    if (!name || !name[0]) return 0;
+    for (i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!(isalnum(c) || c == '.' || c == '_' || c == '-'))
+            return 0;
+    }
+    return strstr(name, ".tar.gz") || strstr(name, ".zip");
+}
+
+static int user_downloads_dir(char *out, size_t n)
+{
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    if (!home || !home[0]) return -1;
+    path_join2(out, n, home, "Downloads");
+    CreateDirectoryA(out, NULL);
+    return is_dir(out) ? 0 : -1;
+#else
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return -1;
+    path_join2(out, n, home, "Downloads");
+    if (!is_dir(out))
+        mkdir(out, 0755);
+    return is_dir(out) ? 0 : -1;
+#endif
+}
+
+int update_download_archive(const UpdateInfo *info, char *out_path, size_t n,
+                            char *err, size_t errlen)
+{
+    char dir[PATH_MAX], hex[80];
+
+    if (out_path && n) out_path[0] = 0;
+    if (!info || !info->asset_url[0] || !asset_name_safe(info->asset_name)) {
+        set_err(err, errlen, "нет архива для этой ОС");
+        return -1;
+    }
+    if (user_downloads_dir(dir, sizeof dir) != 0) {
+        set_err(err, errlen, "нет папки «Загрузки»");
+        return -1;
+    }
+    path_join2(out_path, n, dir, info->asset_name);
+    if (http_download_file(info->asset_url, out_path, err, errlen) != 0)
+        return -1;
+    if (file_size(out_path) < 50 * 1024) {
+        set_err(err, errlen, "архив слишком мал — возможно битый");
+        return -1;
+    }
+    if (info->sha256[0]) {
+        if (file_sha256_hex(out_path, hex, sizeof hex, err, errlen) != 0)
+            return -1;
+        if (!hex_eq_ci(hex, info->sha256)) {
+            set_err(err, errlen, "SHA256 ассета не совпал");
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int update_apply(const UpdateInfo *info, const char *install_root,
